@@ -36,8 +36,12 @@ class Settings(BaseSettings):
     FAL_MODEL: str = "fal-ai/flux-pro/v1.1"
 
     # --- SoundCloud ---
-    SOUNDCLOUD_EMAIL: str = ""
-    SOUNDCLOUD_PASSWORD: str = ""
+    SOUNDCLOUD_CLIENT_ID: str = ""
+    SOUNDCLOUD_CLIENT_SECRET: str = ""
+    SOUNDCLOUD_ACCESS_TOKEN: str = ""  # OAuth access token (obtained via auth flow)
+    SOUNDCLOUD_REFRESH_TOKEN: str = ""  # OAuth refresh token
+    SOUNDCLOUD_EMAIL: str = ""  # Fallback for password grant or browser auth
+    SOUNDCLOUD_PASSWORD: str = ""  # Fallback for password grant or browser auth
 
     # --- YouTube ---
     YOUTUBE_CLIENT_ID: str = ""
