@@ -75,6 +75,24 @@ class PreviewArtResponse(BaseModel):
 
 # --- Helpers ---
 
+def _brand_to_dict(row: BrandSettings) -> dict:
+    """Convert ORM model to dict to avoid lazy-load issues outside async context."""
+    return {
+        "id": row.id,
+        "brand_name": row.brand_name,
+        "description_template": row.description_template,
+        "color_palette": row.color_palette,
+        "visual_style": row.visual_style,
+        "motifs": row.motifs,
+        "genre_visual_modifiers": row.genre_visual_modifiers,
+        "title_format": row.title_format,
+        "youtube_playlists": row.youtube_playlists,
+        "soundcloud_links": row.soundcloud_links,
+        "youtube_links": row.youtube_links,
+        "updated_at": row.updated_at,
+    }
+
+
 async def _get_or_create_brand(db: AsyncSession) -> BrandSettings:
     """Get or create the singleton brand settings row."""
     result = await db.execute(select(BrandSettings).where(BrandSettings.id == 1))
@@ -92,7 +110,7 @@ async def _get_or_create_brand(db: AsyncSession) -> BrandSettings:
 async def get_brand_settings(db: AsyncSession = Depends(get_db)):
     """Get brand settings, creating defaults if none exist."""
     row = await _get_or_create_brand(db)
-    return BrandSettingsOut.model_validate(row)
+    return BrandSettingsOut(**_brand_to_dict(row))
 
 
 @router.put("", response_model=BrandSettingsOut)
@@ -103,7 +121,8 @@ async def update_brand_settings(body: BrandSettingsUpdate, db: AsyncSession = De
     for key, value in update_data.items():
         setattr(row, key, value)
     await db.flush()
-    return BrandSettingsOut.model_validate(row)
+    await db.refresh(row)
+    return BrandSettingsOut(**_brand_to_dict(row))
 
 
 @router.post("/preview-description", response_model=PreviewDescriptionResponse)

@@ -88,6 +88,7 @@ async def update_settings(body: AppSettingsUpdate, db: AsyncSession = Depends(ge
     for key, value in update_data.items():
         setattr(row, key, value)
     await db.flush()
+    await db.refresh(row)
     return AppSettingsOut.model_validate(row)
 
 

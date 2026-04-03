@@ -172,6 +172,7 @@ async def create_mix(body: MixCreate, db: AsyncSession = Depends(get_db)):
         db.add(PipelineStep(mix_id=mix.id, step_name=name, status="pending"))
 
     await db.flush()
+    await db.refresh(mix)
     return MixOut.model_validate(mix)
 
 
@@ -188,6 +189,7 @@ async def update_mix(mix_id: str, body: MixUpdate, db: AsyncSession = Depends(ge
         setattr(mix, key, value)
 
     await db.flush()
+    await db.refresh(mix)
     return MixOut.model_validate(mix)
 
 
@@ -217,6 +219,7 @@ async def approve_mix(mix_id: str, db: AsyncSession = Depends(get_db)):
 
     mix.pipeline_status = "uploading_soundcloud"
     await db.flush()
+    await db.refresh(mix)
     return MixOut.model_validate(mix)
 
 
@@ -245,6 +248,7 @@ async def retry_mix(mix_id: str, db: AsyncSession = Depends(get_db)):
     mix.pipeline_status = "pending"
     mix.pipeline_error = None
     await db.flush()
+    await db.refresh(mix)
     return MixOut.model_validate(mix)
 
 
@@ -276,4 +280,5 @@ async def retry_step(mix_id: str, step_name: str, db: AsyncSession = Depends(get
         mix.pipeline_error = None
 
     await db.flush()
+    await db.refresh(mix)
     return MixOut.model_validate(mix)
