@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+dist/
+build/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Project data (persistent state, mounted as volume)
+data/
+*.db
+*.db-journal
+*.db-wal
+
+# Environment and secrets
+.env
+.env.local
+.env.production
+
+# Playwright browser profile (session cookies, auth state)
+playwright-profile/
+
+# Output directories (development)
+dev/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Logs
+*.log
+
+# Backup files
+backups/
+frontend/package-lock.json

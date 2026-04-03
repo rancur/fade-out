@@ -1,0 +1,113 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-surface text-gray-100;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-surface;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-surface-light rounded-full;
+    border: 2px solid transparent;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #2d333b;
+  }
+
+  ::selection {
+    @apply bg-primary/30 text-white;
+  }
+}
+
+@layer components {
+  .pixel-border {
+    border: 2px solid;
+    box-shadow:
+      inset -2px -2px 0 0 rgba(0, 0, 0, 0.3),
+      inset 2px 2px 0 0 rgba(255, 255, 255, 0.1),
+      4px 4px 0 0 rgba(0, 0, 0, 0.4);
+  }
+
+  .glow-text {
+    text-shadow: 0 0 10px currentColor, 0 0 20px currentColor, 0 0 40px currentColor;
+  }
+
+  .neon-line {
+    @apply h-px w-full;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      #7CB342,
+      #00E5FF,
+      #7CB342,
+      transparent
+    );
+  }
+
+  .card-hover {
+    @apply transition-all duration-300;
+  }
+
+  .card-hover:hover {
+    @apply -translate-y-1;
+    box-shadow: 0 0 15px rgba(124, 179, 66, 0.2), 0 8px 25px rgba(0, 0, 0, 0.4);
+  }
+
+  .cyber-grid {
+    background-image:
+      linear-gradient(rgba(124, 179, 66, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(124, 179, 66, 0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  .gradient-mask-b {
+    mask-image: linear-gradient(to bottom, black 60%, transparent);
+    -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent);
+  }
+}
+
+@layer utilities {
+  .animate-fade-in {
+    animation: fadeIn 0.4s ease-out;
+  }
+
+  @keyframes fadeIn {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .animate-scan {
+    animation: scan 4s linear infinite;
+  }
+
+  @keyframes scan {
+    0%, 100% {
+      opacity: 0;
+      transform: translateY(-100%);
+    }
+    50% {
+      opacity: 0.3;
+    }
+    100% {
+      transform: translateY(100%);
+    }
+  }
+}

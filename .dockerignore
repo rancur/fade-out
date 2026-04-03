@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# Git
+.git/
+.gitignore
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Persistent data (mounted as volume)
+data/
+*.db
+
+# Development
+dev/
+docker-compose.dev.yml
+.vscode/
+.idea/
+*.code-workspace
+
+# Playwright browser profile (session data)
+playwright-profile/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+*.md
+!README.md
+LICENSE
+
+# CI/CD
+.github/
+
+# Scripts
+scripts/
+
+# Misc
+*.log
+*.swp
+*.swo
+*~
