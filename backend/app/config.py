@@ -44,9 +44,10 @@ class Settings(BaseSettings):
     SOUNDCLOUD_PASSWORD: str = ""  # Fallback for password grant or browser auth
 
     # --- YouTube ---
-    YOUTUBE_CLIENT_ID: str = ""
-    YOUTUBE_CLIENT_SECRET: str = ""
-    YOUTUBE_REFRESH_TOKEN: str = ""
+    YOUTUBE_API_KEY: str = ""  # Data API key for reads (playlists, verification)
+    YOUTUBE_CLIENT_ID: str = ""  # OAuth client ID (required for uploads)
+    YOUTUBE_CLIENT_SECRET: str = ""  # OAuth client secret (required for uploads)
+    YOUTUBE_REFRESH_TOKEN: str = ""  # OAuth refresh token (required for uploads)
     YOUTUBE_CHANNEL_ID: str = ""
     YOUTUBE_DEFAULT_PLAYLIST_PREFIX: str = "Will See"
 

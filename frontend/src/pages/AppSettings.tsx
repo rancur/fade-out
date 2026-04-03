@@ -11,7 +11,7 @@ import {
 import { toast } from 'sonner'
 import clsx from 'clsx'
 import { useSettings, useUpdateSettings } from '@/api/hooks'
-import OAuthConnect from '@/components/OAuthConnect'
+import SetupWizard from '@/components/OAuthConnect'
 
 function Toggle({
   checked,
@@ -114,7 +114,7 @@ export default function AppSettings() {
       </div>
 
       {/* Platform Connections (OAuth) */}
-      <OAuthConnect />
+      <SetupWizard />
 
       {/* LLM Provider */}
       <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
