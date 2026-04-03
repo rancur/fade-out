@@ -43,7 +43,7 @@ export default function PipelineProgress({ steps, vertical = false }: PipelinePr
     >
       {steps.map((step, i) => (
         <div
-          key={step.name}
+          key={step.step_name}
           className={clsx(
             'flex items-center',
             vertical ? 'flex-col' : 'flex-row',
@@ -56,7 +56,7 @@ export default function PipelineProgress({ steps, vertical = false }: PipelinePr
                 'w-9 h-9 rounded-full border-2 flex items-center justify-center transition-all duration-300',
                 stepColors[step.status],
               )}
-              title={`${step.name}: ${step.status}`}
+              title={`${step.step_name}: ${step.status}`}
             >
               {stepIcons[step.status]}
             </div>
@@ -66,7 +66,7 @@ export default function PipelineProgress({ steps, vertical = false }: PipelinePr
                 step.status === 'running' ? 'text-cyber-cyan' : 'text-gray-500',
               )}
             >
-              {step.name}
+              {step.step_name}
             </span>
           </div>
 

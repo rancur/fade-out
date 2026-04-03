@@ -2,18 +2,16 @@ import { useState, useEffect } from 'react'
 import {
   Settings,
   Save,
-  FolderOpen,
-  Upload,
   Brain,
-  Bell,
+  Image,
+  Calendar,
   Shield,
-  Plus,
-  X,
-  CheckCircle2,
+  ToggleLeft,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import clsx from 'clsx'
 import { useSettings, useUpdateSettings } from '@/api/hooks'
+import OAuthConnect from '@/components/OAuthConnect'
 
 function Toggle({
   checked,
@@ -54,39 +52,32 @@ export default function AppSettings() {
   const { data: settings, isLoading } = useSettings()
   const update = useUpdateSettings()
 
-  const [form, setForm] = useState<{
-    watch_paths: string[]
-    upload_to_soundcloud: boolean
-    upload_to_youtube: boolean
-    draft_mode: boolean
-    ai_provider: string
-    ai_model: string
-    notification_email: string
-    notification_discord_webhook: string
-  }>({
-    watch_paths: [],
-    upload_to_soundcloud: true,
-    upload_to_youtube: false,
+  const [form, setForm] = useState({
+    image_gen_provider: 'openai',
+    image_gen_model: 'dall-e-3',
+    llm_provider: 'openai',
+    llm_model: 'gpt-4o',
+    premiere_mode: 'immediate',
+    premiere_hour_utc: 18,
+    premiere_day: 'friday',
     draft_mode: true,
-    ai_provider: 'openai',
-    ai_model: 'gpt-4o',
-    notification_email: '',
-    notification_discord_webhook: '',
+    auto_upgrade: false,
+    settings_json: null as Record<string, unknown> | null,
   })
-
-  const [newPath, setNewPath] = useState('')
 
   useEffect(() => {
     if (settings) {
       setForm({
-        watch_paths: settings.watch_paths,
-        upload_to_soundcloud: settings.upload_to_soundcloud,
-        upload_to_youtube: settings.upload_to_youtube,
+        image_gen_provider: settings.image_gen_provider,
+        image_gen_model: settings.image_gen_model,
+        llm_provider: settings.llm_provider,
+        llm_model: settings.llm_model,
+        premiere_mode: settings.premiere_mode,
+        premiere_hour_utc: settings.premiere_hour_utc,
+        premiere_day: settings.premiere_day,
         draft_mode: settings.draft_mode,
-        ai_provider: settings.ai_provider,
-        ai_model: settings.ai_model,
-        notification_email: settings.notification_email ?? '',
-        notification_discord_webhook: settings.notification_discord_webhook ?? '',
+        auto_upgrade: settings.auto_upgrade,
+        settings_json: settings.settings_json,
       })
     }
   }, [settings])
@@ -96,16 +87,6 @@ export default function AppSettings() {
       onSuccess: () => toast.success('Settings saved'),
       onError: () => toast.error('Failed to save settings'),
     })
-  }
-
-  const addPath = () => {
-    if (!newPath.trim()) return
-    setForm({ ...form, watch_paths: [...form.watch_paths, newPath.trim()] })
-    setNewPath('')
-  }
-
-  const removePath = (index: number) => {
-    setForm({ ...form, watch_paths: form.watch_paths.filter((_, i) => i !== index) })
   }
 
   if (isLoading) {
@@ -132,107 +113,20 @@ export default function AppSettings() {
         </button>
       </div>
 
-      {/* Watch Paths */}
-      <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
-        <h2 className="text-sm font-mono text-gray-400 flex items-center gap-2">
-          <FolderOpen className="w-4 h-4" /> Watch Paths
-        </h2>
-        <p className="text-[11px] text-gray-600">Directories to monitor for new audio files</p>
-        <div className="space-y-2">
-          {form.watch_paths.map((p, i) => (
-            <div key={i} className="flex items-center gap-2 group">
-              <code className="flex-1 px-3 py-2 bg-dark rounded-lg text-sm text-gray-400 font-mono truncate">
-                {p}
-              </code>
-              <button
-                onClick={() => removePath(i)}
-                className="p-2 text-gray-600 hover:text-cyber-red transition-colors opacity-0 group-hover:opacity-100"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-          ))}
-        </div>
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={newPath}
-            onChange={(e) => setNewPath(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && addPath()}
-            placeholder="/path/to/mixes"
-            className="flex-1 px-4 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
-          />
-          <button
-            onClick={addPath}
-            className="px-4 py-2 bg-primary/10 text-primary border border-primary/30 rounded-lg hover:bg-primary/20 transition-all"
-          >
-            <Plus className="w-4 h-4" />
-          </button>
-        </div>
-      </div>
+      {/* Platform Connections (OAuth) */}
+      <OAuthConnect />
 
-      {/* Upload Settings */}
+      {/* LLM Provider */}
       <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
         <h2 className="text-sm font-mono text-gray-400 flex items-center gap-2">
-          <Upload className="w-4 h-4" /> Upload Settings
-        </h2>
-        <div className="space-y-4">
-          <Toggle
-            checked={form.draft_mode}
-            onChange={(v) => setForm({ ...form, draft_mode: v })}
-            label="Draft Mode"
-            description="Require manual approval before uploading to platforms"
-          />
-          <div className="neon-line" />
-          <Toggle
-            checked={form.upload_to_soundcloud}
-            onChange={(v) => setForm({ ...form, upload_to_soundcloud: v })}
-            label="Upload to SoundCloud"
-            description={settings?.soundcloud_connected ? 'Connected' : 'Not connected - authorize below'}
-          />
-          <div className="flex items-center gap-2 pl-4">
-            {settings?.soundcloud_connected ? (
-              <span className="flex items-center gap-1.5 text-xs text-primary">
-                <CheckCircle2 className="w-3.5 h-3.5" /> Authorized
-              </span>
-            ) : (
-              <button className="text-xs text-secondary hover:text-secondary/80 underline transition-colors">
-                Connect SoundCloud
-              </button>
-            )}
-          </div>
-          <div className="neon-line" />
-          <Toggle
-            checked={form.upload_to_youtube}
-            onChange={(v) => setForm({ ...form, upload_to_youtube: v })}
-            label="Upload to YouTube"
-            description={settings?.youtube_connected ? 'Connected' : 'Not connected - authorize below'}
-          />
-          <div className="flex items-center gap-2 pl-4">
-            {settings?.youtube_connected ? (
-              <span className="flex items-center gap-1.5 text-xs text-primary">
-                <CheckCircle2 className="w-3.5 h-3.5" /> Authorized
-              </span>
-            ) : (
-              <button className="text-xs text-cyber-red hover:text-cyber-red/80 underline transition-colors">
-                Connect YouTube
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* AI Provider */}
-      <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
-        <h2 className="text-sm font-mono text-gray-400 flex items-center gap-2">
-          <Brain className="w-4 h-4" /> AI Provider
+          <Brain className="w-4 h-4" /> LLM Provider
         </h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-2">
             <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">Provider</label>
             <select
-              value={form.ai_provider}
-              onChange={(e) => setForm({ ...form, ai_provider: e.target.value })}
+              value={form.llm_provider}
+              onChange={(e) => setForm({ ...form, llm_provider: e.target.value })}
               className="w-full px-4 py-2.5 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-none font-mono"
             >
               <option value="openai">OpenAI</option>
@@ -244,8 +138,8 @@ export default function AppSettings() {
             <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">Model</label>
             <input
               type="text"
-              value={form.ai_model}
-              onChange={(e) => setForm({ ...form, ai_model: e.target.value })}
+              value={form.llm_model}
+              onChange={(e) => setForm({ ...form, llm_model: e.target.value })}
               className="w-full px-4 py-2.5 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
               placeholder="gpt-4o"
             />
@@ -253,34 +147,102 @@ export default function AppSettings() {
         </div>
       </div>
 
-      {/* Notifications */}
+      {/* Image Generation */}
       <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
         <h2 className="text-sm font-mono text-gray-400 flex items-center gap-2">
-          <Bell className="w-4 h-4" /> Notifications
+          <Image className="w-4 h-4" /> Image Generation
+        </h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">Provider</label>
+            <select
+              value={form.image_gen_provider}
+              onChange={(e) => setForm({ ...form, image_gen_provider: e.target.value })}
+              className="w-full px-4 py-2.5 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-none font-mono"
+            >
+              <option value="openai">OpenAI (DALL-E)</option>
+              <option value="stability">Stability AI</option>
+              <option value="midjourney">Midjourney</option>
+            </select>
+          </div>
+          <div className="space-y-2">
+            <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">Model</label>
+            <input
+              type="text"
+              value={form.image_gen_model}
+              onChange={(e) => setForm({ ...form, image_gen_model: e.target.value })}
+              className="w-full px-4 py-2.5 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
+              placeholder="dall-e-3"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Premiere Settings */}
+      <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
+        <h2 className="text-sm font-mono text-gray-400 flex items-center gap-2">
+          <Calendar className="w-4 h-4" /> Premiere Schedule
+        </h2>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="space-y-2">
+            <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">Mode</label>
+            <select
+              value={form.premiere_mode}
+              onChange={(e) => setForm({ ...form, premiere_mode: e.target.value })}
+              className="w-full px-4 py-2.5 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-none font-mono"
+            >
+              <option value="immediate">Immediate</option>
+              <option value="scheduled">Scheduled</option>
+              <option value="manual">Manual</option>
+            </select>
+          </div>
+          <div className="space-y-2">
+            <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">Day</label>
+            <select
+              value={form.premiere_day}
+              onChange={(e) => setForm({ ...form, premiere_day: e.target.value })}
+              className="w-full px-4 py-2.5 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-none font-mono"
+            >
+              {['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'].map((d) => (
+                <option key={d} value={d}>
+                  {d.charAt(0).toUpperCase() + d.slice(1)}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="space-y-2">
+            <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">Hour (UTC)</label>
+            <input
+              type="number"
+              min={0}
+              max={23}
+              value={form.premiere_hour_utc}
+              onChange={(e) => setForm({ ...form, premiere_hour_utc: parseInt(e.target.value) || 0 })}
+              className="w-full px-4 py-2.5 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Toggles */}
+      <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
+        <h2 className="text-sm font-mono text-gray-400 flex items-center gap-2">
+          <ToggleLeft className="w-4 h-4" /> Behavior
         </h2>
         <div className="space-y-4">
-          <div className="space-y-2">
-            <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">Email</label>
-            <input
-              type="email"
-              value={form.notification_email}
-              onChange={(e) => setForm({ ...form, notification_email: e.target.value })}
-              className="w-full px-4 py-2.5 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
-              placeholder="you@example.com"
-            />
-          </div>
-          <div className="space-y-2">
-            <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">
-              Discord Webhook URL
-            </label>
-            <input
-              type="url"
-              value={form.notification_discord_webhook}
-              onChange={(e) => setForm({ ...form, notification_discord_webhook: e.target.value })}
-              className="w-full px-4 py-2.5 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
-              placeholder="https://discord.com/api/webhooks/..."
-            />
-          </div>
+          <Toggle
+            checked={form.draft_mode}
+            onChange={(v) => setForm({ ...form, draft_mode: v })}
+            label="Draft Mode"
+            description="Require manual approval before uploading to platforms"
+          />
+          <div className="neon-line" />
+          <Toggle
+            checked={form.auto_upgrade}
+            onChange={(v) => setForm({ ...form, auto_upgrade: v })}
+            label="Auto Upgrade"
+            description="Automatically apply system updates when available"
+          />
         </div>
       </div>
 

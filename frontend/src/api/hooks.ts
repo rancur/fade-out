@@ -1,106 +1,169 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import client from './client'
 
-// ---------- Types ----------
+// ---------- Types (matching actual backend API responses) ----------
 
 export interface Mix {
   id: string
   title: string
-  filename: string
-  status: 'pending' | 'processing' | 'generating' | 'reviewing' | 'approved' | 'uploaded' | 'failed'
-  genres: string[]
-  duration_seconds: number
-  bpm?: number
-  cover_art_url?: string
-  soundcloud_url?: string
-  youtube_url?: string
-  description?: string
-  tracklist?: string[]
-  energy_data?: { time: number; energy: number }[]
-  pipeline_steps?: PipelineStep[]
-  ai_cost?: number
+  audio_file_path: string | null
+  video_file_path: string | null
+  duration_seconds: number | null
+  genres: string[] | null
+  vibes: string[] | null
+  energy_profile: { time: number; rms: number }[] | null
+  tracklist: { title: string; artist: string; timestamp_seconds: number; timestamp_formatted?: string }[] | null
+  description_soundcloud: string | null
+  description_youtube: string | null
+  title_youtube: string | null
+  tags: string[] | null
+  cover_art_path: string | null
+  thumbnail_path: string | null
+  soundcloud_url: string | null
+  youtube_url: string | null
+  youtube_playlist_id: string | null
+  pipeline_status: string
+  pipeline_step: string | null
+  pipeline_error: string | null
+  pipeline_started_at: string | null
+  pipeline_completed_at: string | null
   created_at: string
   updated_at: string
+  metadata_json: Record<string, unknown> | null
+}
+
+export interface MixDetail extends Mix {
+  steps: PipelineStep[]
 }
 
 export interface PipelineStep {
-  name: string
-  status: 'pending' | 'running' | 'complete' | 'failed' | 'skipped'
-  started_at?: string
-  finished_at?: string
-  error?: string
+  id: number
+  mix_id: string
+  step_name: string
+  status: string
+  started_at: string | null
+  completed_at: string | null
+  error: string | null
+  retry_count: number
+  output_json: Record<string, unknown> | null
 }
 
 export interface PipelineStatus {
-  queue_length: number
-  active_mix_id?: string
-  active_step?: string
-  recent: { mix_id: string; title: string; status: string; finished_at: string }[]
+  paused: boolean
+  active: number
+  queued: number
+  completed: number
+  failed: number
 }
 
-export interface Settings {
-  watch_paths: string[]
-  upload_to_soundcloud: boolean
-  upload_to_youtube: boolean
-  soundcloud_connected: boolean
-  youtube_connected: boolean
+export interface AppSettings {
+  id: number
+  image_gen_provider: string
+  image_gen_model: string
+  llm_provider: string
+  llm_model: string
+  premiere_mode: string
+  premiere_hour_utc: number
+  premiere_day: string
   draft_mode: boolean
-  ai_provider: string
-  ai_model: string
-  notification_email?: string
-  notification_discord_webhook?: string
+  auto_upgrade: boolean
+  settings_json: Record<string, unknown> | null
+  updated_at: string
 }
 
-export interface Brand {
-  artist_name: string
-  primary_color: string
-  secondary_color: string
-  style_description: string
-  description_template: string
-  motifs: string[]
-  links: { label: string; url: string }[]
+export interface BrandSettings {
+  id: number
+  brand_name: string | null
+  description_template: string | null
+  color_palette: string[] | null
+  visual_style: string | null
+  motifs: string[] | null
+  genre_visual_modifiers: Record<string, string> | null
+  title_format: string | null
+  youtube_playlists: Record<string, string> | null
+  soundcloud_links: string | null
+  youtube_links: string | null
+  updated_at: string | null
 }
 
-export interface AIUsageData {
-  total_cost: number
-  budget_limit: number
-  month: string
-  daily_costs: { date: string; description: number; tracklist: number; tags: number; cover: number }[]
-  per_mix: { mix_id: string; title: string; cost: number; date: string }[]
-}
-
-export interface Notification {
-  id: string
-  type: 'success' | 'error' | 'warning' | 'info'
-  title: string
-  message: string
-  mix_id?: string
+export interface AIUsageRecord {
+  id: number
+  mix_id: string | null
+  provider: string
+  model: string
+  operation: string
+  input_tokens: number
+  output_tokens: number
+  cost_usd: number
   created_at: string
-  read: boolean
+}
+
+export interface AIBudget {
+  monthly_budget: number
+  spent_this_month: number
+  remaining: number
+  percentage_used: number
+}
+
+export interface NotificationRecord {
+  id: number
+  mix_id: string | null
+  type: string
+  channel: string
+  message: string
+  sent: boolean
+  sent_at: string | null
+  created_at: string
 }
 
 export interface UpgradeStatus {
   current_version: string
-  latest_version: string
+  latest_version: string | null
   update_available: boolean
-  changelog?: string
-  backups: { name: string; date: string; size_mb: number }[]
+  last_checked: string | null
+}
+
+export interface BackupItem {
+  filename: string
+  path: string
+  size_bytes: number
+  created_at: string
+}
+
+// ---------- Paginated response wrapper ----------
+
+interface Paginated<T> {
+  items: T[]
+  total: number
+  page: number
+  page_size: number
 }
 
 // ---------- Mixes ----------
 
-export function useMixes(params?: { status?: string; genre?: string; search?: string; page?: number; limit?: number }) {
+export function useMixes(params?: { status?: string; page?: number; page_size?: number }) {
   return useQuery({
     queryKey: ['mixes', params],
-    queryFn: () => client.get<{ mixes: Mix[]; total: number }>('/mixes', { params }).then((r) => r.data),
+    queryFn: () => client.get<Paginated<Mix>>('/mixes', { params }).then((r) => r.data),
   })
 }
 
 export function useMix(id: string) {
   return useQuery({
     queryKey: ['mixes', id],
-    queryFn: () => client.get<Mix>(`/mixes/${id}`).then((r) => r.data),
+    queryFn: () => client.get<MixDetail>(`/mixes/${id}`).then((r) => r.data),
     enabled: !!id,
+  })
+}
+
+export function useCreateMix() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data: { title: string; audio_file_path?: string; video_file_path?: string }) =>
+      client.post('/mixes', data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['mixes'] })
+    },
   })
 }
 
@@ -144,19 +207,39 @@ export function usePipelineStatus() {
   })
 }
 
+export function usePausePipeline() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => client.post('/pipeline/pause'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pipeline'] })
+    },
+  })
+}
+
+export function useResumePipeline() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => client.post('/pipeline/resume'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pipeline'] })
+    },
+  })
+}
+
 // ---------- Settings ----------
 
 export function useSettings() {
   return useQuery({
     queryKey: ['settings'],
-    queryFn: () => client.get<Settings>('/settings').then((r) => r.data),
+    queryFn: () => client.get<AppSettings>('/settings').then((r) => r.data),
   })
 }
 
 export function useUpdateSettings() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (data: Partial<Settings>) => client.put('/settings', data),
+    mutationFn: (data: Partial<AppSettings>) => client.put('/settings', data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['settings'] })
     },
@@ -168,14 +251,14 @@ export function useUpdateSettings() {
 export function useBrand() {
   return useQuery({
     queryKey: ['brand'],
-    queryFn: () => client.get<Brand>('/brand').then((r) => r.data),
+    queryFn: () => client.get<BrandSettings>('/brand').then((r) => r.data),
   })
 }
 
 export function useUpdateBrand() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (data: Partial<Brand>) => client.put('/brand', data),
+    mutationFn: (data: Partial<BrandSettings>) => client.put('/brand', data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['brand'] })
     },
@@ -184,53 +267,56 @@ export function useUpdateBrand() {
 
 // ---------- AI Usage ----------
 
-export function useAIUsage() {
+export function useAIUsage(params?: { start_date?: string; end_date?: string; page?: number }) {
   return useQuery({
-    queryKey: ['ai-usage'],
-    queryFn: () => client.get<AIUsageData>('/ai/usage').then((r) => r.data),
+    queryKey: ['ai-usage', params],
+    queryFn: () => client.get<Paginated<AIUsageRecord>>('/ai/usage', { params }).then((r) => r.data),
+  })
+}
+
+export function useAIUsageSummary() {
+  return useQuery({
+    queryKey: ['ai-usage-summary'],
+    queryFn: () => client.get<{ items: { provider: string; model: string; operation: string; total_cost: number; total_input_tokens: number; total_output_tokens: number; count: number }[] }>('/ai/usage/summary').then((r) => r.data),
   })
 }
 
 export function useAIBudget() {
   return useQuery({
     queryKey: ['ai-budget'],
-    queryFn: () => client.get<{ budget_limit: number; spent: number }>('/ai/budget').then((r) => r.data),
-  })
-}
-
-export function useUpdateAIBudget() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (budget_limit: number) => client.put('/ai/budget', { budget_limit }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['ai-budget'] })
-      qc.invalidateQueries({ queryKey: ['ai-usage'] })
-    },
+    queryFn: () => client.get<AIBudget>('/ai/budget').then((r) => r.data),
   })
 }
 
 // ---------- Notifications ----------
 
-export function useNotifications(params?: { type?: string; limit?: number }) {
+export function useNotifications(params?: { type?: string; channel?: string; page?: number }) {
   return useQuery({
     queryKey: ['notifications', params],
-    queryFn: () => client.get<Notification[]>('/notifications', { params }).then((r) => r.data),
-  })
-}
-
-export function useMarkNotificationRead() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (id: string) => client.post(`/notifications/${id}/read`),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['notifications'] })
-    },
+    queryFn: () => client.get<Paginated<NotificationRecord>>('/notifications', { params }).then((r) => r.data),
   })
 }
 
 export function useTestNotification() {
   return useMutation({
-    mutationFn: (channel: 'email' | 'discord') => client.post('/notifications/test', { channel }),
+    mutationFn: (channel: string) => client.post('/notifications/test', { channel }),
+  })
+}
+
+export function useNotificationSettings() {
+  return useQuery({
+    queryKey: ['notification-settings'],
+    queryFn: () => client.get<Record<string, unknown>>('/notifications/settings').then((r) => r.data),
+  })
+}
+
+export function useUpdateNotificationSettings() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (data: Record<string, unknown>) => client.put('/notifications/settings', data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['notification-settings'] })
+    },
   })
 }
 
@@ -243,7 +329,17 @@ export function useUpgradeStatus() {
   })
 }
 
-export function usePerformUpgrade() {
+export function useCheckUpgrade() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => client.post('/upgrade/check'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['upgrade'] })
+    },
+  })
+}
+
+export function useApplyUpgrade() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: () => client.post('/upgrade/apply'),
@@ -253,12 +349,19 @@ export function usePerformUpgrade() {
   })
 }
 
+export function useBackups() {
+  return useQuery({
+    queryKey: ['backups'],
+    queryFn: () => client.get<{ backups: BackupItem[]; total: number }>('/upgrade/backups').then((r) => r.data),
+  })
+}
+
 export function useCreateBackup() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: () => client.post('/upgrade/backup'),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['upgrade'] })
+      qc.invalidateQueries({ queryKey: ['backups'] })
     },
   })
 }

@@ -1,63 +1,43 @@
 import { useState, useEffect } from 'react'
 import { Palette, Save, Plus, X, Link as LinkIcon } from 'lucide-react'
 import { toast } from 'sonner'
-import clsx from 'clsx'
 import { useBrand, useUpdateBrand } from '@/api/hooks'
-
-function ColorInput({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
-  return (
-    <div className="space-y-2">
-      <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">{label}</label>
-      <div className="flex items-center gap-3">
-        <div className="relative">
-          <input
-            type="color"
-            value={value}
-            onChange={(e) => onChange(e.target.value)}
-            className="w-10 h-10 rounded-lg cursor-pointer bg-transparent border-2 border-white/10 hover:border-primary/30 transition-colors"
-          />
-        </div>
-        <input
-          type="text"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          className="flex-1 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 font-mono focus:border-primary/40 focus:outline-none"
-        />
-        <div
-          className="w-10 h-10 rounded-lg border border-white/10"
-          style={{ backgroundColor: value }}
-        />
-      </div>
-    </div>
-  )
-}
 
 export default function BrandSettings() {
   const { data: brand, isLoading } = useBrand()
   const update = useUpdateBrand()
 
   const [form, setForm] = useState({
-    artist_name: '',
-    primary_color: '#7CB342',
-    secondary_color: '#FF8A65',
-    style_description: '',
+    brand_name: '',
     description_template: '',
+    color_palette: [] as string[],
+    visual_style: '',
     motifs: [] as string[],
-    links: [] as { label: string; url: string }[],
+    genre_visual_modifiers: {} as Record<string, string>,
+    title_format: '',
+    youtube_playlists: {} as Record<string, string>,
+    soundcloud_links: '',
+    youtube_links: '',
   })
 
   const [newMotif, setNewMotif] = useState('')
+  const [newColor, setNewColor] = useState('#7CB342')
+  const [newModGenre, setNewModGenre] = useState('')
+  const [newModStyle, setNewModStyle] = useState('')
 
   useEffect(() => {
     if (brand) {
       setForm({
-        artist_name: brand.artist_name,
-        primary_color: brand.primary_color,
-        secondary_color: brand.secondary_color,
-        style_description: brand.style_description,
-        description_template: brand.description_template,
-        motifs: brand.motifs,
-        links: brand.links,
+        brand_name: brand.brand_name ?? '',
+        description_template: brand.description_template ?? '',
+        color_palette: brand.color_palette ?? [],
+        visual_style: brand.visual_style ?? '',
+        motifs: brand.motifs ?? [],
+        genre_visual_modifiers: brand.genre_visual_modifiers ?? {},
+        title_format: brand.title_format ?? '',
+        youtube_playlists: brand.youtube_playlists ?? {},
+        soundcloud_links: brand.soundcloud_links ?? '',
+        youtube_links: brand.youtube_links ?? '',
       })
     }
   }, [brand])
@@ -79,18 +59,30 @@ export default function BrandSettings() {
     setForm({ ...form, motifs: form.motifs.filter((_, i) => i !== index) })
   }
 
-  const addLink = () => {
-    setForm({ ...form, links: [...form.links, { label: '', url: '' }] })
+  const addColor = () => {
+    if (!newColor.trim()) return
+    setForm({ ...form, color_palette: [...form.color_palette, newColor.trim()] })
+    setNewColor('#7CB342')
   }
 
-  const updateLink = (index: number, field: 'label' | 'url', value: string) => {
-    const links = [...form.links]
-    links[index] = { ...links[index], [field]: value }
-    setForm({ ...form, links })
+  const removeColor = (index: number) => {
+    setForm({ ...form, color_palette: form.color_palette.filter((_, i) => i !== index) })
   }
 
-  const removeLink = (index: number) => {
-    setForm({ ...form, links: form.links.filter((_, i) => i !== index) })
+  const addModifier = () => {
+    if (!newModGenre.trim() || !newModStyle.trim()) return
+    setForm({
+      ...form,
+      genre_visual_modifiers: { ...form.genre_visual_modifiers, [newModGenre.trim()]: newModStyle.trim() },
+    })
+    setNewModGenre('')
+    setNewModStyle('')
+  }
+
+  const removeModifier = (genre: string) => {
+    const mods = { ...form.genre_visual_modifiers }
+    delete mods[genre]
+    setForm({ ...form, genre_visual_modifiers: mods })
   }
 
   if (isLoading) {
@@ -117,63 +109,107 @@ export default function BrandSettings() {
         </button>
       </div>
 
-      {/* Artist Name */}
+      {/* Brand Name */}
       <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
-        <h2 className="text-sm font-mono text-gray-400">Artist Name</h2>
+        <h2 className="text-sm font-mono text-gray-400">Brand Name</h2>
         <input
           type="text"
-          value={form.artist_name}
-          onChange={(e) => setForm({ ...form, artist_name: e.target.value })}
+          value={form.brand_name}
+          onChange={(e) => setForm({ ...form, brand_name: e.target.value })}
           className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-gray-200 focus:border-primary/40 focus:outline-none font-mono"
           placeholder="Your DJ name"
         />
       </div>
 
-      {/* Colors */}
+      {/* Color Palette */}
       <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
-        <h2 className="text-sm font-mono text-gray-400">Brand Colors</h2>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-          <ColorInput
-            label="Primary"
-            value={form.primary_color}
-            onChange={(v) => setForm({ ...form, primary_color: v })}
+        <h2 className="text-sm font-mono text-gray-400">Color Palette</h2>
+        <div className="flex flex-wrap gap-3">
+          {form.color_palette.map((color, i) => (
+            <div key={i} className="flex items-center gap-2 group">
+              <div
+                className="w-10 h-10 rounded-lg border border-white/10"
+                style={{ backgroundColor: color }}
+              />
+              <code className="text-xs text-gray-400 font-mono">{color}</code>
+              <button
+                onClick={() => removeColor(i)}
+                className="p-1 text-gray-600 hover:text-cyber-red transition-colors opacity-0 group-hover:opacity-100"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            type="color"
+            value={newColor}
+            onChange={(e) => setNewColor(e.target.value)}
+            className="w-10 h-10 rounded-lg cursor-pointer bg-transparent border-2 border-white/10 hover:border-primary/30 transition-colors"
           />
-          <ColorInput
-            label="Secondary"
-            value={form.secondary_color}
-            onChange={(v) => setForm({ ...form, secondary_color: v })}
+          <input
+            type="text"
+            value={newColor}
+            onChange={(e) => setNewColor(e.target.value)}
+            className="w-28 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 font-mono focus:border-primary/40 focus:outline-none"
           />
+          <button
+            onClick={addColor}
+            className="px-4 py-2 bg-primary/10 text-primary border border-primary/30 rounded-lg text-sm hover:bg-primary/20 transition-all"
+          >
+            <Plus className="w-4 h-4" />
+          </button>
         </div>
         {/* Preview */}
-        <div className="mt-4 p-4 rounded-lg border border-white/5">
-          <p className="text-[10px] text-gray-600 font-mono uppercase tracking-wider mb-3">Preview</p>
-          <div className="flex gap-4 items-center">
-            <div
-              className="w-16 h-16 rounded-xl"
-              style={{ background: `linear-gradient(135deg, ${form.primary_color}, ${form.secondary_color})` }}
-            />
-            <div>
-              <p className="text-lg font-bold" style={{ color: form.primary_color }}>
-                {form.artist_name || 'Artist'}
-              </p>
-              <p className="text-sm" style={{ color: form.secondary_color }}>
-                DJ Mix Series
-              </p>
+        {form.color_palette.length > 0 && (
+          <div className="mt-4 p-4 rounded-lg border border-white/5">
+            <p className="text-[10px] text-gray-600 font-mono uppercase tracking-wider mb-3">Preview</p>
+            <div className="flex gap-4 items-center">
+              <div
+                className="w-16 h-16 rounded-xl"
+                style={{
+                  background: `linear-gradient(135deg, ${form.color_palette[0] ?? '#7CB342'}, ${form.color_palette[1] ?? form.color_palette[0] ?? '#FF8A65'})`,
+                }}
+              />
+              <div>
+                <p className="text-lg font-bold" style={{ color: form.color_palette[0] ?? '#7CB342' }}>
+                  {form.brand_name || 'Brand'}
+                </p>
+                <p className="text-sm" style={{ color: form.color_palette[1] ?? form.color_palette[0] ?? '#FF8A65' }}>
+                  DJ Mix Series
+                </p>
+              </div>
             </div>
           </div>
-        </div>
+        )}
       </div>
 
-      {/* Style Description */}
+      {/* Visual Style */}
       <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
-        <h2 className="text-sm font-mono text-gray-400">Style Description</h2>
-        <p className="text-[11px] text-gray-600">Describe your DJ style for AI-generated descriptions</p>
+        <h2 className="text-sm font-mono text-gray-400">Visual Style</h2>
+        <p className="text-[11px] text-gray-600">Describe the visual aesthetic for AI-generated cover art</p>
         <textarea
-          value={form.style_description}
-          onChange={(e) => setForm({ ...form, style_description: e.target.value })}
+          value={form.visual_style}
+          onChange={(e) => setForm({ ...form, visual_style: e.target.value })}
           rows={4}
           className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none resize-none font-mono"
-          placeholder="e.g. Deep house / melodic techno DJ blending atmospheric soundscapes with driving rhythms..."
+          placeholder="e.g. Neon-soaked cyberpunk cityscapes with vibrant gradients and abstract geometric overlays..."
+        />
+      </div>
+
+      {/* Title Format */}
+      <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
+        <h2 className="text-sm font-mono text-gray-400">Title Format</h2>
+        <p className="text-[11px] text-gray-600">
+          Template for mix titles. Use {'{brand}'}, {'{genre}'}, {'{number}'} as variables.
+        </p>
+        <input
+          type="text"
+          value={form.title_format}
+          onChange={(e) => setForm({ ...form, title_format: e.target.value })}
+          className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
+          placeholder="{brand} - {genre} Mix #{number}"
         />
       </div>
 
@@ -226,50 +262,79 @@ export default function BrandSettings() {
         </div>
       </div>
 
-      {/* Links */}
+      {/* Genre Visual Modifiers */}
       <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-mono text-gray-400 flex items-center gap-2">
-            <LinkIcon className="w-4 h-4" /> Social Links
-          </h2>
-          <button
-            onClick={addLink}
-            className="flex items-center gap-1.5 text-xs text-primary hover:text-primary/80 transition-colors"
-          >
-            <Plus className="w-3.5 h-3.5" /> Add Link
-          </button>
-        </div>
-        <div className="space-y-3">
-          {form.links.map((link, i) => (
-            <div key={i} className="flex gap-2">
-              <input
-                type="text"
-                value={link.label}
-                onChange={(e) => updateLink(i, 'label', e.target.value)}
-                placeholder="Label"
-                className="w-32 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
-              />
-              <input
-                type="url"
-                value={link.url}
-                onChange={(e) => updateLink(i, 'url', e.target.value)}
-                placeholder="https://..."
-                className="flex-1 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
-              />
+        <h2 className="text-sm font-mono text-gray-400">Genre Visual Modifiers</h2>
+        <p className="text-[11px] text-gray-600">Map genres to visual style overrides for cover art</p>
+        <div className="space-y-2">
+          {Object.entries(form.genre_visual_modifiers).map(([genre, style]) => (
+            <div key={genre} className="flex items-center gap-2 group">
+              <code className="w-32 shrink-0 px-3 py-2 bg-dark rounded-lg text-sm text-primary font-mono truncate">
+                {genre}
+              </code>
+              <code className="flex-1 px-3 py-2 bg-dark rounded-lg text-sm text-gray-400 font-mono truncate">
+                {style}
+              </code>
               <button
-                onClick={() => removeLink(i)}
-                className={clsx(
-                  'p-2 rounded-lg border text-gray-500 hover:text-cyber-red hover:border-cyber-red/30 transition-all',
-                  'border-white/5',
-                )}
+                onClick={() => removeModifier(genre)}
+                className="p-2 text-gray-600 hover:text-cyber-red transition-colors opacity-0 group-hover:opacity-100"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
           ))}
-          {form.links.length === 0 && (
-            <p className="text-sm text-gray-600 italic">No links added yet.</p>
-          )}
+        </div>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={newModGenre}
+            onChange={(e) => setNewModGenre(e.target.value)}
+            placeholder="Genre"
+            className="w-32 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
+          />
+          <input
+            type="text"
+            value={newModStyle}
+            onChange={(e) => setNewModStyle(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && addModifier()}
+            placeholder="Visual style modifier..."
+            className="flex-1 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
+          />
+          <button
+            onClick={addModifier}
+            className="px-4 py-2 bg-primary/10 text-primary border border-primary/30 rounded-lg text-sm hover:bg-primary/20 transition-all"
+          >
+            <Plus className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* Links */}
+      <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-5">
+        <h2 className="text-sm font-mono text-gray-400 flex items-center gap-2">
+          <LinkIcon className="w-4 h-4" /> Platform Links
+        </h2>
+        <div className="space-y-4">
+          <div className="space-y-2">
+            <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">SoundCloud Links</label>
+            <textarea
+              value={form.soundcloud_links}
+              onChange={(e) => setForm({ ...form, soundcloud_links: e.target.value })}
+              rows={3}
+              className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none resize-none font-mono"
+              placeholder="https://soundcloud.com/your-profile"
+            />
+          </div>
+          <div className="space-y-2">
+            <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">YouTube Links</label>
+            <textarea
+              value={form.youtube_links}
+              onChange={(e) => setForm({ ...form, youtube_links: e.target.value })}
+              rows={3}
+              className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none resize-none font-mono"
+              placeholder="https://youtube.com/@your-channel"
+            />
+          </div>
         </div>
       </div>
     </div>

@@ -1,33 +1,17 @@
 import { useState } from 'react'
-import { Brain, DollarSign, TrendingUp, Zap, Music2 } from 'lucide-react'
+import { Brain, DollarSign, TrendingUp, Zap, BarChart3 } from 'lucide-react'
 import clsx from 'clsx'
 import { format } from 'date-fns'
-import { useAIUsage, useAIBudget, useUpdateAIBudget } from '@/api/hooks'
+import { useAIUsage, useAIBudget, useAIUsageSummary } from '@/api/hooks'
 import CostChart from '@/components/CostChart'
-import { toast } from 'sonner'
 
 export default function AIUsage() {
   const { data: usage, isLoading: usageLoading } = useAIUsage()
   const { data: budget, isLoading: budgetLoading } = useAIBudget()
-  const updateBudget = useUpdateAIBudget()
-  const [newBudget, setNewBudget] = useState<string>('')
+  const { data: summary } = useAIUsageSummary()
+  const [page, setPage] = useState(1)
 
   const isLoading = usageLoading || budgetLoading
-
-  const handleUpdateBudget = () => {
-    const val = parseFloat(newBudget)
-    if (isNaN(val) || val <= 0) {
-      toast.error('Enter a valid budget amount')
-      return
-    }
-    updateBudget.mutate(val, {
-      onSuccess: () => {
-        toast.success('Budget updated')
-        setNewBudget('')
-      },
-      onError: () => toast.error('Failed to update budget'),
-    })
-  }
 
   if (isLoading) {
     return (
@@ -43,9 +27,13 @@ export default function AIUsage() {
     )
   }
 
-  const spent = budget?.spent ?? 0
-  const limit = budget?.budget_limit ?? 10
-  const pct = (spent / limit) * 100
+  const spent = budget?.spent_this_month ?? 0
+  const limit = budget?.monthly_budget ?? 10
+  const remaining = budget?.remaining ?? limit - spent
+  const pct = budget?.percentage_used ?? (spent / limit) * 100
+
+  const records = usage?.items ?? []
+  const totalRecords = usage?.total ?? 0
 
   return (
     <div className="space-y-8">
@@ -54,9 +42,7 @@ export default function AIUsage() {
         <h1 className="font-pixel text-lg text-primary glow-text flex items-center gap-3">
           <Brain className="w-6 h-6" /> AI Usage
         </h1>
-        <p className="text-sm text-gray-500 mt-1">
-          {usage?.month ? format(new Date(usage.month + '-01'), 'MMMM yyyy') : 'This month'}
-        </p>
+        <p className="text-sm text-gray-500 mt-1">This month</p>
       </div>
 
       {/* Stats */}
@@ -71,12 +57,10 @@ export default function AIUsage() {
 
         <div className="bg-surface-light border border-primary/10 rounded-xl p-5">
           <div className="flex items-center gap-2 text-[11px] text-gray-500 font-mono uppercase tracking-wider mb-2">
-            <TrendingUp className="w-3.5 h-3.5" /> Avg per Mix
+            <TrendingUp className="w-3.5 h-3.5" /> Total Calls
           </div>
-          <p className="text-2xl font-bold text-accent">
-            ${usage?.per_mix.length ? (spent / usage.per_mix.length).toFixed(3) : '0.000'}
-          </p>
-          <p className="text-[11px] text-gray-600 mt-1">{usage?.per_mix.length ?? 0} mixes processed</p>
+          <p className="text-2xl font-bold text-accent">{totalRecords}</p>
+          <p className="text-[11px] text-gray-600 mt-1">API calls this period</p>
         </div>
 
         <div className="bg-surface-light border border-primary/10 rounded-xl p-5">
@@ -89,7 +73,7 @@ export default function AIUsage() {
               pct > 90 ? 'text-cyber-red' : pct > 70 ? 'text-cyber-orange' : 'text-primary',
             )}
           >
-            ${Math.max(0, limit - spent).toFixed(2)}
+            ${remaining.toFixed(2)}
           </p>
           <p className="text-[11px] text-gray-600 mt-1">{Math.round(100 - pct)}% of budget left</p>
         </div>
@@ -116,60 +100,57 @@ export default function AIUsage() {
             <div className="absolute inset-0 bg-white/10 animate-pulse-slow rounded-full" />
           </div>
         </div>
+      </div>
 
-        {/* Update budget */}
-        <div className="flex items-center gap-3 pt-2">
-          <label className="text-[11px] text-gray-500 font-mono shrink-0">Set Budget:</label>
-          <div className="flex items-center gap-2">
-            <span className="text-gray-500">$</span>
-            <input
-              type="number"
-              step="0.50"
-              min="1"
-              value={newBudget}
-              onChange={(e) => setNewBudget(e.target.value)}
-              placeholder={limit.toFixed(2)}
-              className="w-28 px-3 py-1.5 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
-            />
-            <button
-              onClick={handleUpdateBudget}
-              disabled={updateBudget.isPending}
-              className="px-4 py-1.5 bg-primary/10 text-primary border border-primary/30 rounded-lg text-sm hover:bg-primary/20 disabled:opacity-50 transition-all"
-            >
-              Update
-            </button>
-          </div>
+      {/* Cost Summary by Operation */}
+      {summary?.items && summary.items.length > 0 && (
+        <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-4">
+          <h2 className="text-sm font-mono text-gray-400 flex items-center gap-2">
+            <BarChart3 className="w-4 h-4" /> Cost Breakdown by Operation
+          </h2>
+          <CostChart data={summary.items} />
         </div>
-      </div>
+      )}
 
-      {/* Cost Chart */}
-      <div className="bg-surface-light border border-primary/10 rounded-xl p-6 space-y-4">
-        <h2 className="text-sm font-mono text-gray-400">Daily Cost Breakdown</h2>
-        <CostChart data={usage?.daily_costs ?? []} />
-      </div>
-
-      {/* Per-Mix Costs */}
+      {/* Usage Records Table */}
       <div className="bg-surface-light border border-primary/10 rounded-xl overflow-hidden">
         <div className="px-6 py-4 border-b border-primary/10">
           <h2 className="text-sm font-mono text-gray-400 flex items-center gap-2">
-            <Music2 className="w-4 h-4" /> Per-Mix Costs
+            <Brain className="w-4 h-4" /> Usage Records
           </h2>
         </div>
         <div className="divide-y divide-white/5">
-          {usage?.per_mix.length === 0 ? (
-            <div className="px-6 py-8 text-center text-gray-600 text-sm">No mix costs recorded yet.</div>
+          {records.length === 0 ? (
+            <div className="px-6 py-8 text-center text-gray-600 text-sm">No usage records yet.</div>
           ) : (
-            usage?.per_mix.map((item) => (
-              <div key={item.mix_id} className="flex items-center justify-between px-6 py-3">
+            records.map((item) => (
+              <div key={item.id} className="flex items-center justify-between px-6 py-3">
                 <div>
-                  <p className="text-sm text-gray-300">{item.title}</p>
-                  <p className="text-[10px] text-gray-600 font-mono">{format(new Date(item.date), 'MMM d, yyyy')}</p>
+                  <p className="text-sm text-gray-300">
+                    <span className="text-primary">{item.operation}</span>
+                    {item.mix_id && <span className="text-gray-600 ml-2 text-xs">mix:{item.mix_id.slice(0, 8)}</span>}
+                  </p>
+                  <p className="text-[10px] text-gray-600 font-mono">
+                    {item.provider}/{item.model} &middot; {item.input_tokens + item.output_tokens} tokens &middot;{' '}
+                    {format(new Date(item.created_at), 'MMM d, HH:mm')}
+                  </p>
                 </div>
-                <span className="text-sm font-mono text-gold">${item.cost.toFixed(3)}</span>
+                <span className="text-sm font-mono text-gold">${item.cost_usd.toFixed(4)}</span>
               </div>
             ))
           )}
         </div>
+        {/* Pagination hint */}
+        {totalRecords > records.length && (
+          <div className="px-6 py-3 border-t border-white/5 text-center">
+            <button
+              onClick={() => setPage(page + 1)}
+              className="text-xs text-primary hover:text-primary/80 transition-colors font-mono"
+            >
+              Load more ({totalRecords - records.length} remaining)
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )

@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import init_db
-from app.routers import ai_usage, brand, mixes, notifications, pipeline, settings as settings_router, upgrade
+from app.routers import ai_usage, auth, brand, mixes, notifications, pipeline, settings as settings_router, upgrade
 
 logger = logging.getLogger("fadeout")
 
@@ -51,6 +51,7 @@ app.add_middleware(
 )
 
 # --- Routers ---
+app.include_router(auth.router)
 app.include_router(mixes.router)
 app.include_router(pipeline.router)
 app.include_router(settings_router.router)

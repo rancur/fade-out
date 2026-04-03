@@ -8,6 +8,7 @@ import {
   Zap,
   ArrowRight,
   Activity,
+  Pause,
 } from 'lucide-react'
 import { useMixes, usePipelineStatus, useAIBudget } from '@/api/hooks'
 import StatusBadge from '@/components/StatusBadge'
@@ -42,16 +43,22 @@ function StatCard({
   )
 }
 
+function basename(path: string): string {
+  return path.split('/').pop() ?? path
+}
+
+const activeStatuses = new Set(['running', 'analyzing', 'generating', 'uploading_soundcloud', 'uploading_youtube', 'verifying'])
+
 export default function Dashboard() {
-  const { data: mixesData } = useMixes({ limit: 5 })
+  const { data: mixesData } = useMixes({ page_size: 5 })
   const { data: pipeline } = usePipelineStatus()
   const { data: budget } = useAIBudget()
 
-  const mixes = mixesData?.mixes ?? []
+  const mixes = mixesData?.items ?? []
   const total = mixesData?.total ?? 0
-  const uploaded = mixes.filter((m) => m.status === 'uploaded').length
-  const processing = mixes.filter((m) => ['processing', 'generating'].includes(m.status)).length
-  const failed = mixes.filter((m) => m.status === 'failed').length
+  const completed = mixes.filter((m) => m.pipeline_status === 'completed').length
+  const processing = mixes.filter((m) => activeStatuses.has(m.pipeline_status)).length
+  const failed = mixes.filter((m) => m.pipeline_status === 'failed').length
 
   return (
     <div className="space-y-8">
@@ -73,13 +80,13 @@ export default function Dashboard() {
       {/* Stats */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard icon={Music2} label="Total Mixes" value={total} accent="text-primary" />
-        <StatCard icon={Upload} label="Uploaded" value={uploaded} accent="text-cyber-lime" />
+        <StatCard icon={Upload} label="Completed" value={completed} accent="text-cyber-lime" />
         <StatCard
           icon={Clock}
           label="Processing"
           value={processing}
           accent="text-cyber-cyan"
-          sub={pipeline?.active_step ? `Step: ${pipeline.active_step}` : undefined}
+          sub={pipeline?.active ? `${pipeline.active} active` : undefined}
         />
         <StatCard icon={AlertTriangle} label="Failed" value={failed} accent="text-cyber-red" />
       </div>
@@ -93,20 +100,20 @@ export default function Dashboard() {
               <span className="text-sm font-mono text-gray-300">AI Budget</span>
             </div>
             <span className="text-sm font-mono text-gray-400">
-              ${budget.spent.toFixed(2)} / ${budget.budget_limit.toFixed(2)}
+              ${budget.spent_this_month.toFixed(2)} / ${budget.monthly_budget.toFixed(2)}
             </span>
           </div>
           <div className="h-3 bg-dark rounded-full overflow-hidden">
             <div
               className={clsx(
                 'h-full rounded-full transition-all duration-700',
-                budget.spent / budget.budget_limit > 0.9
+                budget.percentage_used > 90
                   ? 'bg-gradient-to-r from-cyber-red to-cyber-orange'
-                  : budget.spent / budget.budget_limit > 0.7
+                  : budget.percentage_used > 70
                     ? 'bg-gradient-to-r from-gold to-cyber-orange'
                     : 'bg-gradient-to-r from-primary to-cyber-cyan',
               )}
-              style={{ width: `${Math.min(100, (budget.spent / budget.budget_limit) * 100)}%` }}
+              style={{ width: `${Math.min(100, budget.percentage_used)}%` }}
             />
           </div>
         </div>
@@ -141,34 +148,41 @@ export default function Dashboard() {
                     </div>
                     <div className="min-w-0">
                       <p className="text-sm text-gray-200 truncate">{mix.title}</p>
-                      <p className="text-[10px] text-gray-600 font-mono">{mix.filename}</p>
+                      <p className="text-[10px] text-gray-600 font-mono">
+                        {mix.audio_file_path ? basename(mix.audio_file_path) : 'No file'}
+                      </p>
                     </div>
                   </div>
-                  <StatusBadge status={mix.status} />
+                  <StatusBadge status={mix.pipeline_status} />
                 </Link>
               ))
             )}
           </div>
         </div>
 
-        {/* Pipeline Queue */}
+        {/* Pipeline Status */}
         <div className="bg-surface-light border border-primary/10 rounded-xl overflow-hidden">
           <div className="flex items-center justify-between px-5 py-4 border-b border-primary/10">
             <h2 className="text-sm font-mono text-gray-300 flex items-center gap-2">
               <Activity className="w-4 h-4 text-cyber-cyan" /> Pipeline
             </h2>
             <span className="text-[11px] font-mono text-gray-500">
-              {pipeline?.queue_length ?? 0} queued
+              {pipeline?.queued ?? 0} queued
             </span>
           </div>
           <div className="p-5 space-y-4">
-            {pipeline?.active_mix_id ? (
+            {pipeline?.paused ? (
+              <div className="flex items-center gap-3 p-3 bg-gold/5 border border-gold/20 rounded-lg">
+                <Pause className="w-4 h-4 text-gold" />
+                <p className="text-sm text-gold font-mono">Pipeline Paused</p>
+              </div>
+            ) : pipeline?.active ? (
               <div className="flex items-center gap-3 p-3 bg-cyber-cyan/5 border border-cyber-cyan/20 rounded-lg">
                 <div className="w-3 h-3 rounded-full bg-cyber-cyan animate-pulse" />
                 <div>
                   <p className="text-sm text-cyber-cyan font-mono">Currently Processing</p>
                   <p className="text-[11px] text-gray-500">
-                    Step: {pipeline.active_step ?? 'initializing'}
+                    {pipeline.active} active &middot; {pipeline.queued} queued
                   </p>
                 </div>
               </div>
@@ -179,19 +193,17 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* Recent completions */}
-            {pipeline?.recent && pipeline.recent.length > 0 && (
-              <div className="space-y-2">
-                <p className="text-[10px] text-gray-600 font-mono uppercase tracking-wider">Recent</p>
-                {pipeline.recent.slice(0, 4).map((item) => (
-                  <div
-                    key={item.mix_id}
-                    className="flex items-center justify-between text-[11px] py-1"
-                  >
-                    <span className="text-gray-400 truncate max-w-[60%]">{item.title}</span>
-                    <StatusBadge status={item.status} />
-                  </div>
-                ))}
+            {/* Summary stats */}
+            {pipeline && (
+              <div className="grid grid-cols-2 gap-3">
+                <div className="text-center p-2 bg-white/[0.02] rounded-lg">
+                  <p className="text-lg font-bold text-cyber-lime">{pipeline.completed}</p>
+                  <p className="text-[10px] text-gray-600 font-mono uppercase">Completed</p>
+                </div>
+                <div className="text-center p-2 bg-white/[0.02] rounded-lg">
+                  <p className="text-lg font-bold text-cyber-red">{pipeline.failed}</p>
+                  <p className="text-[10px] text-gray-600 font-mono uppercase">Failed</p>
+                </div>
               </div>
             )}
           </div>

@@ -1,7 +1,7 @@
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 
 interface EnergyChartProps {
-  data: { time: number; energy: number }[]
+  data: { time: number; rms: number }[]
 }
 
 export default function EnergyChart({ data }: EnergyChartProps) {
@@ -59,7 +59,7 @@ export default function EnergyChart({ data }: EnergyChartProps) {
         />
         <Area
           type="monotone"
-          dataKey="energy"
+          dataKey="rms"
           stroke="url(#energyStroke)"
           strokeWidth={2}
           fill="url(#energyGrad)"

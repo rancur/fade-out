@@ -14,17 +14,21 @@ export default function MixList() {
   const [sort, setSort] = useState<'newest' | 'oldest' | 'title'>('newest')
 
   const { data, isLoading } = useMixes({
-    search: search || undefined,
     status: status === 'all' ? undefined : status,
     page,
-    limit: PAGE_SIZE,
+    page_size: PAGE_SIZE,
   })
 
-  const mixes = data?.mixes ?? []
+  const mixes = data?.items ?? []
   const total = data?.total ?? 0
   const totalPages = Math.ceil(total / PAGE_SIZE)
 
-  const sorted = [...mixes].sort((a, b) => {
+  // Client-side search filter (API doesn't support search param)
+  const filtered = search
+    ? mixes.filter((m) => m.title.toLowerCase().includes(search.toLowerCase()))
+    : mixes
+
+  const sorted = [...filtered].sort((a, b) => {
     if (sort === 'oldest') return new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
     if (sort === 'title') return a.title.localeCompare(b.title)
     return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()

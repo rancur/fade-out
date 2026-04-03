@@ -40,6 +40,11 @@ function formatDuration(seconds: number): string {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
+function basename(path: string | null): string | null {
+  if (!path) return null
+  return path.split('/').pop() ?? path
+}
+
 export default function MixDetail() {
   const { id } = useParams<{ id: string }>()
   const { data: mix, isLoading, error } = useMix(id ?? '')
@@ -93,6 +98,8 @@ export default function MixDetail() {
     })
   }
 
+  const filename = basename(mix.audio_file_path)
+
   return (
     <div className="space-y-6 animate-fade-in">
       {/* Back link */}
@@ -107,8 +114,8 @@ export default function MixDetail() {
       <div className="flex flex-col sm:flex-row gap-6">
         {/* Cover */}
         <div className="w-full sm:w-48 h-48 rounded-xl overflow-hidden bg-surface-light border border-primary/10 shrink-0">
-          {mix.cover_art_url ? (
-            <img src={mix.cover_art_url} alt={mix.title} className="w-full h-full object-cover" />
+          {mix.cover_art_path ? (
+            <img src={mix.cover_art_path} alt={mix.title} className="w-full h-full object-cover" />
           ) : (
             <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-primary/10 to-cyber-cyan/5">
               <Music className="w-16 h-16 text-primary/20" />
@@ -121,26 +128,39 @@ export default function MixDetail() {
           <div className="flex items-start justify-between gap-4">
             <div>
               <h1 className="text-xl font-bold text-gray-100">{mix.title}</h1>
-              <p className="text-sm text-gray-500 font-mono mt-1">{mix.filename}</p>
+              {filename && <p className="text-sm text-gray-500 font-mono mt-1">{filename}</p>}
             </div>
-            <StatusBadge status={mix.status} size="md" />
+            <StatusBadge status={mix.pipeline_status} size="md" />
           </div>
 
           {/* Meta row */}
           <div className="flex flex-wrap gap-4 text-sm text-gray-400 font-mono">
-            <span className="flex items-center gap-1.5">
-              <Clock className="w-4 h-4" /> {formatDuration(mix.duration_seconds)}
-            </span>
-            {mix.bpm && <span>{mix.bpm} BPM</span>}
+            {mix.duration_seconds != null && (
+              <span className="flex items-center gap-1.5">
+                <Clock className="w-4 h-4" /> {formatDuration(mix.duration_seconds)}
+              </span>
+            )}
+            {mix.pipeline_step && <span>Step: {mix.pipeline_step}</span>}
             <span>{format(new Date(mix.created_at), 'MMM d, yyyy h:mm a')}</span>
           </div>
 
           {/* Genres */}
-          {mix.genres.length > 0 && (
+          {mix.genres && mix.genres.length > 0 && (
             <div className="flex flex-wrap gap-2">
               {mix.genres.map((g) => (
                 <span key={g} className="text-xs px-2.5 py-1 rounded-full bg-primary/10 text-primary border border-primary/20 font-mono">
                   {g}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {/* Vibes */}
+          {mix.vibes && mix.vibes.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {mix.vibes.map((v) => (
+                <span key={v} className="text-xs px-2.5 py-1 rounded-full bg-cyber-magenta/10 text-cyber-magenta border border-cyber-magenta/20 font-mono">
+                  {v}
                 </span>
               ))}
             </div>
@@ -170,9 +190,16 @@ export default function MixDetail() {
             )}
           </div>
 
+          {/* Error */}
+          {mix.pipeline_error && (
+            <div className="text-xs text-cyber-red bg-cyber-red/5 border border-cyber-red/20 rounded-lg px-3 py-2 font-mono">
+              {mix.pipeline_error}
+            </div>
+          )}
+
           {/* Action buttons */}
           <div className="flex gap-2 pt-2">
-            {mix.status === 'reviewing' && (
+            {mix.pipeline_status === 'reviewing' && (
               <button
                 onClick={handleApprove}
                 disabled={approve.isPending}
@@ -182,7 +209,7 @@ export default function MixDetail() {
                 {approve.isPending ? 'Approving...' : 'Approve & Upload'}
               </button>
             )}
-            {mix.status === 'failed' && (
+            {mix.pipeline_status === 'failed' && (
               <button
                 onClick={handleRetry}
                 disabled={retry.isPending}
@@ -231,25 +258,50 @@ export default function MixDetail() {
           <div className="space-y-6">
             <div>
               <h3 className="text-sm font-mono text-gray-400 mb-3">Energy Profile</h3>
-              <EnergyChart data={mix.energy_data ?? []} />
+              <EnergyChart data={mix.energy_profile ?? []} />
             </div>
-            {mix.ai_cost !== undefined && (
-              <div className="flex items-center gap-2 text-sm text-gray-400">
-                <span className="font-mono">AI Cost:</span>
-                <span className="text-gold font-mono">${mix.ai_cost.toFixed(3)}</span>
+            {mix.tags && mix.tags.length > 0 && (
+              <div>
+                <h3 className="text-sm font-mono text-gray-400 mb-2">Tags</h3>
+                <div className="flex flex-wrap gap-2">
+                  {mix.tags.map((t) => (
+                    <span key={t} className="text-xs px-2 py-1 rounded bg-white/5 text-gray-400 font-mono">
+                      {t}
+                    </span>
+                  ))}
+                </div>
               </div>
             )}
           </div>
         )}
 
         {tab === 'description' && (
-          <div className="prose prose-invert max-w-none">
-            {mix.description ? (
-              <div className="text-sm text-gray-300 whitespace-pre-wrap leading-relaxed">
-                {mix.description}
+          <div className="prose prose-invert max-w-none space-y-6">
+            <div>
+              <h3 className="text-sm font-mono text-gray-400 mb-2">SoundCloud</h3>
+              {mix.description_soundcloud ? (
+                <div className="text-sm text-gray-300 whitespace-pre-wrap leading-relaxed">
+                  {mix.description_soundcloud}
+                </div>
+              ) : (
+                <p className="text-gray-600 text-sm italic">No SoundCloud description generated yet.</p>
+              )}
+            </div>
+            <div>
+              <h3 className="text-sm font-mono text-gray-400 mb-2">YouTube</h3>
+              {mix.description_youtube ? (
+                <div className="text-sm text-gray-300 whitespace-pre-wrap leading-relaxed">
+                  {mix.description_youtube}
+                </div>
+              ) : (
+                <p className="text-gray-600 text-sm italic">No YouTube description generated yet.</p>
+              )}
+            </div>
+            {mix.title_youtube && (
+              <div>
+                <h3 className="text-sm font-mono text-gray-400 mb-2">YouTube Title</h3>
+                <p className="text-sm text-gray-300">{mix.title_youtube}</p>
               </div>
-            ) : (
-              <p className="text-gray-600 text-sm italic">No description generated yet.</p>
             )}
           </div>
         )}
@@ -264,7 +316,12 @@ export default function MixDetail() {
                     className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-white/[0.02] transition-colors"
                   >
                     <span className="text-xs text-gray-600 font-mono w-6 text-right">{i + 1}</span>
-                    <span className="text-sm text-gray-300">{track}</span>
+                    <span className="text-xs text-gray-500 font-mono w-16">
+                      {track.timestamp_formatted ?? `${Math.floor(track.timestamp_seconds / 60)}:${String(track.timestamp_seconds % 60).padStart(2, '0')}`}
+                    </span>
+                    <span className="text-sm text-gray-300">
+                      {track.artist} - {track.title}
+                    </span>
                   </li>
                 ))}
               </ol>
@@ -276,22 +333,34 @@ export default function MixDetail() {
 
         {tab === 'pipeline' && (
           <div className="space-y-6">
-            {mix.pipeline_steps && mix.pipeline_steps.length > 0 ? (
+            {mix.steps && mix.steps.length > 0 ? (
               <>
-                <PipelineProgress steps={mix.pipeline_steps} />
+                <PipelineProgress steps={mix.steps} />
                 <div className="space-y-2 mt-6">
-                  {mix.pipeline_steps.map((step) => (
+                  {mix.steps.map((step) => (
                     <div
-                      key={step.name}
+                      key={step.step_name}
                       className="flex items-center justify-between px-4 py-3 rounded-lg bg-dark/50"
                     >
                       <div className="flex items-center gap-3">
                         <StatusBadge status={step.status} />
-                        <span className="text-sm text-gray-300 font-mono">{step.name}</span>
+                        <span className="text-sm text-gray-300 font-mono">{step.step_name}</span>
+                        {step.retry_count > 0 && (
+                          <span className="text-[10px] text-gray-500 font-mono">
+                            (retries: {step.retry_count})
+                          </span>
+                        )}
                       </div>
-                      <div className="text-[11px] text-gray-600 font-mono">
-                        {step.started_at && format(new Date(step.started_at), 'HH:mm:ss')}
-                        {step.finished_at && ` - ${format(new Date(step.finished_at), 'HH:mm:ss')}`}
+                      <div className="flex items-center gap-3">
+                        {step.error && (
+                          <span className="text-[10px] text-cyber-red font-mono max-w-[200px] truncate" title={step.error}>
+                            {step.error}
+                          </span>
+                        )}
+                        <span className="text-[11px] text-gray-600 font-mono">
+                          {step.started_at && format(new Date(step.started_at), 'HH:mm:ss')}
+                          {step.completed_at && ` - ${format(new Date(step.completed_at), 'HH:mm:ss')}`}
+                        </span>
                       </div>
                     </div>
                   ))}

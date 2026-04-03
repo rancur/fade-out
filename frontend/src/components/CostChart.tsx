@@ -1,7 +1,15 @@
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 
+interface CostSummaryItem {
+  provider: string
+  model: string
+  operation: string
+  total_cost: number
+  count: number
+}
+
 interface CostChartProps {
-  data: { date: string; description: number; tracklist: number; tags: number; cover: number }[]
+  data: CostSummaryItem[]
 }
 
 export default function CostChart({ data }: CostChartProps) {
@@ -13,11 +21,23 @@ export default function CostChart({ data }: CostChartProps) {
     )
   }
 
+  // Group by operation for the bar chart
+  const operationMap = new Map<string, number>()
+  for (const item of data) {
+    const key = item.operation
+    operationMap.set(key, (operationMap.get(key) ?? 0) + item.total_cost)
+  }
+
+  const chartData = Array.from(operationMap.entries()).map(([operation, cost]) => ({
+    operation,
+    cost,
+  }))
+
   return (
     <ResponsiveContainer width="100%" height={280}>
-      <BarChart data={data} margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
+      <BarChart data={chartData} margin={{ top: 5, right: 5, left: -10, bottom: 0 }}>
         <XAxis
-          dataKey="date"
+          dataKey="operation"
           tick={{ fontSize: 10, fill: '#6b7280' }}
           axisLine={{ stroke: '#1f2937' }}
           tickLine={false}
@@ -36,15 +56,12 @@ export default function CostChart({ data }: CostChartProps) {
             fontSize: '12px',
             fontFamily: '"JetBrains Mono", monospace',
           }}
-          formatter={(value: number, name: string) => [`$${value.toFixed(3)}`, name]}
+          formatter={(value: number) => [`$${value.toFixed(4)}`, 'Cost']}
         />
         <Legend
           wrapperStyle={{ fontSize: '11px', fontFamily: '"JetBrains Mono", monospace' }}
         />
-        <Bar dataKey="description" stackId="a" fill="#7CB342" radius={[0, 0, 0, 0]} name="Description" />
-        <Bar dataKey="tracklist" stackId="a" fill="#4FC3F7" name="Tracklist" />
-        <Bar dataKey="tags" stackId="a" fill="#E040FB" name="Tags" />
-        <Bar dataKey="cover" stackId="a" fill="#FF8A65" radius={[4, 4, 0, 0]} name="Cover Art" />
+        <Bar dataKey="cost" fill="#7CB342" radius={[4, 4, 0, 0]} name="Cost" />
       </BarChart>
     </ResponsiveContainer>
   )

@@ -2,13 +2,18 @@ import clsx from 'clsx'
 
 const statusConfig: Record<string, { label: string; color: string; glow: string }> = {
   pending: { label: 'Pending', color: 'text-gray-400 border-gray-500', glow: '' },
-  processing: { label: 'Processing', color: 'text-cyber-cyan border-cyber-cyan', glow: 'shadow-neon-cyan animate-pulse-slow' },
+  running: { label: 'Running', color: 'text-cyber-cyan border-cyber-cyan', glow: 'shadow-neon-cyan animate-pulse-slow' },
+  analyzing: { label: 'Analyzing', color: 'text-cyber-cyan border-cyber-cyan', glow: 'shadow-neon-cyan animate-pulse-slow' },
   generating: { label: 'Generating', color: 'text-cyber-magenta border-cyber-magenta', glow: 'shadow-neon-magenta animate-pulse-slow' },
-  reviewing: { label: 'Reviewing', color: 'text-gold border-gold', glow: '' },
-  approved: { label: 'Approved', color: 'text-primary border-primary', glow: 'shadow-neon' },
-  uploaded: { label: 'Uploaded', color: 'text-cyber-lime border-cyber-lime', glow: '' },
+  uploading_soundcloud: { label: 'Uploading SC', color: 'text-secondary border-secondary', glow: 'shadow-neon-magenta animate-pulse-slow' },
+  uploading_youtube: { label: 'Uploading YT', color: 'text-cyber-red border-cyber-red', glow: 'shadow-neon-red animate-pulse-slow' },
+  verifying: { label: 'Verifying', color: 'text-gold border-gold', glow: '' },
+  draft_review: { label: 'Draft Review', color: 'text-gold border-gold', glow: '' },
+  completed: { label: 'Completed', color: 'text-cyber-lime border-cyber-lime', glow: '' },
   failed: { label: 'Failed', color: 'text-cyber-red border-cyber-red', glow: 'shadow-neon-red' },
 }
+
+const animatedStatuses = new Set(['running', 'analyzing', 'generating', 'uploading_soundcloud', 'uploading_youtube'])
 
 interface StatusBadgeProps {
   status: string
@@ -31,7 +36,7 @@ export default function StatusBadge({ status, size = 'sm' }: StatusBadgeProps) {
         className={clsx(
           'rounded-full',
           size === 'sm' ? 'w-1.5 h-1.5' : 'w-2 h-2',
-          status === 'processing' || status === 'generating' ? 'animate-pulse bg-current' : 'bg-current',
+          animatedStatuses.has(status) ? 'animate-pulse bg-current' : 'bg-current',
         )}
       />
       {config.label}

@@ -13,7 +13,13 @@ function formatDuration(seconds: number): string {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
+function basename(path: string): string {
+  return path.split('/').pop() ?? path
+}
+
 export default function MixCard({ mix }: { mix: Mix }) {
+  const genres = mix.genres ?? []
+
   return (
     <Link
       to={`/mixes/${mix.id}`}
@@ -24,9 +30,9 @@ export default function MixCard({ mix }: { mix: Mix }) {
     >
       {/* Cover art */}
       <div className="relative aspect-video bg-dark overflow-hidden">
-        {mix.cover_art_url ? (
+        {mix.cover_art_path ? (
           <img
-            src={mix.cover_art_url}
+            src={mix.cover_art_path}
             alt={mix.title}
             className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
           />
@@ -39,7 +45,7 @@ export default function MixCard({ mix }: { mix: Mix }) {
         <div className="absolute inset-0 bg-gradient-to-t from-surface-light via-transparent to-transparent" />
         {/* Status */}
         <div className="absolute top-3 right-3">
-          <StatusBadge status={mix.status} />
+          <StatusBadge status={mix.pipeline_status} />
         </div>
       </div>
 
@@ -50,9 +56,9 @@ export default function MixCard({ mix }: { mix: Mix }) {
         </h3>
 
         {/* Genres */}
-        {mix.genres.length > 0 && (
+        {genres.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
-            {mix.genres.slice(0, 3).map((g) => (
+            {genres.slice(0, 3).map((g) => (
               <span
                 key={g}
                 className="text-[10px] px-2 py-0.5 rounded bg-primary/10 text-primary/80 font-mono"
@@ -60,9 +66,9 @@ export default function MixCard({ mix }: { mix: Mix }) {
                 {g}
               </span>
             ))}
-            {mix.genres.length > 3 && (
+            {genres.length > 3 && (
               <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-gray-500 font-mono">
-                +{mix.genres.length - 3}
+                +{genres.length - 3}
               </span>
             )}
           </div>
@@ -70,10 +76,16 @@ export default function MixCard({ mix }: { mix: Mix }) {
 
         {/* Meta */}
         <div className="flex items-center justify-between text-[11px] text-gray-500 font-mono">
-          <span className="flex items-center gap-1">
-            <Clock className="w-3 h-3" />
-            {formatDuration(mix.duration_seconds)}
-          </span>
+          {mix.duration_seconds != null ? (
+            <span className="flex items-center gap-1">
+              <Clock className="w-3 h-3" />
+              {formatDuration(mix.duration_seconds)}
+            </span>
+          ) : mix.audio_file_path ? (
+            <span className="truncate max-w-[50%]">{basename(mix.audio_file_path)}</span>
+          ) : (
+            <span />
+          )}
           <span>{format(new Date(mix.created_at), 'MMM d, yyyy')}</span>
         </div>
 
