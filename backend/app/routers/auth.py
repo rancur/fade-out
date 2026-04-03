@@ -50,14 +50,13 @@ def _build_redirect_uri(request: Request, provider: str) -> str:
 async def soundcloud_auth(request: Request):
     """Redirect user to SoundCloud OAuth authorize page."""
     redirect_uri = _build_redirect_uri(request, "soundcloud")
+    from urllib.parse import urlencode
     params = {
         "client_id": settings.SOUNDCLOUD_CLIENT_ID,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": "non-expiring",
     }
-    qs = "&".join(f"{k}={httpx.URL('', params={k: v}).params[k]}" for k, v in params.items())
-    authorize_url = f"https://api.soundcloud.com/connect?{qs}"
+    authorize_url = f"https://api.soundcloud.com/connect?{urlencode(params)}"
     return RedirectResponse(url=authorize_url)
 
 
@@ -137,6 +136,9 @@ _YOUTUBE_SCOPES = "https://www.googleapis.com/auth/youtube.upload https://www.go
 async def youtube_auth(request: Request):
     """Redirect user to Google OAuth authorize page for YouTube."""
     redirect_uri = _build_redirect_uri(request, "youtube")
+    from urllib.parse import urlencode
+    if not settings.YOUTUBE_CLIENT_ID:
+        return RedirectResponse(url="/settings?auth=youtube&error=no_client_id")
     params = {
         "client_id": settings.YOUTUBE_CLIENT_ID,
         "redirect_uri": redirect_uri,
@@ -145,8 +147,7 @@ async def youtube_auth(request: Request):
         "access_type": "offline",
         "prompt": "consent",
     }
-    qs = "&".join(f"{k}={httpx.URL('', params={k: v}).params[k]}" for k, v in params.items())
-    authorize_url = f"https://accounts.google.com/o/oauth2/v2/auth?{qs}"
+    authorize_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
     return RedirectResponse(url=authorize_url)
 
 
