@@ -15,8 +15,8 @@ services:
       - /volume1/twitch/Recordings:/watch/video:ro
       - /volume1/homes/willcurran/djctl/cue-sheets:/watch/djctl-cue:ro
       # Output folders on NAS
-      - /volume1/will-see/YouTube Thumbnails:/output/thumbnails
-      - /volume1/will-see/SoundCloud Cover Art:/output/cover-art
+      - /volume1/homes/willcurran/will-see/youtube-thumbnails:/output/thumbnails
+      - /volume1/homes/willcurran/will-see/soundcloud-cover-art:/output/cover-art
       # Persistent data (SQLite DB, state, tokens)
       - ./data:/data
     environment:
