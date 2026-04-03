@@ -133,18 +133,33 @@ function SoundCloudSection({ status }: { status: SoundCloudStatus | undefined })
     onError: () => toast.error('Failed to save token'),
   })
 
-  const authenticate = useMutation({
+  const [showAuthFlow, setShowAuthFlow] = useState(false)
+  const [authCode, setAuthCode] = useState('')
+
+  const getOAuthUrl = useMutation({
     mutationFn: () =>
-      client.post<SoundCloudStatus>('/auth/soundcloud/authenticate').then((r) => r.data),
+      client.get<OAuthURLResponse>('/auth/soundcloud/oauth-url').then((r) => r.data),
+    onSuccess: (data) => {
+      window.open(data.url, '_blank')
+      setShowAuthFlow(true)
+    },
+    onError: () => toast.error('Failed to generate auth URL'),
+  })
+
+  const exchangeCode = useMutation({
+    mutationFn: (code: string) =>
+      client.post<SoundCloudStatus>('/auth/soundcloud/exchange-code', { code, redirect_uri: 'https://soundcloud.com' }).then((r) => r.data),
     onSuccess: (data) => {
       if (data.connected) {
         toast.success(`SoundCloud connected as @${data.username}!`)
+        setShowAuthFlow(false)
+        setAuthCode('')
       } else {
-        toast.error(data.error || 'Authentication failed')
+        toast.error(data.error || 'Code exchange failed')
       }
       qc.invalidateQueries({ queryKey: ['auth-status-all'] })
     },
-    onError: () => toast.error('Authentication failed'),
+    onError: () => toast.error('Code exchange failed'),
   })
 
   const isConnected = status?.connected
@@ -177,14 +192,14 @@ function SoundCloudSection({ status }: { status: SoundCloudStatus | undefined })
         {!isConnected && (
           <div className="flex items-center gap-2">
             <button
-              onClick={() => authenticate.mutate()}
-              disabled={authenticate.isPending}
+              onClick={() => getOAuthUrl.mutate()}
+              disabled={getOAuthUrl.isPending}
               className="px-3 py-1.5 rounded-lg text-[11px] font-mono border border-secondary/30 text-secondary hover:bg-secondary/10 transition-all disabled:opacity-50"
             >
-              {authenticate.isPending ? (
+              {getOAuthUrl.isPending ? (
                 <Loader2 className="w-3 h-3 animate-spin" />
               ) : (
-                'Auto Connect'
+                'Authorize'
               )}
             </button>
             <button
@@ -207,24 +222,43 @@ function SoundCloudSection({ status }: { status: SoundCloudStatus | undefined })
         )}
       </div>
 
+      {/* Auth code paste flow */}
+      {showAuthFlow && !isConnected && (
+        <div className="mt-4 space-y-3 p-3 bg-dark/50 border border-secondary/20 rounded-lg">
+          <p className="text-[11px] text-gray-400">
+            A SoundCloud authorization page opened in a new tab. After authorizing, you'll be redirected to soundcloud.com.
+            Copy the <strong className="text-gray-200">code</strong> from the URL bar (after <code className="text-secondary">?code=</code>) and paste it below.
+          </p>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={authCode}
+              onChange={(e) => setAuthCode(e.target.value)}
+              placeholder="Paste the code from the URL"
+              className="flex-1 bg-dark border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-200 placeholder-gray-600 focus:border-secondary/50 focus:outline-none"
+            />
+            <button
+              onClick={() => authCode && exchangeCode.mutate(authCode)}
+              disabled={!authCode || exchangeCode.isPending}
+              className="px-4 py-2 bg-secondary/10 text-secondary border border-secondary/30 rounded-lg text-sm font-mono hover:bg-secondary/20 transition-all disabled:opacity-40"
+            >
+              {exchangeCode.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Connect'}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Config hints */}
-      {!isConnected && !showTokenInput && status?.error && (
+      {!isConnected && !showTokenInput && !showAuthFlow && status?.error && (
         <p className="text-[11px] text-cyber-orange mt-3 font-mono">{status.error}</p>
       )}
 
-      {/* Token input */}
+      {/* Token input (advanced) */}
       {showTokenInput && (
         <div className="mt-4 space-y-3">
-          <div className="text-[11px] text-gray-500 space-y-1">
-            <p>
-              <strong className="text-gray-400">Auto Connect</strong> uses EMAIL + PASSWORD from
-              your .env for password-grant auth.
-            </p>
-            <p>
-              <strong className="text-gray-400">Paste Token</strong> if you have an OAuth access
-              token from the SoundCloud developer console.
-            </p>
-          </div>
+          <p className="text-[11px] text-gray-500">
+            Paste an OAuth access token if you have one from the SoundCloud API directly.
+          </p>
           <div className="flex gap-2">
             <input
               type="password"

@@ -267,14 +267,33 @@ async def set_soundcloud_token(body: TokenUpdate, db: AsyncSession = Depends(get
         return SoundCloudStatus(connected=False, error=str(exc))
 
 
-@router.post("/soundcloud/authenticate", response_model=SoundCloudStatus)
-async def soundcloud_password_auth(db: AsyncSession = Depends(get_db)):
-    """Attempt to get a SoundCloud token via password grant using configured credentials."""
-    if not all([settings.SOUNDCLOUD_CLIENT_ID, settings.SOUNDCLOUD_CLIENT_SECRET,
-                settings.SOUNDCLOUD_EMAIL, settings.SOUNDCLOUD_PASSWORD]):
+@router.get("/soundcloud/oauth-url", response_model=OAuthURL)
+async def soundcloud_oauth_url(
+    redirect_uri: str = Query(default="https://soundcloud.com"),
+):
+    """Generate the SoundCloud OAuth authorization URL."""
+    if not settings.SOUNDCLOUD_CLIENT_ID:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="SOUNDCLOUD_CLIENT_ID not set in .env")
+
+    from urllib.parse import urlencode
+
+    params = {
+        "client_id": settings.SOUNDCLOUD_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+    }
+    url = f"https://api.soundcloud.com/connect?{urlencode(params)}"
+    return OAuthURL(url=url, redirect_uri=redirect_uri)
+
+
+@router.post("/soundcloud/exchange-code", response_model=SoundCloudStatus)
+async def soundcloud_exchange_code(body: CodeExchange, db: AsyncSession = Depends(get_db)):
+    """Exchange a SoundCloud authorization code for tokens."""
+    if not settings.SOUNDCLOUD_CLIENT_ID or not settings.SOUNDCLOUD_CLIENT_SECRET:
         return SoundCloudStatus(
             connected=False,
-            error="Need SOUNDCLOUD_CLIENT_ID, CLIENT_SECRET, EMAIL, and PASSWORD in .env",
+            error="SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET must be set in .env",
         )
 
     try:
@@ -282,39 +301,44 @@ async def soundcloud_password_auth(db: AsyncSession = Depends(get_db)):
             resp = await client.post(
                 "https://api.soundcloud.com/oauth2/token",
                 data={
-                    "grant_type": "password",
+                    "grant_type": "authorization_code",
+                    "code": body.code,
                     "client_id": settings.SOUNDCLOUD_CLIENT_ID,
                     "client_secret": settings.SOUNDCLOUD_CLIENT_SECRET,
-                    "username": settings.SOUNDCLOUD_EMAIL,
-                    "password": settings.SOUNDCLOUD_PASSWORD,
+                    "redirect_uri": body.redirect_uri,
                 },
             )
 
-        if resp.status_code == 200:
-            token_data = resp.json()
-            access_token = token_data.get("access_token", "")
+        if resp.status_code != 200:
+            return SoundCloudStatus(
+                connected=False,
+                error=f"Code exchange failed: {resp.text[:200]}",
+            )
 
-            row = await _get_settings(db)
-            sj = dict(row.settings_json or {})
-            sj["soundcloud_access_token"] = access_token
-            if token_data.get("refresh_token"):
-                sj["soundcloud_refresh_token"] = token_data["refresh_token"]
-            row.settings_json = sj
-            await db.flush()
+        token_data = resp.json()
+        access_token = token_data.get("access_token", "")
+        refresh_token = token_data.get("refresh_token", "")
 
-            # Get username
-            async with httpx.AsyncClient(timeout=10) as me_client:
-                me_resp = await me_client.get(
-                    "https://api.soundcloud.com/me",
-                    headers={"Authorization": f"OAuth {access_token}"},
-                )
-            username = None
-            if me_resp.status_code == 200:
-                username = me_resp.json().get("username")
+        # Save tokens
+        row = await _get_settings(db)
+        sj = dict(row.settings_json or {})
+        sj["soundcloud_access_token"] = access_token
+        if refresh_token:
+            sj["soundcloud_refresh_token"] = refresh_token
+        row.settings_json = sj
+        await db.flush()
 
-            return SoundCloudStatus(connected=True, username=username)
+        # Get username
+        async with httpx.AsyncClient(timeout=10) as me_client:
+            me_resp = await me_client.get(
+                "https://api.soundcloud.com/me",
+                headers={"Authorization": f"OAuth {access_token}"},
+            )
+        username = None
+        if me_resp.status_code == 200:
+            username = me_resp.json().get("username")
 
-        return SoundCloudStatus(connected=False, error=f"Auth failed: {resp.text[:200]}")
+        return SoundCloudStatus(connected=True, username=username)
     except Exception as exc:
         return SoundCloudStatus(connected=False, error=str(exc))
 
