@@ -51,7 +51,7 @@ class MixOut(BaseModel):
     duration_seconds: Optional[float] = None
     genres: Optional[list] = None
     vibes: Optional[list] = None
-    energy_profile: Optional[dict] = None
+    energy_profile: Optional[list] = None
     tracklist: Optional[list] = None
     description_soundcloud: Optional[str] = None
     description_youtube: Optional[str] = None
@@ -149,7 +149,13 @@ async def get_mix(mix_id: str, db: AsyncSession = Depends(get_db)):
     mix = result.scalar_one_or_none()
     if not mix:
         raise HTTPException(status_code=404, detail="Mix not found")
-    return MixDetail.model_validate(mix)
+    # Convert to dict to avoid lazy-load issues with Pydantic
+    mix_dict = {c.name: getattr(mix, c.name) for c in mix.__table__.columns}
+    mix_dict["steps"] = [
+        {c.name: getattr(s, c.name) for c in s.__table__.columns}
+        for s in mix.steps
+    ]
+    return MixDetail(**mix_dict)
 
 
 @router.post("", response_model=MixOut, status_code=201)
