@@ -12,10 +12,15 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import init_db
 from app.routers import ai_usage, auth, brand, mixes, notifications, pipeline, settings as settings_router, upgrade
+from app.services.handlers import register_all_handlers
+from app.services.pipeline import PipelineOrchestrator
 
 logger = logging.getLogger("fadeout")
 
 FRONTEND_DIR = Path("/app/frontend/dist")
+
+# Global orchestrator instance -- importable by routers
+orchestrator = PipelineOrchestrator()
 
 
 @asynccontextmanager
@@ -28,7 +33,14 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     await init_db()
     logger.info("Database ready.")
-    # Future: start file watcher and scheduler here
+
+    # Register all pipeline step handlers
+    register_all_handlers(orchestrator)
+    logger.info(
+        "Pipeline orchestrator ready (%d handlers registered).",
+        len(orchestrator._handlers),
+    )
+
     logger.info("Fade-Out is running.")
     yield
     logger.info("Fade-Out shutting down.")

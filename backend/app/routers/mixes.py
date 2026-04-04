@@ -13,6 +13,11 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models import Mix, PipelineStep
 
+# Lazy import to avoid circular dependency -- the orchestrator is set at app startup
+def _get_orchestrator():
+    from app.main import orchestrator
+    return orchestrator
+
 router = APIRouter(prefix="/api/mixes", tags=["mixes"])
 
 
@@ -173,6 +178,11 @@ async def create_mix(body: MixCreate, db: AsyncSession = Depends(get_db)):
 
     await db.flush()
     await db.refresh(mix)
+
+    # Kick off the pipeline asynchronously
+    orch = _get_orchestrator()
+    await orch.start_pipeline(mix.id)
+
     return MixOut.model_validate(mix)
 
 
@@ -217,9 +227,14 @@ async def approve_mix(mix_id: str, db: AsyncSession = Depends(get_db)):
             detail=f"Mix is not in draft_review status (current: {mix.pipeline_status})",
         )
 
-    mix.pipeline_status = "uploading_soundcloud"
+    mix.pipeline_status = "resuming"
     await db.flush()
     await db.refresh(mix)
+
+    # Resume pipeline from where it paused (after generate_art)
+    orch = _get_orchestrator()
+    await orch.resume_pipeline(mix.id)
+
     return MixOut.model_validate(mix)
 
 
@@ -249,6 +264,11 @@ async def retry_mix(mix_id: str, db: AsyncSession = Depends(get_db)):
     mix.pipeline_error = None
     await db.flush()
     await db.refresh(mix)
+
+    # Re-start the full pipeline (it will skip already-completed steps)
+    orch = _get_orchestrator()
+    await orch.start_pipeline(mix.id)
+
     return MixOut.model_validate(mix)
 
 
@@ -281,4 +301,9 @@ async def retry_step(mix_id: str, step_name: str, db: AsyncSession = Depends(get
 
     await db.flush()
     await db.refresh(mix)
+
+    # Retry the specific step and continue from there
+    orch = _get_orchestrator()
+    await orch.retry_step(mix.id, step_name)
+
     return MixOut.model_validate(mix)

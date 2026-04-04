@@ -234,9 +234,9 @@ class ArtGenerator:
 
             # fal.ai queue API: may return request_id for polling or direct result
             if "request_id" in result:
-                request_id = result["request_id"]
-                status_url = f"https://queue.fal.run/{self._fal_model}/requests/{request_id}/status"
-                result_url = f"https://queue.fal.run/{self._fal_model}/requests/{request_id}"
+                # Use URLs from the response (they handle model path correctly)
+                status_url = result.get("status_url", f"https://queue.fal.run/{self._fal_model}/requests/{result['request_id']}/status")
+                result_url = result.get("response_url", f"https://queue.fal.run/{self._fal_model}/requests/{result['request_id']}")
 
                 # Poll for completion
                 import asyncio
