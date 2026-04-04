@@ -115,7 +115,7 @@ export default function MixDetail() {
         {/* Cover */}
         <div className="w-full sm:w-48 h-48 rounded-xl overflow-hidden bg-surface-light border border-primary/10 shrink-0">
           {mix.cover_art_path ? (
-            <img src={mix.cover_art_path} alt={mix.title} className="w-full h-full object-cover" />
+            <img src={`/api/mixes/${mix.id}/cover-art`} alt={mix.title} className="w-full h-full object-cover" />
           ) : (
             <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-primary/10 to-cyber-cyan/5">
               <Music className="w-16 h-16 text-primary/20" />

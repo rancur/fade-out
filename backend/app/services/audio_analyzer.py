@@ -17,7 +17,9 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 SEGMENT_DURATION = 15  # seconds per Shazam sample clip
-DEFAULT_SAMPLE_INTERVAL = settings.AUDIO_SAMPLE_INTERVAL_SECONDS  # 300s = 5 min
+DEFAULT_SAMPLE_INTERVAL = settings.AUDIO_SAMPLE_INTERVAL_SECONDS  # 120s = 2 min
+SECONDARY_CLIP_OFFSET = 30  # seconds after primary clip for transition catching
+RETRY_CLIP_OFFSET = 45  # seconds offset for retry if primary Shazam fails
 
 
 @dataclass
@@ -198,15 +200,46 @@ class AudioAnalyzer:
     async def _identify_tracks(
         self, path: str, sample_times: List[float], sr_native: int
     ) -> List[TrackHit]:
-        """Use Shazam to identify tracks at sample points."""
+        """Use Shazam to identify tracks at sample points.
+
+        For each sample point, tries two clips (primary and +30s offset) to
+        catch transitions. If the primary clip fails Shazam, retries at +45s.
+        Consecutive duplicate tracks are deduplicated (keep first occurrence).
+        """
         identified: List[TrackHit] = []
         seen_titles: set[str] = set()
+        last_title: Optional[str] = None
 
         for t in sample_times:
+            hits_at_point: List[TrackHit] = []
+
+            # Primary clip at sample point
             hit = await self._shazam_segment(path, t, sr_native)
-            if hit and hit.title.lower() not in seen_titles:
-                seen_titles.add(hit.title.lower())
-                identified.append(hit)
+            if hit:
+                hits_at_point.append(hit)
+            else:
+                # Retry with offset if primary fails
+                retry_offset = t + RETRY_CLIP_OFFSET
+                hit_retry = await self._shazam_segment(path, retry_offset, sr_native)
+                if hit_retry:
+                    hits_at_point.append(hit_retry)
+
+            # Secondary clip at +30s to catch transitions
+            secondary_t = t + SECONDARY_CLIP_OFFSET
+            hit2 = await self._shazam_segment(path, secondary_t, sr_native)
+            if hit2:
+                hits_at_point.append(hit2)
+
+            # Add unique hits, deduplicating consecutive same-track identifications
+            for h in hits_at_point:
+                title_key = h.title.lower()
+                # Skip if same as the last identified track (consecutive dedup)
+                if title_key == last_title:
+                    continue
+                if title_key not in seen_titles:
+                    seen_titles.add(title_key)
+                    identified.append(h)
+                    last_title = title_key
 
         # Sort by timestamp
         identified.sort(key=lambda h: h.timestamp_seconds)

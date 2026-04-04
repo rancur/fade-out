@@ -1,6 +1,7 @@
 """OpenAI-powered description generator for SoundCloud and YouTube."""
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -47,6 +48,7 @@ RULES:
 - No markdown formatting
 - Plain text only
 - If a tracklist is provided, include it with timestamps
+- Do NOT include any links in the description body. Links will be added automatically at the end. Do not write placeholder links like [example.com] either.
 - Platform-specific links go at the very bottom
 
 MIX DATA:
@@ -76,6 +78,33 @@ YOUTUBE_LINK_INSTRUCTION = (
     "Do NOT include a YouTube link (they are already on YouTube). "
     "Format the tracklist as YouTube chapters with timestamps starting at 0:00."
 )
+
+CREATIVE_TITLE_PROMPT = """\
+Generate a creative, artistic title for a DJ mix by "{brand_name}" for SoundCloud.
+
+VIBE:
+- Psychedelic, evocative, poetic
+- Should feel like a DJ mix name, NOT an SEO title
+- Desert energy, late-night, otherworldly
+- Think album names, art exhibitions, fever dreams
+- Examples of the vibe: "Desert Frequencies Vol. III", "Four Decks and a Prayer", "Neon Cactus After Dark", "The Eye Opens at Midnight", "Silk and Static", "Phantom Groove Theory"
+
+RULES:
+- Under 60 characters
+- No dates
+- Do not include "DJ mix", "set", or "live" in the title
+- Incorporate the genres and vibes naturally but artistically
+- Do NOT just list genres -- weave them into something evocative
+- One title only, no alternatives, no explanation
+
+MIX DATA:
+- Raw filename: {filename}
+- Genres: {genres}
+- Vibes: {vibes}
+{tracklist_hint}
+
+Return ONLY the title, nothing else.\
+"""
 
 YOUTUBE_TITLE_PROMPT = """\
 Generate a YouTube title for a DJ mix upload.
@@ -164,6 +193,55 @@ class DescriptionGenerator:
             mix_id=mix_id,
             brand_settings=brand_settings,
         )
+
+    async def generate_creative_title(
+        self,
+        genres: List[str],
+        vibes: List[str],
+        tracklist: Optional[List[Dict[str, Any]]] = None,
+        filename: str = "",
+        session: Optional[AsyncSession] = None,
+        mix_id: Optional[str] = None,
+    ) -> str:
+        """Generate a creative, artistic mix title for SoundCloud."""
+        # Build a tracklist hint (first few artists for inspiration)
+        tracklist_hint = ""
+        if tracklist:
+            artists = list({t.get("artist", "") for t in tracklist[:8] if t.get("artist")})
+            if artists:
+                tracklist_hint = f"- Key artists: {', '.join(artists[:6])}"
+
+        prompt = CREATIVE_TITLE_PROMPT.format(
+            brand_name=settings.BRAND_NAME,
+            filename=filename,
+            genres=", ".join(genres),
+            vibes=", ".join(vibes),
+            tracklist_hint=tracklist_hint,
+        )
+
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=80,
+            temperature=0.9,
+        )
+
+        title = response.choices[0].message.content.strip().strip('"').strip("'")
+
+        # Enforce 60-char limit
+        if len(title) > 60:
+            title = title[:57] + "..."
+
+        # Track usage
+        if session and mix_id:
+            await self._track_usage(
+                session, mix_id, "creative_title",
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+            )
+
+        logger.info("Generated creative title: %s", title)
+        return title
 
     async def generate_youtube_title(
         self,
@@ -280,8 +358,23 @@ class DescriptionGenerator:
 
         description = response.choices[0].message.content.strip()
 
-        # Append links if the model didn't already include them
-        if links and not any(link_line.split(":")[-1].strip() in description for link_line in links.splitlines()[:1]):
+        # Strip any lines that look like URLs or bracketed placeholder links
+        # This catches LLM hallucinated links like "[soundcloud.com/willsee]" or "https://..."
+        url_line_pattern = re.compile(
+            r"^\s*(\[?\s*https?://\S+\s*\]?|"       # lines starting with a URL or [url]
+            r"\[?\s*\w+\.\w+\S*\s*\]?)\s*$|"        # lines that are just a domain like [example.com]
+            r"^\s*\w+:\s*https?://\S+\s*$|"          # lines like "YouTube: https://..."
+            r"^\s*\w+:\s*\[?\s*\w+\.\w+\S*\s*\]?$", # lines like "Website: [example.com]"
+            re.IGNORECASE,
+        )
+        cleaned_lines = []
+        for line in description.split("\n"):
+            if not url_line_pattern.match(line):
+                cleaned_lines.append(line)
+        description = "\n".join(cleaned_lines).rstrip()
+
+        # Always append the real links
+        if links:
             description += f"\n\n{links}"
 
         # Track usage

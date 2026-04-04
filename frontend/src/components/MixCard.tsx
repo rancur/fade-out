@@ -32,7 +32,7 @@ export default function MixCard({ mix }: { mix: Mix }) {
       <div className="relative aspect-video bg-dark overflow-hidden">
         {mix.cover_art_path ? (
           <img
-            src={mix.cover_art_path}
+            src={`/api/mixes/${mix.id}/cover-art`}
             alt={mix.title}
             className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
           />

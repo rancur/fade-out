@@ -101,7 +101,7 @@ class Settings(BaseSettings):
     # --- Pipeline ---
     DRAFT_MODE: bool = True
     FILE_STABLE_SECONDS: int = 120
-    AUDIO_SAMPLE_INTERVAL_SECONDS: int = 300
+    AUDIO_SAMPLE_INTERVAL_SECONDS: int = 120  # sample every 2 minutes
     MAX_CONCURRENT_PIPELINES: int = 2
 
     @field_validator("NOTIFICATION_WEBHOOK_URLS", mode="before")

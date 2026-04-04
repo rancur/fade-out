@@ -1,15 +1,18 @@
 """Mix CRUD and pipeline trigger endpoints."""
 
+import os
 from datetime import datetime
 from typing import List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import settings
 from app.database import get_db
 from app.models import Mix, PipelineStep
 
@@ -156,6 +159,24 @@ async def get_mix(mix_id: str, db: AsyncSession = Depends(get_db)):
         for s in mix.steps
     ]
     return MixDetail(**mix_dict)
+
+
+@router.get("/{mix_id}/cover-art")
+async def get_cover_art(mix_id: str):
+    """Serve the cover art image for a mix."""
+    cover_path = os.path.join(settings.OUTPUT_COVER_ART_PATH, f"{mix_id}.jpg")
+    if not os.path.isfile(cover_path):
+        raise HTTPException(status_code=404, detail="Cover art not found")
+    return FileResponse(cover_path, media_type="image/jpeg")
+
+
+@router.get("/{mix_id}/thumbnail")
+async def get_thumbnail(mix_id: str):
+    """Serve the thumbnail image for a mix."""
+    thumb_path = os.path.join(settings.OUTPUT_THUMBNAILS_PATH, f"{mix_id}.jpg")
+    if not os.path.isfile(thumb_path):
+        raise HTTPException(status_code=404, detail="Thumbnail not found")
+    return FileResponse(thumb_path, media_type="image/jpeg")
 
 
 @router.post("", response_model=MixOut, status_code=201)

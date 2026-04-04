@@ -165,6 +165,18 @@ async def handle_generate_description(
     desc_gen = DescriptionGenerator()
     tag_gen = TagGenerator()
 
+    # Generate a creative SoundCloud title
+    raw_filename = Path(mix.audio_file_path).stem if mix.audio_file_path else "mix"
+    creative_title = await desc_gen.generate_creative_title(
+        genres=genres,
+        vibes=vibes,
+        tracklist=tracklist,
+        filename=raw_filename,
+        session=session,
+        mix_id=mix_id,
+    )
+    mix.title = creative_title
+
     # Generate all content
     sc_desc = await desc_gen.generate_soundcloud_description(
         mix_title=mix.title,

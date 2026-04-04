@@ -81,6 +81,16 @@ async def health_check():
 
 
 # --- Static Files & SPA Fallback ---
+
+# Serve cover art and thumbnails from the output directories
+COVER_ART_DIR = Path(settings.OUTPUT_COVER_ART_PATH)
+THUMBNAILS_DIR = Path(settings.OUTPUT_THUMBNAILS_PATH)
+
+if COVER_ART_DIR.exists():
+    app.mount("/output/cover-art", StaticFiles(directory=COVER_ART_DIR), name="cover-art")
+if THUMBNAILS_DIR.exists():
+    app.mount("/output/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
+
 if FRONTEND_DIR.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
 
