@@ -178,8 +178,26 @@ class DescriptionGenerator:
         session: Optional[AsyncSession] = None,
         mix_id: Optional[str] = None,
         brand_settings: Optional[BrandSettings] = None,
+        youtube_timestamp_offset: float = 0.0,
     ) -> str:
-        """Generate a YouTube description with chapter timestamps."""
+        """Generate a YouTube description with chapter timestamps.
+
+        youtube_timestamp_offset: seconds to ADD to FLAC timestamps for YT chapters.
+        Positive = video starts before the FLAC (extra intro in stream).
+        Negative = video starts after the FLAC.
+        """
+        # Apply offset to tracklist timestamps for YouTube chapters
+        adjusted_tracklist = tracklist
+        if tracklist and youtube_timestamp_offset != 0.0:
+            adjusted_tracklist = []
+            for t in tracklist:
+                adjusted = dict(t)
+                ts = t.get("timestamp_seconds", 0) + youtube_timestamp_offset
+                ts = max(0, ts)  # don't go negative
+                adjusted["timestamp_seconds"] = ts
+                adjusted["timestamp_formatted"] = _seconds_to_timestamp(ts)
+                adjusted_tracklist.append(adjusted)
+
         return await self._generate_description(
             platform="YouTube",
             platform_link_instruction=YOUTUBE_LINK_INSTRUCTION,
@@ -187,7 +205,7 @@ class DescriptionGenerator:
             mix_title=mix_title,
             genres=genres,
             vibes=vibes,
-            tracklist=tracklist,
+            tracklist=adjusted_tracklist,
             energy_profile=energy_profile,
             bpm_range=bpm_range,
             duration_seconds=duration_seconds,

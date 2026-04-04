@@ -45,6 +45,50 @@ def _title_from_filename(audio_path: str) -> str:
     return stem.strip().title()
 
 
+async def _detect_video_offset(
+    video_path: str, flac_tracklist: list, analyzer
+) -> float:
+    """Detect the timestamp offset between the FLAC and the video.
+
+    Shazams the first few minutes of the video to find where the first
+    identified track starts, then calculates the difference from the FLAC
+    tracklist's first track timestamp.
+    """
+    from app.services.audio_analyzer import TrackHit
+
+    first_flac_track = flac_tracklist[0] if flac_tracklist else None
+    if not first_flac_track:
+        return 0.0
+
+    first_flac_title = first_flac_track.get("title", "").lower() if isinstance(first_flac_track, dict) else first_flac_track.title.lower()
+    first_flac_ts = first_flac_track.get("timestamp_seconds", 0) if isinstance(first_flac_track, dict) else first_flac_track.timestamp_seconds
+
+    # Sample the video at 30s intervals for the first 10 minutes
+    import librosa
+    duration = librosa.get_duration(path=video_path)
+    max_search = min(duration, 600)  # search first 10 min
+
+    for offset in range(0, int(max_search), 30):
+        try:
+            # Get native sample rate for Shazam
+            sr_native = librosa.get_samplerate(video_path)
+            hit = await analyzer._shazam_segment(video_path, float(offset), sr_native)
+            if hit and hit.title.lower() == first_flac_title:
+                # Found the first track in the video
+                video_ts = float(offset)
+                detected_offset = video_ts - first_flac_ts
+                logger.info(
+                    "Video offset: first track '%s' at %.0fs in video vs %.0fs in FLAC = %.1fs offset",
+                    hit.title, video_ts, first_flac_ts, detected_offset,
+                )
+                return detected_offset
+        except Exception:
+            continue
+
+    logger.info("Could not auto-detect video offset (first track not found in video first 10min)")
+    return 0.0
+
+
 # ---------------------------------------------------------------------------
 # detect
 # ---------------------------------------------------------------------------
@@ -121,6 +165,20 @@ async def handle_analyze(mix_id: str, session: AsyncSession) -> Optional[dict]:
     mix.tracklist = final_tracklist
     mix.duration_seconds = result.duration_seconds
 
+    # Auto-detect YouTube timestamp offset if video file exists
+    # The FLAC is trimmed but the video stream isn't — find where the first
+    # track starts in the video vs the FLAC to calculate the offset.
+    yt_offset = 0.0
+    if mix.video_file_path and os.path.exists(mix.video_file_path) and final_tracklist:
+        try:
+            yt_offset = await _detect_video_offset(
+                mix.video_file_path, final_tracklist, analyzer
+            )
+            logger.info("Auto-detected YouTube timestamp offset: %.1fs", yt_offset)
+        except Exception as exc:
+            logger.warning("Video offset detection failed, defaulting to 0: %s", exc)
+    mix.youtube_timestamp_offset = yt_offset
+
     return {
         "genres": result.genres,
         "vibes": result.vibes,
@@ -128,6 +186,7 @@ async def handle_analyze(mix_id: str, session: AsyncSession) -> Optional[dict]:
         "tracks_found": len(final_tracklist),
         "tracklist_source": merged.source,
         "duration_seconds": result.duration_seconds,
+        "youtube_timestamp_offset": yt_offset,
     }
 
 
@@ -193,6 +252,7 @@ async def handle_generate_description(
         brand_settings=brand,
     )
 
+    yt_offset = mix.youtube_timestamp_offset or 0.0
     yt_desc = await desc_gen.generate_youtube_description(
         mix_title=mix.title,
         genres=genres,
@@ -204,6 +264,7 @@ async def handle_generate_description(
         session=session,
         mix_id=mix_id,
         brand_settings=brand,
+        youtube_timestamp_offset=yt_offset,
     )
 
     yt_title = await desc_gen.generate_youtube_title(

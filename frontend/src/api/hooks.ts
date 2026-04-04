@@ -22,6 +22,7 @@ export interface Mix {
   soundcloud_url: string | null
   youtube_url: string | null
   youtube_playlist_id: string | null
+  youtube_timestamp_offset: number
   pipeline_status: string
   pipeline_step: string | null
   pipeline_error: string | null

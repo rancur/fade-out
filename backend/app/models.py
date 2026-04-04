@@ -44,6 +44,7 @@ class Mix(Base):
     soundcloud_url = Column(String)
     youtube_url = Column(String)
     youtube_playlist_id = Column(String)
+    youtube_timestamp_offset = Column(Float, default=0.0)  # seconds to add to FLAC timestamps for YT chapters
     pipeline_status = Column(String, default="pending")
     pipeline_step = Column(String)
     pipeline_error = Column(Text)

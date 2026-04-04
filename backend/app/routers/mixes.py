@@ -65,6 +65,7 @@ class MixOut(BaseModel):
     soundcloud_url: Optional[str] = None
     youtube_url: Optional[str] = None
     youtube_playlist_id: Optional[str] = None
+    youtube_timestamp_offset: Optional[float] = 0.0
     pipeline_status: Optional[str] = None
     pipeline_step: Optional[str] = None
     pipeline_error: Optional[str] = None
@@ -100,6 +101,7 @@ class MixUpdate(BaseModel):
     tracklist: Optional[list] = None
     cover_art_path: Optional[str] = None
     thumbnail_path: Optional[str] = None
+    youtube_timestamp_offset: Optional[float] = None
     metadata_json: Optional[dict] = None
 
 
