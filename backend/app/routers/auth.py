@@ -581,9 +581,12 @@ async def youtube_oauth_url(
     if not yt_client_id:
         raise HTTPException(status_code=400, detail="YouTube Client ID not configured. Add it in Settings.")
 
-    # Build callback URI dynamically from request host
+    # Google OAuth requires localhost/127.0.0.1 for Desktop app clients — private IPs are rejected.
+    # Always use 127.0.0.1 with the same port for the redirect URI.
     if not redirect_uri:
-        redirect_uri = f"http://{request.headers.get('host', 'localhost:8500')}/api/auth/youtube/callback"
+        host = request.headers.get("host", "127.0.0.1:8500")
+        port = host.split(":")[-1] if ":" in host else "8500"
+        redirect_uri = f"http://127.0.0.1:{port}/api/auth/youtube/callback"
 
     params = {
         "client_id": yt_client_id,
@@ -619,8 +622,10 @@ async def youtube_callback(
     if not yt_client_id or not yt_client_secret:
         return RedirectResponse(url="/settings?auth=youtube&error=missing_client_credentials")
 
-    # The redirect_uri used here must match what was used to generate the auth URL
-    callback_uri = f"http://{request.headers.get('host', 'localhost:8500')}/api/auth/youtube/callback"
+    # Must match the redirect_uri used in the auth URL (always 127.0.0.1 for Google Desktop clients)
+    host = request.headers.get("host", "127.0.0.1:8500")
+    port = host.split(":")[-1] if ":" in host else "8500"
+    callback_uri = f"http://127.0.0.1:{port}/api/auth/youtube/callback"
 
     try:
         async with httpx.AsyncClient(timeout=15) as http_client:
