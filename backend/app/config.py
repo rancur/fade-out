@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     DJCTL_WS_URL: str = "ws://192.168.1.221:8081/ws"
 
     # --- Database ---
-    DATABASE_URL: str = "sqlite:///./data/fadeout.db"
+    DATABASE_URL: str = "sqlite:////data/fadeout.db"
 
     # --- OpenAI ---
     OPENAI_API_KEY: str = ""
