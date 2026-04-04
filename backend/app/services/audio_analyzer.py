@@ -244,7 +244,7 @@ class AudioAnalyzer:
         identified.sort(key=lambda h: h.timestamp_seconds)
 
         # Post-processing: remove likely false positives
-        # A track identified only once AND very close (<90s) to another track
+        # A track identified only once AND very close (<45s) to neighbors on BOTH sides
         # is likely a false positive from a transition blend
         if len(identified) > 3:
             filtered: List[TrackHit] = []
@@ -257,17 +257,18 @@ class AudioAnalyzer:
                     filtered.append(track)
                     continue
 
-                # Keep if there's enough gap from neighbors (>90s both sides)
+                # Keep if there's enough gap from at least one neighbor
                 prev_gap = (track.timestamp_seconds - identified[i - 1].timestamp_seconds) if i > 0 else 999
                 next_gap = (identified[i + 1].timestamp_seconds - track.timestamp_seconds) if i < len(identified) - 1 else 999
 
-                if prev_gap >= 90 or next_gap >= 90:
-                    filtered.append(track)
-                else:
+                # Only filter if BOTH gaps are tiny (sandwiched between close tracks)
+                if prev_gap < 45 and next_gap < 45:
                     logger.debug(
                         "Filtering likely false positive: %s - %s at %.0fs (single hit, gaps: %.0fs/%.0fs)",
                         track.artist, track.title, track.timestamp_seconds, prev_gap, next_gap,
                     )
+                else:
+                    filtered.append(track)
             identified = filtered
 
         return identified
@@ -301,15 +302,6 @@ class AudioAnalyzer:
         matches = result.get("matches", [])
         track_info = result.get("track")
         if not matches or not track_info:
-            return None
-
-        # Filter by match confidence — Shazam offset is a rough confidence indicator
-        # Lower offset values generally mean higher confidence
-        top_match = matches[0] if matches else {}
-        match_offset = top_match.get("offset", 0)
-        # Very high offset values (>10) are usually false positives from transitions/FX
-        if match_offset > 15:
-            logger.debug("Low confidence match at %.1fs (offset=%s), skipping", offset, match_offset)
             return None
 
         title = track_info.get("title", "Unknown")
