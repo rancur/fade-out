@@ -29,11 +29,12 @@ UPLOAD_TIMEOUT = 600  # 10 minutes for large FLAC files
 class SoundCloudUploader:
     """Upload mixes to SoundCloud via API (preferred) or browser automation (fallback)."""
 
-    def __init__(self) -> None:
-        self._client_id = settings.SOUNDCLOUD_CLIENT_ID
-        self._client_secret = settings.SOUNDCLOUD_CLIENT_SECRET
-        self._access_token: Optional[str] = settings.SOUNDCLOUD_ACCESS_TOKEN
-        self._refresh_token: Optional[str] = settings.SOUNDCLOUD_REFRESH_TOKEN
+    def __init__(self, db_settings_json: Optional[Dict[str, Any]] = None) -> None:
+        sj = db_settings_json or {}
+        self._client_id = sj.get("soundcloud_client_id") or settings.SOUNDCLOUD_CLIENT_ID
+        self._client_secret = sj.get("soundcloud_client_secret") or settings.SOUNDCLOUD_CLIENT_SECRET
+        self._access_token: Optional[str] = sj.get("soundcloud_access_token") or settings.SOUNDCLOUD_ACCESS_TOKEN
+        self._refresh_token: Optional[str] = sj.get("soundcloud_refresh_token") or settings.SOUNDCLOUD_REFRESH_TOKEN
         self._email = settings.SOUNDCLOUD_EMAIL
         self._password = settings.SOUNDCLOUD_PASSWORD
         self._playwright = None

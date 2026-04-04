@@ -252,8 +252,9 @@ export default function AppSettings() {
         <div>
           <p className="text-sm text-gold">API keys are stored server-side</p>
           <p className="text-[11px] text-gray-500 mt-1">
-            Platform credentials and API keys are managed through environment variables on the backend.
-            They are never exposed through this dashboard.
+            Credentials can be configured above or via environment variables.
+            Values stored in the database take priority over .env. They are never
+            sent to the browser in plain text.
           </p>
         </div>
       </div>

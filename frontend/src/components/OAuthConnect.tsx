@@ -1,5 +1,6 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useSearchParams } from 'react-router-dom'
 import {
   Cloud,
   Youtube,
@@ -11,8 +12,10 @@ import {
   ExternalLink,
   ChevronDown,
   ChevronRight,
-  Sparkles,
-  Cpu,
+  Eye,
+  EyeOff,
+  Save,
+  Info,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import clsx from 'clsx'
@@ -49,6 +52,17 @@ interface AllStatus {
 interface OAuthURLResponse {
   url: string
   redirect_uri: string
+}
+
+interface CredentialInfo {
+  name: string
+  is_set: boolean
+  source: string | null
+  masked_value: string | null
+}
+
+interface CredentialsResponse {
+  credentials: CredentialInfo[]
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +123,231 @@ function StatusBar({ status }: { status: AllStatus | undefined }) {
 }
 
 // ---------------------------------------------------------------------------
+// Credential input field with show/hide toggle
+// ---------------------------------------------------------------------------
+
+function CredentialField({
+  label,
+  name,
+  value,
+  onChange,
+  placeholder,
+  credentialInfo,
+}: {
+  label: string
+  name: string
+  value: string
+  onChange: (name: string, value: string) => void
+  placeholder?: string
+  credentialInfo?: CredentialInfo
+}) {
+  const [visible, setVisible] = useState(false)
+
+  const hint = credentialInfo?.is_set
+    ? credentialInfo.source === 'env'
+      ? `Set via .env (${credentialInfo.masked_value})`
+      : `Saved (${credentialInfo.masked_value})`
+    : 'Not set'
+
+  return (
+    <div className="space-y-1">
+      <label className="text-[11px] text-gray-500 font-mono uppercase tracking-wider">
+        {label}
+      </label>
+      <div className="relative">
+        <input
+          type={visible ? 'text' : 'password'}
+          value={value}
+          onChange={(e) => onChange(name, e.target.value)}
+          placeholder={placeholder || `Enter ${label}`}
+          className="w-full bg-dark border border-gray-700 rounded-lg px-3 py-2 pr-10 text-sm font-mono text-gray-200 placeholder-gray-600 focus:border-primary/50 focus:outline-none"
+        />
+        <button
+          type="button"
+          onClick={() => setVisible(!visible)}
+          className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 transition-colors"
+        >
+          {visible ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+        </button>
+      </div>
+      <p className={clsx(
+        'text-[10px] font-mono',
+        credentialInfo?.is_set ? 'text-gray-500' : 'text-gray-600',
+      )}>
+        {hint}
+      </p>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Credentials Management Section
+// ---------------------------------------------------------------------------
+
+function CredentialsSection({
+  onCredentialsSaved,
+}: {
+  onCredentialsSaved: () => void
+}) {
+  const qc = useQueryClient()
+  const [expanded, setExpanded] = useState(false)
+  const [formValues, setFormValues] = useState<Record<string, string>>({})
+  const [hasChanges, setHasChanges] = useState(false)
+
+  const { data: credentialsData, isLoading } = useQuery({
+    queryKey: ['credentials'],
+    queryFn: () =>
+      client.get<CredentialsResponse>('/auth/credentials').then((r) => r.data),
+  })
+
+  const saveCredentials = useMutation({
+    mutationFn: (creds: Record<string, string>) =>
+      client.put<CredentialsResponse>('/auth/credentials', { credentials: creds }).then((r) => r.data),
+    onSuccess: () => {
+      toast.success('Credentials saved')
+      setFormValues({})
+      setHasChanges(false)
+      qc.invalidateQueries({ queryKey: ['credentials'] })
+      qc.invalidateQueries({ queryKey: ['auth-status-all'] })
+      onCredentialsSaved()
+    },
+    onError: () => toast.error('Failed to save credentials'),
+  })
+
+  const handleChange = (name: string, value: string) => {
+    setFormValues((prev) => ({ ...prev, [name]: value }))
+    setHasChanges(true)
+  }
+
+  const handleSave = () => {
+    // Only send fields that have been modified
+    const toSave: Record<string, string> = {}
+    for (const [k, v] of Object.entries(formValues)) {
+      if (v !== '') {
+        toSave[k] = v
+      }
+    }
+    if (Object.keys(toSave).length > 0) {
+      saveCredentials.mutate(toSave)
+    }
+  }
+
+  const getCredInfo = (name: string): CredentialInfo | undefined =>
+    credentialsData?.credentials.find((c) => c.name === name)
+
+  // Auto-expand if nothing is configured
+  const allConfigured = credentialsData?.credentials.every((c) => c.is_set) ?? false
+
+  const credentialGroups = [
+    {
+      title: 'AI Services',
+      fields: [
+        { label: 'OpenAI API Key', name: 'openai_api_key', placeholder: 'sk-proj-...' },
+        { label: 'fal.ai API Key', name: 'fal_api_key', placeholder: 'fal-...' },
+      ],
+    },
+    {
+      title: 'SoundCloud OAuth',
+      fields: [
+        { label: 'Client ID', name: 'soundcloud_client_id', placeholder: 'Your SoundCloud app Client ID' },
+        { label: 'Client Secret', name: 'soundcloud_client_secret', placeholder: 'Your SoundCloud app Client Secret' },
+      ],
+    },
+    {
+      title: 'YouTube / Google OAuth',
+      fields: [
+        { label: 'Client ID', name: 'youtube_client_id', placeholder: 'xxxx.apps.googleusercontent.com' },
+        { label: 'Client Secret', name: 'youtube_client_secret', placeholder: 'GOCSPX-...' },
+        { label: 'API Key (optional, read-only)', name: 'youtube_api_key', placeholder: 'AIza...' },
+      ],
+    },
+  ]
+
+  return (
+    <div className="bg-surface-light border border-primary/10 rounded-xl p-5">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-lg flex items-center justify-center bg-primary/10">
+            <Key className="w-5 h-5 text-primary" />
+          </div>
+          <div>
+            <h3 className="text-sm font-mono text-gray-200">API Credentials</h3>
+            <p className="text-[11px] text-gray-500">
+              {allConfigured
+                ? 'All credentials configured'
+                : 'Configure API keys and OAuth client secrets'}
+            </p>
+          </div>
+        </div>
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="px-3 py-1.5 rounded-lg text-[11px] font-mono border border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-all flex items-center gap-1.5"
+        >
+          {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+          {allConfigured ? 'Edit' : 'Configure'}
+        </button>
+      </div>
+
+      {(expanded || !allConfigured) && (
+        <div className="mt-5 space-y-6">
+          {isLoading ? (
+            <div className="h-20 bg-dark/50 rounded-lg animate-pulse" />
+          ) : (
+            <>
+              {credentialGroups.map((group) => (
+                <div key={group.title} className="space-y-3">
+                  <h4 className="text-[11px] font-mono text-gray-400 uppercase tracking-wider">
+                    {group.title}
+                  </h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {group.fields.map((field) => (
+                      <CredentialField
+                        key={field.name}
+                        label={field.label}
+                        name={field.name}
+                        value={formValues[field.name] || ''}
+                        onChange={handleChange}
+                        placeholder={field.placeholder}
+                        credentialInfo={getCredInfo(field.name)}
+                      />
+                    ))}
+                  </div>
+                </div>
+              ))}
+
+              {hasChanges && (
+                <div className="flex justify-end">
+                  <button
+                    onClick={handleSave}
+                    disabled={saveCredentials.isPending}
+                    className="flex items-center gap-2 px-4 py-2 bg-primary/10 text-primary border border-primary/30 rounded-lg text-xs font-mono hover:bg-primary/20 transition-all disabled:opacity-50"
+                  >
+                    {saveCredentials.isPending ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Save className="w-3.5 h-3.5" />
+                    )}
+                    Save Credentials
+                  </button>
+                </div>
+              )}
+
+              <div className="flex items-start gap-2 p-3 bg-dark/50 border border-gray-800 rounded-lg">
+                <Info className="w-4 h-4 text-gray-500 shrink-0 mt-0.5" />
+                <p className="text-[10px] text-gray-500 font-mono">
+                  Credentials saved here override .env values. Leave a field empty to use the .env
+                  fallback. Values are stored server-side and never sent to the browser in plain text.
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // SoundCloud Section
 // ---------------------------------------------------------------------------
 
@@ -133,33 +372,18 @@ function SoundCloudSection({ status }: { status: SoundCloudStatus | undefined })
     onError: () => toast.error('Failed to save token'),
   })
 
-  const [showAuthFlow, setShowAuthFlow] = useState(false)
-  const [authCode, setAuthCode] = useState('')
-
+  // Authorize via callback flow — opens in same window, SoundCloud redirects back
   const getOAuthUrl = useMutation({
     mutationFn: () =>
       client.get<OAuthURLResponse>('/auth/soundcloud/oauth-url').then((r) => r.data),
     onSuccess: (data) => {
-      window.open(data.url, '_blank')
-      setShowAuthFlow(true)
+      // Navigate to SoundCloud auth — callback will redirect back to /settings
+      window.location.href = data.url
     },
-    onError: () => toast.error('Failed to generate auth URL'),
-  })
-
-  const exchangeCode = useMutation({
-    mutationFn: (code: string) =>
-      client.post<SoundCloudStatus>('/auth/soundcloud/exchange-code', { code, redirect_uri: 'https://soundcloud.com' }).then((r) => r.data),
-    onSuccess: (data) => {
-      if (data.connected) {
-        toast.success(`SoundCloud connected as @${data.username}!`)
-        setShowAuthFlow(false)
-        setAuthCode('')
-      } else {
-        toast.error(data.error || 'Code exchange failed')
-      }
-      qc.invalidateQueries({ queryKey: ['auth-status-all'] })
+    onError: (err: any) => {
+      const msg = err.response?.data?.detail || 'Failed to generate auth URL. Make sure SoundCloud credentials are configured above.'
+      toast.error(msg)
     },
-    onError: () => toast.error('Code exchange failed'),
   })
 
   const isConnected = status?.connected
@@ -222,34 +446,8 @@ function SoundCloudSection({ status }: { status: SoundCloudStatus | undefined })
         )}
       </div>
 
-      {/* Auth code paste flow */}
-      {showAuthFlow && !isConnected && (
-        <div className="mt-4 space-y-3 p-3 bg-dark/50 border border-secondary/20 rounded-lg">
-          <p className="text-[11px] text-gray-400">
-            A SoundCloud authorization page opened in a new tab. After authorizing, you'll be redirected to soundcloud.com.
-            Copy the <strong className="text-gray-200">code</strong> from the URL bar (after <code className="text-secondary">?code=</code>) and paste it below.
-          </p>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={authCode}
-              onChange={(e) => setAuthCode(e.target.value)}
-              placeholder="Paste the code from the URL"
-              className="flex-1 bg-dark border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-200 placeholder-gray-600 focus:border-secondary/50 focus:outline-none"
-            />
-            <button
-              onClick={() => authCode && exchangeCode.mutate(authCode)}
-              disabled={!authCode || exchangeCode.isPending}
-              className="px-4 py-2 bg-secondary/10 text-secondary border border-secondary/30 rounded-lg text-sm font-mono hover:bg-secondary/20 transition-all disabled:opacity-40"
-            >
-              {exchangeCode.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Connect'}
-            </button>
-          </div>
-        </div>
-      )}
-
       {/* Config hints */}
-      {!isConnected && !showTokenInput && !showAuthFlow && status?.error && (
+      {!isConnected && !showTokenInput && status?.error && (
         <p className="text-[11px] text-cyber-orange mt-3 font-mono">{status.error}</p>
       )}
 
@@ -288,55 +486,26 @@ function SoundCloudSection({ status }: { status: SoundCloudStatus | undefined })
 function YouTubeSection({ status }: { status: YouTubeStatus | undefined }) {
   const qc = useQueryClient()
   const [expanded, setExpanded] = useState(false)
-  const [authCode, setAuthCode] = useState('')
-  const [oauthRedirectUri, setOauthRedirectUri] = useState('')
   const [showRefreshTokenInput, setShowRefreshTokenInput] = useState(false)
   const [refreshToken, setRefreshToken] = useState('')
-  const [awaitingCode, setAwaitingCode] = useState(false)
 
   const canUpload = status?.can_upload
   const isConnected = status?.connected
 
-  // Generate OAuth URL
+  // Authorize via callback flow
   const generateOAuthUrl = useMutation({
     mutationFn: () =>
       client
-        .get<OAuthURLResponse>('/auth/youtube/oauth-url', {
-          params: { redirect_uri: 'urn:ietf:wg:oauth:2.0:oob' },
-        })
+        .get<OAuthURLResponse>('/auth/youtube/oauth-url')
         .then((r) => r.data),
     onSuccess: (data) => {
-      setOauthRedirectUri(data.redirect_uri)
-      window.open(data.url, '_blank')
-      setAwaitingCode(true)
+      // Navigate to Google auth — callback will redirect back to /settings
+      window.location.href = data.url
     },
     onError: (err: any) => {
-      const msg = err.response?.data?.detail || 'Failed to generate OAuth URL'
+      const msg = err.response?.data?.detail || 'Failed to generate OAuth URL. Make sure YouTube credentials are configured above.'
       toast.error(msg)
     },
-  })
-
-  // Exchange code for tokens
-  const exchangeCode = useMutation({
-    mutationFn: (code: string) =>
-      client
-        .post<YouTubeStatus>('/auth/youtube/exchange-code', {
-          code,
-          redirect_uri: oauthRedirectUri || 'urn:ietf:wg:oauth:2.0:oob',
-        })
-        .then((r) => r.data),
-    onSuccess: (data) => {
-      if (data.can_upload) {
-        toast.success(`YouTube connected to ${data.channel_name} — uploads enabled!`)
-        setAwaitingCode(false)
-        setAuthCode('')
-        setExpanded(false)
-      } else if (data.error) {
-        toast.error(data.error)
-      }
-      qc.invalidateQueries({ queryKey: ['auth-status-all'] })
-    },
-    onError: () => toast.error('Code exchange failed'),
   })
 
   // Save refresh token directly
@@ -478,7 +647,6 @@ function YouTubeSection({ status }: { status: YouTubeStatus | undefined }) {
               <p className="text-[11px] text-gray-500 ml-7">
                 Go to Credentials, click "Create Credentials" &gt; "OAuth client ID". Choose
                 application type <strong className="text-gray-400">"Desktop application"</strong>.
-                No redirect URI needed — Google handles it for desktop apps.
               </p>
               <p className="text-[11px] text-gray-500 ml-7">
                 If prompted for an OAuth consent screen, create one (External is fine for personal
@@ -486,25 +654,20 @@ function YouTubeSection({ status }: { status: YouTubeStatus | undefined }) {
               </p>
             </div>
 
-            {/* Step 4 */}
+            {/* Step 4 — Save credentials via UI */}
             <div className="space-y-1.5">
               <div className="flex items-center gap-2">
                 <span className="flex items-center justify-center w-5 h-5 rounded-full bg-primary/20 text-primary text-[10px] font-bold">
                   4
                 </span>
                 <span className="text-xs font-mono text-gray-300">
-                  Add credentials to your .env file
+                  Enter your Client ID and Secret above
                 </span>
               </div>
-              <div className="ml-7 bg-dark border border-gray-700 rounded-lg p-3 font-mono text-[11px] text-gray-400">
-                <code>
-                  FADEOUT_YOUTUBE_CLIENT_ID=your-client-id.apps.googleusercontent.com
-                  <br />
-                  FADEOUT_YOUTUBE_CLIENT_SECRET=your-client-secret
-                </code>
-              </div>
               <p className="text-[11px] text-gray-500 ml-7">
-                Then restart the backend so it picks up the new env vars.
+                Copy the Client ID and Client Secret from Google Cloud Console and paste them into
+                the <strong className="text-gray-400">API Credentials</strong> section above, then
+                click Save Credentials.
               </p>
             </div>
 
@@ -517,11 +680,23 @@ function YouTubeSection({ status }: { status: YouTubeStatus | undefined }) {
                 <span className="text-xs font-mono text-gray-300">Authorize with Google</span>
               </div>
               <p className="text-[11px] text-gray-500 ml-7">
-                Click the button below. A Google sign-in page will open. After you approve, Google
-                will show you an authorization code. Copy it and paste it here.
+                Click the button below. You will be redirected to Google to sign in and approve access.
+                After approval, you will be automatically redirected back here.
               </p>
 
               <div className="ml-7 space-y-3">
+                {/* Desktop app localhost note */}
+                <div className="flex items-start gap-2 p-3 bg-dark/50 border border-gold/20 rounded-lg">
+                  <AlertTriangle className="w-4 h-4 text-gold shrink-0 mt-0.5" />
+                  <p className="text-[10px] text-gray-400 font-mono">
+                    <strong className="text-gold">Desktop OAuth client?</strong> Google only allows{' '}
+                    <code className="text-cyber-cyan">http://127.0.0.1</code> redirects for Desktop
+                    apps. Access fade-out at{' '}
+                    <code className="text-cyber-cyan">http://127.0.0.1:8500</code> for this step.
+                    After authorization, normal LAN access works fine.
+                  </p>
+                </div>
+
                 <button
                   onClick={() => generateOAuthUrl.mutate()}
                   disabled={generateOAuthUrl.isPending}
@@ -532,41 +707,8 @@ function YouTubeSection({ status }: { status: YouTubeStatus | undefined }) {
                   ) : (
                     <ExternalLink className="w-3.5 h-3.5" />
                   )}
-                  Open Google Authorization
+                  Authorize with Google
                 </button>
-
-                {awaitingCode && (
-                  <div className="space-y-2 p-3 bg-dark border border-cyber-red/20 rounded-lg">
-                    <p className="text-[11px] text-gray-400 font-mono">
-                      After authorizing, paste the code from the Google page below:
-                    </p>
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        value={authCode}
-                        onChange={(e) => setAuthCode(e.target.value)}
-                        placeholder="Paste authorization code here"
-                        className="flex-1 bg-surface border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-200 placeholder-gray-600 focus:border-cyber-red/50 focus:outline-none"
-                      />
-                      <button
-                        onClick={() => authCode && exchangeCode.mutate(authCode)}
-                        disabled={!authCode || exchangeCode.isPending}
-                        className="px-4 py-2 bg-primary/10 text-primary border border-primary/30 rounded-lg text-sm font-mono hover:bg-primary/20 transition-all disabled:opacity-40"
-                      >
-                        {exchangeCode.isPending ? (
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                        ) : (
-                          'Connect'
-                        )}
-                      </button>
-                    </div>
-                    {exchangeCode.isError && (
-                      <p className="text-[11px] text-cyber-red font-mono">
-                        Exchange failed. Make sure you copied the full code and try again.
-                      </p>
-                    )}
-                  </div>
-                )}
               </div>
             </div>
 
@@ -619,61 +761,54 @@ function YouTubeSection({ status }: { status: YouTubeStatus | undefined }) {
 }
 
 // ---------------------------------------------------------------------------
-// API Key status cards (OpenAI, fal)
-// ---------------------------------------------------------------------------
-
-function ApiKeyCard({
-  label,
-  icon: Icon,
-  iconColor,
-  bgColor,
-  configured,
-  envVar,
-}: {
-  label: string
-  icon: React.ElementType
-  iconColor: string
-  bgColor: string
-  configured: boolean
-  envVar: string
-}) {
-  return (
-    <div className="flex items-center gap-3 bg-surface-light border border-primary/10 rounded-xl px-4 py-3">
-      <div className={clsx('w-8 h-8 rounded-lg flex items-center justify-center', bgColor)}>
-        <Icon className={clsx('w-4 h-4', iconColor)} />
-      </div>
-      <div className="flex-1">
-        <span className="text-xs font-mono text-gray-300">{label}</span>
-        <div className="flex items-center gap-1.5">
-          {configured ? (
-            <>
-              <CheckCircle2 className="w-3 h-3 text-primary" />
-              <span className="text-[11px] text-primary font-mono">Configured</span>
-            </>
-          ) : (
-            <>
-              <XCircle className="w-3 h-3 text-gray-600" />
-              <span className="text-[11px] text-gray-600 font-mono">
-                Add {envVar} to .env
-              </span>
-            </>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
 // Main Setup Wizard
 // ---------------------------------------------------------------------------
 
 export default function SetupWizard() {
+  const qc = useQueryClient()
+  const [searchParams, setSearchParams] = useSearchParams()
+
   const { data: status, isLoading } = useQuery({
     queryKey: ['auth-status-all'],
     queryFn: () => client.get<AllStatus>('/auth/status').then((r) => r.data),
     refetchInterval: 30_000,
   })
+
+  // Detect OAuth callback results from URL params
+  useEffect(() => {
+    const auth = searchParams.get('auth')
+    const success = searchParams.get('success')
+    const error = searchParams.get('error')
+
+    if (auth && (success || error)) {
+      const service = auth === 'soundcloud' ? 'SoundCloud' : auth === 'youtube' ? 'YouTube' : auth
+
+      if (success === '1') {
+        toast.success(`${service} connected successfully!`)
+        // Refresh status
+        qc.invalidateQueries({ queryKey: ['auth-status-all'] })
+      } else if (error) {
+        const errorMessages: Record<string, string> = {
+          no_code_received: 'No authorization code received from the provider.',
+          missing_client_credentials: 'Client credentials are missing. Configure them in API Credentials above.',
+          code_exchange_failed: 'Failed to exchange the authorization code for tokens. Try again.',
+          no_refresh_token_returned: 'No refresh token was returned. Try revoking app access at myaccount.google.com/permissions and re-authorize.',
+        }
+        toast.error(`${service} auth failed: ${errorMessages[error] || error}`)
+      }
+
+      // Clean up URL params
+      const newParams = new URLSearchParams(searchParams)
+      newParams.delete('auth')
+      newParams.delete('success')
+      newParams.delete('error')
+      setSearchParams(newParams, { replace: true })
+    }
+  }, [searchParams, setSearchParams, qc])
+
+  const handleCredentialsSaved = () => {
+    qc.invalidateQueries({ queryKey: ['auth-status-all'] })
+  }
 
   if (isLoading) {
     return (
@@ -694,25 +829,8 @@ export default function SetupWizard() {
       {/* Overall status bar */}
       <StatusBar status={status} />
 
-      {/* API Key cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <ApiKeyCard
-          label="OpenAI"
-          icon={Sparkles}
-          iconColor="text-cyber-cyan"
-          bgColor="bg-cyber-cyan/10"
-          configured={status?.openai.configured ?? false}
-          envVar="FADEOUT_OPENAI_API_KEY"
-        />
-        <ApiKeyCard
-          label="fal.ai"
-          icon={Cpu}
-          iconColor="text-cyber-magenta"
-          bgColor="bg-cyber-magenta/10"
-          configured={status?.fal.configured ?? false}
-          envVar="FADEOUT_FAL_API_KEY"
-        />
-      </div>
+      {/* API Credentials (editable from UI) */}
+      <CredentialsSection onCredentialsSaved={handleCredentialsSaved} />
 
       {/* SoundCloud */}
       <SoundCloudSection status={status?.soundcloud} />

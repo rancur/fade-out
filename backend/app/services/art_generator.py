@@ -61,10 +61,11 @@ GENRE_VISUAL_MODIFIERS: Dict[str, str] = {
 class ArtGenerator:
     """Generates cover art (1400x1400) and YouTube thumbnails (1920x1080)."""
 
-    def __init__(self) -> None:
-        self._fal_api_key = settings.FAL_API_KEY
+    def __init__(self, db_settings_json: Optional[Dict[str, Any]] = None) -> None:
+        sj = db_settings_json or {}
+        self._fal_api_key = sj.get("fal_api_key") or settings.FAL_API_KEY
         self._fal_model = settings.FAL_MODEL
-        self._openai_api_key = settings.OPENAI_API_KEY
+        self._openai_api_key = sj.get("openai_api_key") or settings.OPENAI_API_KEY
 
     # ------------------------------------------------------------------
     # Public API

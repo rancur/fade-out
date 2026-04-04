@@ -130,8 +130,10 @@ Return ONLY the title, nothing else.\
 class DescriptionGenerator:
     """Generates platform-specific descriptions and titles using OpenAI."""
 
-    def __init__(self) -> None:
-        self._client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    def __init__(self, db_settings_json: Optional[Dict[str, Any]] = None) -> None:
+        sj = db_settings_json or {}
+        api_key = sj.get("openai_api_key") or settings.OPENAI_API_KEY
+        self._client = openai.AsyncOpenAI(api_key=api_key)
         self._model = settings.OPENAI_MODEL
 
     async def generate_soundcloud_description(

@@ -32,7 +32,9 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
 class YouTubeUploader:
     """Upload videos to YouTube via the Data API v3."""
 
-    def __init__(self) -> None:
+    def __init__(self, db_settings_json: Optional[Dict] = None) -> None:
+        sj = db_settings_json or {}
+        self._db_settings = sj
         self._credentials: Optional[Credentials] = None
         self._youtube = None
 
@@ -45,15 +47,20 @@ class YouTubeUploader:
         if self._credentials and self._credentials.valid:
             return self._credentials
 
-        if not settings.YOUTUBE_REFRESH_TOKEN:
+        sj = self._db_settings
+        refresh_token = sj.get("youtube_refresh_token") or settings.YOUTUBE_REFRESH_TOKEN
+        client_id = sj.get("youtube_client_id") or settings.YOUTUBE_CLIENT_ID
+        client_secret = sj.get("youtube_client_secret") or settings.YOUTUBE_CLIENT_SECRET
+
+        if not refresh_token:
             raise RuntimeError("YOUTUBE_REFRESH_TOKEN not configured")
 
         self._credentials = Credentials(
             token=None,
-            refresh_token=settings.YOUTUBE_REFRESH_TOKEN,
+            refresh_token=refresh_token,
             token_uri="https://oauth2.googleapis.com/token",
-            client_id=settings.YOUTUBE_CLIENT_ID,
-            client_secret=settings.YOUTUBE_CLIENT_SECRET,
+            client_id=client_id,
+            client_secret=client_secret,
             scopes=SCOPES,
         )
         self._credentials.refresh(Request())

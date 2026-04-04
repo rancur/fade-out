@@ -162,7 +162,9 @@ async def handle_generate_description(
     from app.services.description_generator import DescriptionGenerator
     from app.services.tag_generator import TagGenerator
 
-    desc_gen = DescriptionGenerator()
+    app_settings = await _get_app_settings(session)
+    sj = (app_settings.settings_json or {}) if app_settings else {}
+    desc_gen = DescriptionGenerator(db_settings_json=sj)
     tag_gen = TagGenerator()
 
     # Generate a creative SoundCloud title
@@ -256,7 +258,9 @@ async def handle_generate_art(
 
     from app.services.art_generator import ArtGenerator
 
-    art_gen = ArtGenerator()
+    app_settings_art = await _get_app_settings(session)
+    sj_art = (app_settings_art.settings_json or {}) if app_settings_art else {}
+    art_gen = ArtGenerator(db_settings_json=sj_art)
 
     cover_result = await art_gen.generate_cover_art(
         mix_title=mix.title,
@@ -304,7 +308,11 @@ async def handle_upload_soundcloud(
     if not has_token and app_settings and app_settings.settings_json:
         has_token = bool(app_settings.settings_json.get("soundcloud_access_token"))
 
-    has_credentials = bool(settings.SOUNDCLOUD_CLIENT_ID and settings.SOUNDCLOUD_CLIENT_SECRET)
+    sj = (app_settings.settings_json or {}) if app_settings else {}
+    has_credentials = bool(
+        (sj.get("soundcloud_client_id") or settings.SOUNDCLOUD_CLIENT_ID)
+        and (sj.get("soundcloud_client_secret") or settings.SOUNDCLOUD_CLIENT_SECRET)
+    )
     has_browser_auth = bool(settings.SOUNDCLOUD_EMAIL and settings.SOUNDCLOUD_PASSWORD)
 
     if not has_token and not has_credentials and not has_browser_auth:
@@ -325,7 +333,8 @@ async def handle_upload_soundcloud(
     tags = mix.tags or tag_gen.generate(genres=genres, vibes=vibes, tracklist=mix.tracklist)
     genre_label = tag_gen.get_primary_genre_tag(genres)
 
-    uploader = SoundCloudUploader()
+    sj_sc = (app_settings.settings_json or {}) if app_settings else {}
+    uploader = SoundCloudUploader(db_settings_json=sj_sc)
     permalink = await uploader.upload(
         audio_path=mix.audio_file_path,
         title=mix.title,
@@ -355,7 +364,9 @@ async def handle_verify_soundcloud(
 
     from app.services.soundcloud_uploader import SoundCloudUploader
 
-    uploader = SoundCloudUploader()
+    app_settings_v = await _get_app_settings(session)
+    sj_v = (app_settings_v.settings_json or {}) if app_settings_v else {}
+    uploader = SoundCloudUploader(db_settings_json=sj_v)
     verified = await uploader.verify_upload(mix.soundcloud_url)
 
     if not verified:
@@ -406,7 +417,8 @@ async def handle_upload_youtube(
     if app_settings and app_settings.premiere_mode:
         premiere_mode = app_settings.premiere_mode
 
-    uploader = YouTubeUploader()
+    sj_yt = (app_settings.settings_json or {}) if app_settings else {}
+    uploader = YouTubeUploader(db_settings_json=sj_yt)
     result = await uploader.upload(
         video_path=mix.video_file_path,
         title=mix.title_youtube or mix.title,
@@ -447,7 +459,9 @@ async def handle_verify_youtube(
     # Extract video ID from URL
     video_id = mix.youtube_url.split("v=")[-1].split("&")[0]
 
-    uploader = YouTubeUploader()
+    app_settings_yv = await _get_app_settings(session)
+    sj_yv = (app_settings_yv.settings_json or {}) if app_settings_yv else {}
+    uploader = YouTubeUploader(db_settings_json=sj_yv)
     status = await uploader.verify_upload(video_id)
 
     if status.get("status") == "not_found":
