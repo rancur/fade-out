@@ -394,31 +394,44 @@ class ArtGenerator:
     def _overlay_text(
         self, image_path: str, title: str, genres: List[str]
     ) -> None:
-        """Overlay title and genre text on the thumbnail in pixel-art style."""
+        """Overlay title and genre text on the thumbnail with auto-scaling."""
         img = Image.open(image_path).convert("RGB")
-        draw = ImageDraw.Draw(img)
+        max_text_width = img.width - 120  # 60px margin on each side
 
-        # Try to load a pixel/bitmap font, fall back to default
+        # Auto-scale title font to fit within the image width
         title_font = self._get_font(size=64)
+        title_size = 64
+        while title_size > 28:
+            bbox = title_font.getbbox(title) if hasattr(title_font, 'getbbox') else (0, 0, title_size * len(title) * 0.6, title_size)
+            text_width = bbox[2] - bbox[0] if bbox else title_size * len(title) * 0.6
+            if text_width <= max_text_width:
+                break
+            title_size -= 4
+            title_font = self._get_font(size=title_size)
+
         genre_font = self._get_font(size=36)
+        genre_text = " / ".join(g.title() for g in genres[:3])
+
+        # Calculate overlay height based on font sizes
+        overlay_height = title_size + 60 + 50  # title + genre + padding
+        overlay_top = img.height - overlay_height
 
         # Semi-transparent overlay at bottom
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay)
         overlay_draw.rectangle(
-            [(0, img.height - 200), (img.width, img.height)],
-            fill=(0, 0, 0, 160),
+            [(0, overlay_top), (img.width, img.height)],
+            fill=(0, 0, 0, 170),
         )
         img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
         draw = ImageDraw.Draw(img)
 
         # Title text
-        title_y = img.height - 170
+        title_y = overlay_top + 20
         self._draw_text_with_shadow(draw, title, (60, title_y), title_font, fill="white")
 
         # Genre text
-        genre_text = " / ".join(g.title() for g in genres[:3])
-        genre_y = img.height - 80
+        genre_y = title_y + title_size + 15
         self._draw_text_with_shadow(draw, genre_text, (60, genre_y), genre_font, fill="#FF6B35")
 
         img.save(image_path, quality=95)
