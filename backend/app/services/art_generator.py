@@ -239,20 +239,30 @@ class ArtGenerator:
                 result_url = f"https://queue.fal.run/{self._fal_model}/requests/{request_id}"
 
                 # Poll for completion
-                for _ in range(60):  # up to 5 minutes
-                    import asyncio
+                import asyncio
+                for attempt in range(60):  # up to 5 minutes
                     await asyncio.sleep(5)
-                    status_resp = await client.get(status_url, headers=headers)
-                    status_data = status_resp.json()
-                    if status_data.get("status") == "COMPLETED":
+                    try:
+                        status_resp = await client.get(status_url, headers=headers)
+                        if status_resp.status_code != 200 or not status_resp.text.strip():
+                            logger.debug("fal.ai status poll %d: HTTP %s (empty or error)", attempt, status_resp.status_code)
+                            continue
+                        status_data = status_resp.json()
+                    except Exception as poll_exc:
+                        logger.debug("fal.ai status poll %d error: %s", attempt, poll_exc)
+                        continue
+
+                    status_val = status_data.get("status", "").upper()
+                    if status_val == "COMPLETED":
                         result_resp = await client.get(result_url, headers=headers)
                         result = result_resp.json()
                         break
-                    elif status_data.get("status") in ("FAILED", "CANCELLED"):
+                    elif status_val in ("FAILED", "CANCELLED"):
                         logger.error("fal.ai generation failed: %s", status_data)
                         return None
+                    # IN_QUEUE or IN_PROGRESS — keep polling
                 else:
-                    logger.error("fal.ai generation timed out")
+                    logger.error("fal.ai generation timed out after 60 polls")
                     return None
 
             images = result.get("images") or result.get("output", {}).get("images", [])
