@@ -210,39 +210,66 @@ class AudioAnalyzer:
         seen_titles: set[str] = set()
         last_title: Optional[str] = None
 
-        for t in sample_times:
-            hits_at_point: List[TrackHit] = []
+        # Track how many times each song is identified (for confidence filtering)
+        title_hit_count: dict[str, int] = {}
 
+        for t in sample_times:
             # Primary clip at sample point
             hit = await self._shazam_segment(path, t, sr_native)
-            if hit:
-                hits_at_point.append(hit)
-            else:
+            if not hit:
                 # Retry with offset if primary fails
-                retry_offset = t + RETRY_CLIP_OFFSET
-                hit_retry = await self._shazam_segment(path, retry_offset, sr_native)
-                if hit_retry:
-                    hits_at_point.append(hit_retry)
+                hit = await self._shazam_segment(path, t + RETRY_CLIP_OFFSET, sr_native)
 
-            # Secondary clip at +30s to catch transitions
-            secondary_t = t + SECONDARY_CLIP_OFFSET
-            hit2 = await self._shazam_segment(path, secondary_t, sr_native)
-            if hit2:
-                hits_at_point.append(hit2)
-
-            # Add unique hits, deduplicating consecutive same-track identifications
-            for h in hits_at_point:
-                title_key = h.title.lower()
-                # Skip if same as the last identified track (consecutive dedup)
-                if title_key == last_title:
-                    continue
-                if title_key not in seen_titles:
+            if hit:
+                title_key = hit.title.lower()
+                title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
+                if title_key != last_title and title_key not in seen_titles:
                     seen_titles.add(title_key)
-                    identified.append(h)
+                    identified.append(hit)
                     last_title = title_key
+
+            # Secondary clip at +30s to catch tracks during transitions
+            # Only add if we didn't already get a hit at this point
+            if not hit:
+                hit2 = await self._shazam_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
+                if hit2:
+                    title_key = hit2.title.lower()
+                    title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
+                    if title_key != last_title and title_key not in seen_titles:
+                        seen_titles.add(title_key)
+                        identified.append(hit2)
+                        last_title = title_key
 
         # Sort by timestamp
         identified.sort(key=lambda h: h.timestamp_seconds)
+
+        # Post-processing: remove likely false positives
+        # A track identified only once AND very close (<90s) to another track
+        # is likely a false positive from a transition blend
+        if len(identified) > 3:
+            filtered: List[TrackHit] = []
+            for i, track in enumerate(identified):
+                title_key = track.title.lower()
+                hits = title_hit_count.get(title_key, 0)
+
+                # Keep if identified more than once (confirmed)
+                if hits >= 2:
+                    filtered.append(track)
+                    continue
+
+                # Keep if there's enough gap from neighbors (>90s both sides)
+                prev_gap = (track.timestamp_seconds - identified[i - 1].timestamp_seconds) if i > 0 else 999
+                next_gap = (identified[i + 1].timestamp_seconds - track.timestamp_seconds) if i < len(identified) - 1 else 999
+
+                if prev_gap >= 90 or next_gap >= 90:
+                    filtered.append(track)
+                else:
+                    logger.debug(
+                        "Filtering likely false positive: %s - %s at %.0fs (single hit, gaps: %.0fs/%.0fs)",
+                        track.artist, track.title, track.timestamp_seconds, prev_gap, next_gap,
+                    )
+            identified = filtered
+
         return identified
 
     async def _shazam_segment(
@@ -274,6 +301,15 @@ class AudioAnalyzer:
         matches = result.get("matches", [])
         track_info = result.get("track")
         if not matches or not track_info:
+            return None
+
+        # Filter by match confidence — Shazam offset is a rough confidence indicator
+        # Lower offset values generally mean higher confidence
+        top_match = matches[0] if matches else {}
+        match_offset = top_match.get("offset", 0)
+        # Very high offset values (>10) are usually false positives from transitions/FX
+        if match_offset > 15:
+            logger.debug("Low confidence match at %.1fs (offset=%s), skipping", offset, match_offset)
             return None
 
         title = track_info.get("title", "Unknown")
