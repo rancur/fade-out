@@ -48,8 +48,8 @@ RULES:
 - No markdown formatting
 - Plain text only
 - If a tracklist is provided, include it with timestamps
-- Do NOT include any links in the description body. Links will be added automatically at the end. Do not write placeholder links like [example.com] either.
-- Platform-specific links go at the very bottom
+- Do NOT include any links, URLs, or references to links in the description body. No "Find us on", "Explore more", "Follow on", "Catch us on", or similar link introduction phrases. Links are appended automatically and separately. Do not write placeholder links like [example.com] either.
+- Do NOT include a sign-off line like "— Will See" or any closing signature
 
 MIX DATA:
 - Title: {mix_title}
@@ -358,8 +358,8 @@ class DescriptionGenerator:
 
         description = response.choices[0].message.content.strip()
 
-        # Strip any lines that look like URLs or bracketed placeholder links
-        # This catches LLM hallucinated links like "[soundcloud.com/willsee]" or "https://..."
+        # Strip any lines that look like URLs, bracketed placeholder links,
+        # or link introduction phrases ("Find us on:", "Explore more:", etc.)
         url_line_pattern = re.compile(
             r"^\s*(\[?\s*https?://\S+\s*\]?|"       # lines starting with a URL or [url]
             r"\[?\s*\w+\.\w+\S*\s*\]?)\s*$|"        # lines that are just a domain like [example.com]
@@ -367,10 +367,19 @@ class DescriptionGenerator:
             r"^\s*\w+:\s*\[?\s*\w+\.\w+\S*\s*\]?$", # lines like "Website: [example.com]"
             re.IGNORECASE,
         )
+        link_intro_pattern = re.compile(
+            r"^\s*(find\s+us|explore\s+more|follow|catch\s+us|connect\s+with|check\s+us|"
+            r"listen\s+on|watch\s+on|more\s+from|stay\s+connected|join\s+us|links|"
+            r"--+\s*will\s+see|—\s*will\s+see)\b",
+            re.IGNORECASE,
+        )
         cleaned_lines = []
         for line in description.split("\n"):
-            if not url_line_pattern.match(line):
-                cleaned_lines.append(line)
+            if url_line_pattern.match(line):
+                continue
+            if link_intro_pattern.match(line):
+                continue
+            cleaned_lines.append(line)
         description = "\n".join(cleaned_lines).rstrip()
 
         # Always append the real links
