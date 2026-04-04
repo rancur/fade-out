@@ -199,7 +199,7 @@ export default function MixDetail() {
 
           {/* Action buttons */}
           <div className="flex gap-2 pt-2">
-            {mix.pipeline_status === 'reviewing' && (
+            {mix.pipeline_status === 'draft_review' && (
               <button
                 onClick={handleApprove}
                 disabled={approve.isPending}
@@ -276,33 +276,78 @@ export default function MixDetail() {
         )}
 
         {tab === 'description' && (
-          <div className="prose prose-invert max-w-none space-y-6">
-            <div>
-              <h3 className="text-sm font-mono text-gray-400 mb-2">SoundCloud</h3>
-              {mix.description_soundcloud ? (
-                <div className="text-sm text-gray-300 whitespace-pre-wrap leading-relaxed">
-                  {mix.description_soundcloud}
-                </div>
-              ) : (
-                <p className="text-gray-600 text-sm italic">No SoundCloud description generated yet.</p>
-              )}
-            </div>
-            <div>
-              <h3 className="text-sm font-mono text-gray-400 mb-2">YouTube</h3>
-              {mix.description_youtube ? (
-                <div className="text-sm text-gray-300 whitespace-pre-wrap leading-relaxed">
-                  {mix.description_youtube}
-                </div>
-              ) : (
-                <p className="text-gray-600 text-sm italic">No YouTube description generated yet.</p>
-              )}
-            </div>
-            {mix.title_youtube && (
-              <div>
-                <h3 className="text-sm font-mono text-gray-400 mb-2">YouTube Title</h3>
-                <p className="text-sm text-gray-300">{mix.title_youtube}</p>
+          <div className="space-y-8">
+            {/* SoundCloud */}
+            <div className="border border-secondary/20 rounded-xl overflow-hidden">
+              <div className="flex items-center gap-2 px-5 py-3 bg-secondary/5 border-b border-secondary/20">
+                <div className="w-2.5 h-2.5 rounded-full bg-secondary shadow-[0_0_6px_theme(colors.secondary)]" />
+                <span className="text-sm font-mono text-secondary">SoundCloud</span>
+                <span className="text-[11px] text-gray-500 ml-auto font-mono">{mix.title}</span>
               </div>
-            )}
+              <div className="flex flex-col md:flex-row">
+                {/* Cover art (square) */}
+                <div className="w-full md:w-64 shrink-0">
+                  {mix.cover_art_path ? (
+                    <img
+                      src={`/api/mixes/${mix.id}/cover-art`}
+                      alt="SoundCloud cover art"
+                      className="w-full md:w-64 md:h-64 object-cover"
+                    />
+                  ) : (
+                    <div className="w-full h-48 md:h-64 bg-gradient-to-br from-secondary/10 to-cyber-magenta/5 flex items-center justify-center">
+                      <Music className="w-16 h-16 text-secondary/20" />
+                    </div>
+                  )}
+                </div>
+                {/* Description */}
+                <div className="flex-1 p-5">
+                  {mix.description_soundcloud ? (
+                    <div className="text-sm text-gray-300 whitespace-pre-wrap leading-relaxed max-h-[320px] overflow-y-auto pr-2 scrollbar-thin">
+                      {mix.description_soundcloud}
+                    </div>
+                  ) : (
+                    <p className="text-gray-600 text-sm italic">No SoundCloud description generated yet.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* YouTube */}
+            <div className="border border-cyber-red/20 rounded-xl overflow-hidden">
+              <div className="flex items-center gap-2 px-5 py-3 bg-cyber-red/5 border-b border-cyber-red/20">
+                <div className="w-2.5 h-2.5 rounded-full bg-cyber-red shadow-[0_0_6px_theme(colors.cyber.red)]" />
+                <span className="text-sm font-mono text-cyber-red">YouTube</span>
+                {mix.title_youtube && (
+                  <span className="text-[11px] text-gray-500 ml-auto font-mono">{mix.title_youtube}</span>
+                )}
+              </div>
+              <div className="flex flex-col md:flex-row">
+                {/* Thumbnail (16:9) */}
+                <div className="w-full md:w-80 shrink-0">
+                  {mix.thumbnail_path ? (
+                    <img
+                      src={`/api/mixes/${mix.id}/thumbnail`}
+                      alt="YouTube thumbnail"
+                      className="w-full md:w-80 md:h-[180px] object-cover"
+                    />
+                  ) : (
+                    <div className="w-full h-48 md:h-[180px] bg-gradient-to-br from-cyber-red/10 to-cyber-orange/5 flex items-center justify-center">
+                      <Music className="w-16 h-16 text-cyber-red/20" />
+                    </div>
+                  )}
+                </div>
+                {/* Description */}
+                <div className="flex-1 p-5">
+                  {mix.description_youtube ? (
+                    <div className="text-sm text-gray-300 whitespace-pre-wrap leading-relaxed max-h-[320px] overflow-y-auto pr-2 scrollbar-thin">
+                      {mix.description_youtube}
+                    </div>
+                  ) : (
+                    <p className="text-gray-600 text-sm italic">No YouTube description generated yet.</p>
+                  )}
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
