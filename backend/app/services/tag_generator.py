@@ -4,8 +4,6 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
-from app.config import settings
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
