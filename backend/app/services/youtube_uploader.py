@@ -20,13 +20,15 @@ CATEGORY_MUSIC = "10"
 
 # Preferred premiere slots (Phoenix local time)
 PREMIERE_SLOTS = [
-    ("friday", 16),    # Fri 4 PM Phoenix = 7 PM EST
+    ("friday", 16),  # Fri 4 PM Phoenix = 7 PM EST
     ("saturday", 10),  # Sat 10 AM Phoenix
     ("thursday", 17),  # Thu 5 PM Phoenix
 ]
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
-          "https://www.googleapis.com/auth/youtube"]
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube",
+]
 
 
 class YouTubeUploader:
@@ -48,9 +50,13 @@ class YouTubeUploader:
             return self._credentials
 
         sj = self._db_settings
-        refresh_token = sj.get("youtube_refresh_token") or settings.YOUTUBE_REFRESH_TOKEN
+        refresh_token = (
+            sj.get("youtube_refresh_token") or settings.YOUTUBE_REFRESH_TOKEN
+        )
         client_id = sj.get("youtube_client_id") or settings.YOUTUBE_CLIENT_ID
-        client_secret = sj.get("youtube_client_secret") or settings.YOUTUBE_CLIENT_SECRET
+        client_secret = (
+            sj.get("youtube_client_secret") or settings.YOUTUBE_CLIENT_SECRET
+        )
 
         if not refresh_token:
             raise RuntimeError("YOUTUBE_REFRESH_TOKEN not configured")
@@ -127,6 +133,7 @@ class YouTubeUploader:
         )
 
         import asyncio
+
         insert_request = youtube.videos().insert(
             part="snippet,status",
             body=body,
@@ -145,7 +152,9 @@ class YouTubeUploader:
         # Playlist management
         playlist_id = None
         if genre_for_playlist:
-            playlist_id = await self._manage_playlist(youtube, video_id, genre_for_playlist)
+            playlist_id = await self._manage_playlist(
+                youtube, video_id, genre_for_playlist
+            )
 
         return {
             "video_id": video_id,
@@ -168,10 +177,15 @@ class YouTubeUploader:
             except Exception as exc:
                 retries += 1
                 if retries > max_retries:
-                    raise RuntimeError(f"YouTube upload failed after {max_retries} retries: {exc}")
-                logger.warning("Upload chunk failed (retry %d/%d): %s", retries, max_retries, exc)
+                    raise RuntimeError(
+                        f"YouTube upload failed after {max_retries} retries: {exc}"
+                    )
+                logger.warning(
+                    "Upload chunk failed (retry %d/%d): %s", retries, max_retries, exc
+                )
                 import time
-                time.sleep(2 ** retries)
+
+                time.sleep(2**retries)
 
         return response
 
@@ -182,6 +196,7 @@ class YouTubeUploader:
     async def _set_thumbnail(self, youtube, video_id: str, thumbnail_path: str) -> None:
         """Set a custom thumbnail for the video."""
         import asyncio
+
         try:
             media = MediaFileUpload(thumbnail_path, mimetype="image/jpeg")
             await asyncio.to_thread(
@@ -217,8 +232,13 @@ class YouTubeUploader:
         for day_name, hour in PREMIERE_SLOTS:
             # Calculate next occurrence of this day+hour
             day_index = {
-                "monday": 0, "tuesday": 1, "wednesday": 2,
-                "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
+                "monday": 0,
+                "tuesday": 1,
+                "wednesday": 2,
+                "thursday": 3,
+                "friday": 4,
+                "saturday": 5,
+                "sunday": 6,
             }[day_name]
 
             current_day = now_phoenix.weekday()
@@ -237,7 +257,9 @@ class YouTubeUploader:
         candidates.sort()
 
         # Prefer within 24 hours
-        within_24h = [c for c in candidates if (c - now_phoenix).total_seconds() <= 86400]
+        within_24h = [
+            c for c in candidates if (c - now_phoenix).total_seconds() <= 86400
+        ]
         chosen_phoenix = within_24h[0] if within_24h else candidates[0]
 
         # Convert back to UTC
@@ -260,16 +282,21 @@ class YouTubeUploader:
     ) -> Optional[str]:
         """Add video to appropriate genre playlist, creating if needed."""
         import asyncio
-        playlist_name = f"{settings.YOUTUBE_DEFAULT_PLAYLIST_PREFIX} | {genre.title()} Mixes"
+
+        playlist_name = (
+            f"{settings.YOUTUBE_DEFAULT_PLAYLIST_PREFIX} | {genre.title()} Mixes"
+        )
 
         try:
             # Search existing playlists
             playlists = await asyncio.to_thread(
-                youtube.playlists().list(
+                youtube.playlists()
+                .list(
                     part="snippet",
                     mine=True,
                     maxResults=50,
-                ).execute
+                )
+                .execute
             )
 
             playlist_id = None
@@ -281,7 +308,8 @@ class YouTubeUploader:
             # Create if not found
             if not playlist_id:
                 create_resp = await asyncio.to_thread(
-                    youtube.playlists().insert(
+                    youtube.playlists()
+                    .insert(
                         part="snippet,status",
                         body={
                             "snippet": {
@@ -290,14 +318,16 @@ class YouTubeUploader:
                             },
                             "status": {"privacyStatus": "public"},
                         },
-                    ).execute
+                    )
+                    .execute
                 )
                 playlist_id = create_resp["id"]
                 logger.info("Created playlist: %s (%s)", playlist_name, playlist_id)
 
             # Add video to playlist
             await asyncio.to_thread(
-                youtube.playlistItems().insert(
+                youtube.playlistItems()
+                .insert(
                     part="snippet",
                     body={
                         "snippet": {
@@ -308,7 +338,8 @@ class YouTubeUploader:
                             },
                         },
                     },
-                ).execute
+                )
+                .execute
             )
             logger.info("Added video %s to playlist %s", video_id, playlist_id)
             return playlist_id
@@ -324,14 +355,17 @@ class YouTubeUploader:
     async def verify_upload(self, video_id: str) -> Dict[str, Any]:
         """Check video status via the API."""
         import asyncio
+
         youtube = self._get_service()
 
         try:
             response = await asyncio.to_thread(
-                youtube.videos().list(
+                youtube.videos()
+                .list(
                     part="status,snippet,processingDetails",
                     id=video_id,
-                ).execute
+                )
+                .execute
             )
 
             items = response.get("items", [])
@@ -341,7 +375,9 @@ class YouTubeUploader:
             video = items[0]
             upload_status = video.get("status", {}).get("uploadStatus", "unknown")
             privacy = video.get("status", {}).get("privacyStatus", "unknown")
-            processing = video.get("processingDetails", {}).get("processingStatus", "unknown")
+            processing = video.get("processingDetails", {}).get(
+                "processingStatus", "unknown"
+            )
 
             result = {
                 "status": upload_status,

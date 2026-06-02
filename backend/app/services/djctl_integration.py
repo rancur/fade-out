@@ -65,8 +65,8 @@ class DJCTLResult:
 
 _RE_PERFORMER = re.compile(r'^\s*PERFORMER\s+"(.+)"', re.MULTILINE)
 _RE_TITLE = re.compile(r'^\s*TITLE\s+"(.+)"', re.MULTILINE)
-_RE_TRACK = re.compile(r'^\s*TRACK\s+(\d+)\s+AUDIO', re.MULTILINE)
-_RE_INDEX = re.compile(r'^\s*INDEX\s+01\s+(\d+):(\d+):(\d+)', re.MULTILINE)
+_RE_TRACK = re.compile(r"^\s*TRACK\s+(\d+)\s+AUDIO", re.MULTILINE)
+_RE_INDEX = re.compile(r"^\s*INDEX\s+01\s+(\d+):(\d+):(\d+)", re.MULTILINE)
 
 
 def parse_cue_file(cue_path: str) -> List[CueTrack]:
@@ -119,14 +119,16 @@ def parse_cue_file(cue_path: str) -> List[CueTrack]:
                 mm = int(im.group(1))
                 ss = int(im.group(2))
                 ff = int(im.group(3))
-                tracks.append(CueTrack(
-                    number=current_track_num,
-                    title=current_title or f"Track {current_track_num}",
-                    artist=current_performer or global_performer or "Unknown",
-                    index_mm=mm,
-                    index_ss=ss,
-                    index_ff=ff,
-                ))
+                tracks.append(
+                    CueTrack(
+                        number=current_track_num,
+                        title=current_title or f"Track {current_track_num}",
+                        artist=current_performer or global_performer or "Unknown",
+                        index_mm=mm,
+                        index_ss=ss,
+                        index_ff=ff,
+                    )
+                )
                 current_track_num = None
                 continue
 
@@ -134,7 +136,9 @@ def parse_cue_file(cue_path: str) -> List[CueTrack]:
     return tracks
 
 
-def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> Optional[str]:
+def find_cue_for_audio(
+    audio_path: str, cue_directory: Optional[str] = None
+) -> Optional[str]:
     """Find a CUE sheet matching an audio file by date proximity.
 
     CUE filenames contain date like djctl-2025-12-05.cue.
@@ -151,7 +155,7 @@ def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> 
     best_match: Optional[str] = None
     best_delta: int = 999
 
-    date_pattern = re.compile(r'(\d{4}-\d{2}-\d{2})')
+    date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
     for fname in os.listdir(cue_dir):
         if not fname.lower().endswith(".cue"):
@@ -170,7 +174,12 @@ def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> 
             best_match = os.path.join(cue_dir, fname)
 
     if best_match and best_delta <= 1:
-        logger.info("Matched CUE %s to audio %s (delta=%d days)", best_match, audio_path, best_delta)
+        logger.info(
+            "Matched CUE %s to audio %s (delta=%d days)",
+            best_match,
+            audio_path,
+            best_delta,
+        )
         return best_match
 
     logger.debug("No CUE match found for %s (best delta=%d)", audio_path, best_delta)
@@ -180,6 +189,7 @@ def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> 
 # --------------------------------------------------------------------------
 # WebSocket listener
 # --------------------------------------------------------------------------
+
 
 class DJCTLWebSocketListener:
     """Connects to DJCTL WebSocket and collects real-time track data."""
@@ -216,7 +226,9 @@ class DJCTLWebSocketListener:
                             msg = json.loads(raw_msg)
                             self._handle_message(msg)
                         except json.JSONDecodeError:
-                            logger.debug("Non-JSON message from DJCTL: %s", raw_msg[:100])
+                            logger.debug(
+                                "Non-JSON message from DJCTL: %s", raw_msg[:100]
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -246,6 +258,7 @@ class DJCTLWebSocketListener:
 # --------------------------------------------------------------------------
 # Merge logic
 # --------------------------------------------------------------------------
+
 
 def merge_tracklists(
     cue_tracks: Optional[List[CueTrack]],
@@ -287,12 +300,14 @@ def merge_tracklists(
             h, rem = divmod(total, 3600)
             m, s = divmod(rem, 60)
             tf = f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m}:{s:02d}"
-            formatted.append({
-                "title": wt.get("title", "Unknown"),
-                "artist": wt.get("artist", "Unknown"),
-                "timestamp_seconds": ts,
-                "timestamp_formatted": tf,
-            })
+            formatted.append(
+                {
+                    "title": wt.get("title", "Unknown"),
+                    "artist": wt.get("artist", "Unknown"),
+                    "timestamp_seconds": ts,
+                    "timestamp_formatted": tf,
+                }
+            )
         return DJCTLResult(tracklist=formatted, source="djctl")
 
     if shazam_tracks:
@@ -303,12 +318,14 @@ def merge_tracklists(
             h, rem = divmod(total, 3600)
             m, s = divmod(rem, 60)
             tf = f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m}:{s:02d}"
-            formatted.append({
-                "title": st.get("title", "Unknown"),
-                "artist": st.get("artist", "Unknown"),
-                "timestamp_seconds": ts,
-                "timestamp_formatted": tf,
-            })
+            formatted.append(
+                {
+                    "title": st.get("title", "Unknown"),
+                    "artist": st.get("artist", "Unknown"),
+                    "timestamp_seconds": ts,
+                    "timestamp_formatted": tf,
+                }
+            )
         return DJCTLResult(tracklist=formatted, source="shazam")
 
     return DJCTLResult(tracklist=[], source="none")

@@ -17,6 +17,7 @@ router = APIRouter(prefix="/api/ai", tags=["ai_usage"])
 
 # --- Schemas ---
 
+
 class AIUsageOut(BaseModel):
     id: int
     mix_id: Optional[str] = None
@@ -64,12 +65,17 @@ class BudgetResponse(BaseModel):
 
 # --- Endpoints ---
 
+
 @router.get("/usage", response_model=AIUsageListResponse)
 async def list_ai_usage(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
-    start_date: Optional[date] = Query(None, description="Filter from this date (inclusive)"),
-    end_date: Optional[date] = Query(None, description="Filter to this date (inclusive)"),
+    start_date: Optional[date] = Query(
+        None, description="Filter from this date (inclusive)"
+    ),
+    end_date: Optional[date] = Query(
+        None, description="Filter to this date (inclusive)"
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """List AI usage records with optional date range filtering and pagination."""
@@ -77,11 +83,19 @@ async def list_ai_usage(
     count_query = select(sa_func.count()).select_from(AIUsage)
 
     if start_date:
-        query = query.where(AIUsage.created_at >= datetime.combine(start_date, datetime.min.time()))
-        count_query = count_query.where(AIUsage.created_at >= datetime.combine(start_date, datetime.min.time()))
+        query = query.where(
+            AIUsage.created_at >= datetime.combine(start_date, datetime.min.time())
+        )
+        count_query = count_query.where(
+            AIUsage.created_at >= datetime.combine(start_date, datetime.min.time())
+        )
     if end_date:
-        query = query.where(AIUsage.created_at <= datetime.combine(end_date, datetime.max.time()))
-        count_query = count_query.where(AIUsage.created_at <= datetime.combine(end_date, datetime.max.time()))
+        query = query.where(
+            AIUsage.created_at <= datetime.combine(end_date, datetime.max.time())
+        )
+        count_query = count_query.where(
+            AIUsage.created_at <= datetime.combine(end_date, datetime.max.time())
+        )
 
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
@@ -153,8 +167,7 @@ async def ai_budget(db: AsyncSession = Depends(get_db)):
     month_start = datetime(now.year, now.month, 1)
 
     result = await db.execute(
-        select(sa_func.sum(AIUsage.cost_usd))
-        .where(AIUsage.created_at >= month_start)
+        select(sa_func.sum(AIUsage.cost_usd)).where(AIUsage.created_at >= month_start)
     )
     spent = result.scalar() or 0.0
     spent = round(spent, 4)

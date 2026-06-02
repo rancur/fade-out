@@ -21,6 +21,7 @@ _last_checked_at: Optional[str] = None
 
 # --- Schemas ---
 
+
 class UpgradeStatusResponse(BaseModel):
     current_version: str
     latest_version: Optional[str] = None
@@ -66,6 +67,7 @@ class BackupCreateResponse(BaseModel):
 
 # --- Endpoints ---
 
+
 @router.get("/status", response_model=UpgradeStatusResponse)
 async def upgrade_status():
     """Return current version info and whether an update is available."""
@@ -73,7 +75,9 @@ async def upgrade_status():
 
     current = _get_current_version()
     latest = _last_check.get("latest_version") if _last_check else None
-    update_available = _last_check is not None and _last_check.get("latest_version") is not None
+    update_available = (
+        _last_check is not None and _last_check.get("latest_version") is not None
+    )
 
     return UpgradeStatusResponse(
         current_version=current,
@@ -95,7 +99,9 @@ async def check_for_updates():
         update_info = await service.check_for_update()
     except Exception as exc:
         logger.exception("Update check failed")
-        raise HTTPException(status_code=502, detail=f"Failed to check for updates: {exc}")
+        raise HTTPException(
+            status_code=502, detail=f"Failed to check for updates: {exc}"
+        )
 
     _last_checked_at = checked_at
 
@@ -141,7 +147,9 @@ async def apply_upgrade():
         logger.info("Pre-upgrade backup saved to %s", backup_path)
     except Exception as exc:
         logger.exception("Pre-upgrade backup failed")
-        raise HTTPException(status_code=500, detail=f"Backup failed, aborting upgrade: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Backup failed, aborting upgrade: {exc}"
+        )
 
     # Perform upgrade
     try:

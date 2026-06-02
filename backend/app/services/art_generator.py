@@ -88,12 +88,19 @@ class ArtGenerator:
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
         image_url = await self._generate_with_fal(
-            prompt, width=1400, height=1400, session=session, mix_id=mix_id,
+            prompt,
+            width=1400,
+            height=1400,
+            session=session,
+            mix_id=mix_id,
         )
         if not image_url:
             logger.warning("fal.ai failed, falling back to DALL-E")
             image_url = await self._generate_with_dalle(
-                prompt, size="1024x1024", session=session, mix_id=mix_id,
+                prompt,
+                size="1024x1024",
+                session=session,
+                mix_id=mix_id,
             )
 
         if not image_url:
@@ -120,10 +127,16 @@ class ArtGenerator:
         if cover_art_path and os.path.exists(cover_art_path):
             # Extend the cover art to 16:9
             thumbnail_url = await self._generate_wide_variant(
-                genres, vibes, brand_settings, session, mix_id,
+                genres,
+                vibes,
+                brand_settings,
+                session,
+                mix_id,
             )
             if thumbnail_url:
-                await self._download_and_save(thumbnail_url, output_path, resize=(1920, 1080))
+                await self._download_and_save(
+                    thumbnail_url, output_path, resize=(1920, 1080)
+                )
             else:
                 # Fallback: letterbox the cover art
                 self._letterbox_cover(cover_art_path, output_path)
@@ -131,11 +144,18 @@ class ArtGenerator:
             # Generate fresh wide image
             prompt = self._build_prompt(genres, vibes, brand_settings, aspect="wide")
             image_url = await self._generate_with_fal(
-                prompt, width=1920, height=1080, session=session, mix_id=mix_id,
+                prompt,
+                width=1920,
+                height=1080,
+                session=session,
+                mix_id=mix_id,
             )
             if not image_url:
                 image_url = await self._generate_with_dalle(
-                    prompt, size="1792x1024", session=session, mix_id=mix_id,
+                    prompt,
+                    size="1792x1024",
+                    session=session,
+                    mix_id=mix_id,
                 )
             if not image_url:
                 raise RuntimeError("All providers failed for thumbnail generation")
@@ -175,7 +195,10 @@ class ArtGenerator:
         # Genre modifiers
         genre_mods_map = GENRE_VISUAL_MODIFIERS
         if brand_settings and brand_settings.genre_visual_modifiers:
-            genre_mods_map = {**GENRE_VISUAL_MODIFIERS, **brand_settings.genre_visual_modifiers}
+            genre_mods_map = {
+                **GENRE_VISUAL_MODIFIERS,
+                **brand_settings.genre_visual_modifiers,
+            }
 
         genre_modifier_parts: List[str] = []
         for g in genres:
@@ -193,7 +216,9 @@ class ArtGenerator:
         parts.append(f"motifs: {', '.join(motifs[:5])}")
 
         if aspect == "wide":
-            parts.append("wide cinematic composition, 16:9 aspect ratio, panoramic scene")
+            parts.append(
+                "wide cinematic composition, 16:9 aspect ratio, panoramic scene"
+            )
         else:
             parts.append("square composition, centered subject")
 
@@ -236,21 +261,37 @@ class ArtGenerator:
             # fal.ai queue API: may return request_id for polling or direct result
             if "request_id" in result:
                 # Use URLs from the response (they handle model path correctly)
-                status_url = result.get("status_url", f"https://queue.fal.run/{self._fal_model}/requests/{result['request_id']}/status")
-                result_url = result.get("response_url", f"https://queue.fal.run/{self._fal_model}/requests/{result['request_id']}")
+                status_url = result.get(
+                    "status_url",
+                    f"https://queue.fal.run/{self._fal_model}/requests/{result['request_id']}/status",
+                )
+                result_url = result.get(
+                    "response_url",
+                    f"https://queue.fal.run/{self._fal_model}/requests/{result['request_id']}",
+                )
 
                 # Poll for completion
                 import asyncio
+
                 for attempt in range(60):  # up to 5 minutes
                     await asyncio.sleep(5)
                     try:
                         status_resp = await client.get(status_url, headers=headers)
-                        if status_resp.status_code != 200 or not status_resp.text.strip():
-                            logger.debug("fal.ai status poll %d: HTTP %s (empty or error)", attempt, status_resp.status_code)
+                        if (
+                            status_resp.status_code != 200
+                            or not status_resp.text.strip()
+                        ):
+                            logger.debug(
+                                "fal.ai status poll %d: HTTP %s (empty or error)",
+                                attempt,
+                                status_resp.status_code,
+                            )
                             continue
                         status_data = status_resp.json()
                     except Exception as poll_exc:
-                        logger.debug("fal.ai status poll %d error: %s", attempt, poll_exc)
+                        logger.debug(
+                            "fal.ai status poll %d error: %s", attempt, poll_exc
+                        )
                         continue
 
                     status_val = status_data.get("status", "").upper()
@@ -303,6 +344,7 @@ class ArtGenerator:
 
         try:
             import openai
+
             client = openai.AsyncOpenAI(api_key=self._openai_api_key)
             response = await client.images.generate(
                 model="dall-e-3",
@@ -344,11 +386,18 @@ class ArtGenerator:
     ) -> Optional[str]:
         prompt = self._build_prompt(genres, vibes, brand_settings, aspect="wide")
         url = await self._generate_with_fal(
-            prompt, width=1920, height=1080, session=session, mix_id=mix_id,
+            prompt,
+            width=1920,
+            height=1080,
+            session=session,
+            mix_id=mix_id,
         )
         if not url:
             url = await self._generate_with_dalle(
-                prompt, size="1792x1024", session=session, mix_id=mix_id,
+                prompt,
+                size="1792x1024",
+                session=session,
+                mix_id=mix_id,
             )
         return url
 
@@ -377,12 +426,14 @@ class ArtGenerator:
         bg = cover.resize((1920, 1080), Image.LANCZOS)
         try:
             from PIL import ImageFilter
+
             bg = bg.filter(ImageFilter.GaussianBlur(radius=30))
         except Exception:
             pass
 
         # Darken the background
         from PIL import ImageEnhance
+
         enhancer = ImageEnhance.Brightness(bg)
         bg = enhancer.enhance(0.4)
 
@@ -392,9 +443,7 @@ class ArtGenerator:
         bg.paste(cover_resized, (x_offset, 0))
         bg.save(output_path, quality=95)
 
-    def _overlay_text(
-        self, image_path: str, title: str, genres: List[str]
-    ) -> None:
+    def _overlay_text(self, image_path: str, title: str, genres: List[str]) -> None:
         """Overlay title and genre text on the thumbnail with auto-scaling."""
         img = Image.open(image_path).convert("RGB")
         max_text_width = img.width - 120  # 60px margin on each side
@@ -403,7 +452,11 @@ class ArtGenerator:
         title_font = self._get_font(size=64)
         title_size = 64
         while title_size > 28:
-            bbox = title_font.getbbox(title) if hasattr(title_font, 'getbbox') else (0, 0, title_size * len(title) * 0.6, title_size)
+            bbox = (
+                title_font.getbbox(title)
+                if hasattr(title_font, "getbbox")
+                else (0, 0, title_size * len(title) * 0.6, title_size)
+            )
             text_width = bbox[2] - bbox[0] if bbox else title_size * len(title) * 0.6
             if text_width <= max_text_width:
                 break
@@ -429,11 +482,15 @@ class ArtGenerator:
 
         # Title text
         title_y = overlay_top + 20
-        self._draw_text_with_shadow(draw, title, (60, title_y), title_font, fill="white")
+        self._draw_text_with_shadow(
+            draw, title, (60, title_y), title_font, fill="white"
+        )
 
         # Genre text
         genre_y = title_y + title_size + 15
-        self._draw_text_with_shadow(draw, genre_text, (60, genre_y), genre_font, fill="#FF6B35")
+        self._draw_text_with_shadow(
+            draw, genre_text, (60, genre_y), genre_font, fill="#FF6B35"
+        )
 
         img.save(image_path, quality=95)
 
@@ -449,7 +506,9 @@ class ArtGenerator:
     ) -> None:
         x, y = position
         # Shadow
-        draw.text((x + shadow_offset, y + shadow_offset), text, font=font, fill=shadow_color)
+        draw.text(
+            (x + shadow_offset, y + shadow_offset), text, font=font, fill=shadow_color
+        )
         # Main text
         draw.text((x, y), text, font=font, fill=fill)
 

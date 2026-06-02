@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 async def _get_mix(mix_id: str, session: AsyncSession) -> Mix:
     """Load a Mix or raise if not found."""
     mix = await session.get(Mix, mix_id)
@@ -58,11 +59,20 @@ async def _detect_video_offset(
     if not first_flac_track:
         return 0.0
 
-    first_flac_title = first_flac_track.get("title", "").lower() if isinstance(first_flac_track, dict) else first_flac_track.title.lower()
-    first_flac_ts = first_flac_track.get("timestamp_seconds", 0) if isinstance(first_flac_track, dict) else first_flac_track.timestamp_seconds
+    first_flac_title = (
+        first_flac_track.get("title", "").lower()
+        if isinstance(first_flac_track, dict)
+        else first_flac_track.title.lower()
+    )
+    first_flac_ts = (
+        first_flac_track.get("timestamp_seconds", 0)
+        if isinstance(first_flac_track, dict)
+        else first_flac_track.timestamp_seconds
+    )
 
     # Sample the video at 30s intervals for the first 10 minutes
     import librosa
+
     duration = librosa.get_duration(path=video_path)
     max_search = min(duration, 600)  # search first 10 min
 
@@ -77,13 +87,18 @@ async def _detect_video_offset(
                 detected_offset = video_ts - first_flac_ts
                 logger.info(
                     "Video offset: first track '%s' at %.0fs in video vs %.0fs in FLAC = %.1fs offset",
-                    hit.title, video_ts, first_flac_ts, detected_offset,
+                    hit.title,
+                    video_ts,
+                    first_flac_ts,
+                    detected_offset,
                 )
                 return detected_offset
         except Exception:
             continue
 
-    logger.info("Could not auto-detect video offset (first track not found in video first 10min)")
+    logger.info(
+        "Could not auto-detect video offset (first track not found in video first 10min)"
+    )
     return 0.0
 
 
@@ -91,14 +106,13 @@ async def _detect_video_offset(
 # detect
 # ---------------------------------------------------------------------------
 
+
 async def handle_detect(mix_id: str, session: AsyncSession) -> Optional[dict]:
     """Verify the audio file exists and read its duration via mutagen."""
     mix = await _get_mix(mix_id, session)
 
     if not mix.audio_file_path or not os.path.exists(mix.audio_file_path):
-        raise FileNotFoundError(
-            f"Audio file missing: {mix.audio_file_path!r}"
-        )
+        raise FileNotFoundError(f"Audio file missing: {mix.audio_file_path!r}")
 
     # Get duration from mutagen (lightweight -- no full decode)
     from mutagen import File as MutagenFile
@@ -114,7 +128,8 @@ async def handle_detect(mix_id: str, session: AsyncSession) -> Optional[dict]:
     if mix.video_file_path:
         if not os.path.exists(mix.video_file_path):
             logger.warning(
-                "Video file set but not found yet: %s", mix.video_file_path,
+                "Video file set but not found yet: %s",
+                mix.video_file_path,
             )
             video_ok = False
 
@@ -129,6 +144,7 @@ async def handle_detect(mix_id: str, session: AsyncSession) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # analyze
 # ---------------------------------------------------------------------------
+
 
 async def handle_analyze(mix_id: str, session: AsyncSession) -> Optional[dict]:
     """Run audio analysis and merge with CUE/DJCTL data if available."""
@@ -191,6 +207,7 @@ async def handle_analyze(mix_id: str, session: AsyncSession) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # generate_description
 # ---------------------------------------------------------------------------
+
 
 async def handle_generate_description(
     mix_id: str, session: AsyncSession
@@ -297,9 +314,8 @@ async def handle_generate_description(
 # generate_art
 # ---------------------------------------------------------------------------
 
-async def handle_generate_art(
-    mix_id: str, session: AsyncSession
-) -> Optional[dict]:
+
+async def handle_generate_art(mix_id: str, session: AsyncSession) -> Optional[dict]:
     """Generate cover art and YouTube thumbnail."""
     mix = await _get_mix(mix_id, session)
     brand = await _get_brand_settings(session)
@@ -355,6 +371,7 @@ async def handle_generate_art(
 # upload_soundcloud
 # ---------------------------------------------------------------------------
 
+
 async def handle_upload_soundcloud(
     mix_id: str, session: AsyncSession
 ) -> Optional[dict]:
@@ -376,7 +393,8 @@ async def handle_upload_soundcloud(
 
     if not has_token and not has_credentials and not has_browser_auth:
         logger.warning(
-            "SoundCloud not configured -- skipping upload for mix %s", mix_id,
+            "SoundCloud not configured -- skipping upload for mix %s",
+            mix_id,
         )
         return {"skipped": True, "reason": "No SoundCloud credentials configured"}
 
@@ -389,7 +407,9 @@ async def handle_upload_soundcloud(
     tag_gen = TagGenerator()
     genres = mix.genres or ["electronic"]
     vibes = mix.vibes or ["mixed"]
-    tags = mix.tags or tag_gen.generate(genres=genres, vibes=vibes, tracklist=mix.tracklist)
+    tags = mix.tags or tag_gen.generate(
+        genres=genres, vibes=vibes, tracklist=mix.tracklist
+    )
     genre_label = tag_gen.get_primary_genre_tag(genres)
 
     sj_sc = (app_settings.settings_json or {}) if app_settings else {}
@@ -411,6 +431,7 @@ async def handle_upload_soundcloud(
 # verify_soundcloud
 # ---------------------------------------------------------------------------
 
+
 async def handle_verify_soundcloud(
     mix_id: str, session: AsyncSession
 ) -> Optional[dict]:
@@ -429,9 +450,7 @@ async def handle_verify_soundcloud(
     verified = await uploader.verify_upload(mix.soundcloud_url)
 
     if not verified:
-        raise RuntimeError(
-            f"SoundCloud verification failed for {mix.soundcloud_url}"
-        )
+        raise RuntimeError(f"SoundCloud verification failed for {mix.soundcloud_url}")
 
     return {"verified": True, "url": mix.soundcloud_url}
 
@@ -440,9 +459,8 @@ async def handle_verify_soundcloud(
 # upload_youtube
 # ---------------------------------------------------------------------------
 
-async def handle_upload_youtube(
-    mix_id: str, session: AsyncSession
-) -> Optional[dict]:
+
+async def handle_upload_youtube(mix_id: str, session: AsyncSession) -> Optional[dict]:
     """Upload the video to YouTube."""
     mix = await _get_mix(mix_id, session)
 
@@ -454,15 +472,14 @@ async def handle_upload_youtube(
 
     if not has_token:
         logger.warning(
-            "YouTube not configured -- skipping upload for mix %s", mix_id,
+            "YouTube not configured -- skipping upload for mix %s",
+            mix_id,
         )
         return {"skipped": True, "reason": "No YouTube refresh token configured"}
 
     # Video file is required for YouTube
     if not mix.video_file_path or not os.path.exists(mix.video_file_path):
-        raise VideoNotReady(
-            f"Video file not available: {mix.video_file_path!r}"
-        )
+        raise VideoNotReady(f"Video file not available: {mix.video_file_path!r}")
 
     from app.services.tag_generator import TagGenerator
     from app.services.youtube_uploader import YouTubeUploader
@@ -503,9 +520,8 @@ async def handle_upload_youtube(
 # verify_youtube
 # ---------------------------------------------------------------------------
 
-async def handle_verify_youtube(
-    mix_id: str, session: AsyncSession
-) -> Optional[dict]:
+
+async def handle_verify_youtube(mix_id: str, session: AsyncSession) -> Optional[dict]:
     """Verify the YouTube upload processed successfully."""
     mix = await _get_mix(mix_id, session)
 
@@ -540,9 +556,8 @@ async def handle_verify_youtube(
 # cross_link
 # ---------------------------------------------------------------------------
 
-async def handle_cross_link(
-    mix_id: str, session: AsyncSession
-) -> Optional[dict]:
+
+async def handle_cross_link(mix_id: str, session: AsyncSession) -> Optional[dict]:
     """Update descriptions on each platform to include the other platform's URL."""
     mix = await _get_mix(mix_id, session)
 
@@ -593,6 +608,7 @@ async def handle_cross_link(
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+
 
 def register_all_handlers(orchestrator: PipelineOrchestrator) -> None:
     """Register every step handler on the given orchestrator instance."""

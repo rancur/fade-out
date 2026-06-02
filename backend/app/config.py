@@ -93,7 +93,9 @@ class Settings(BaseSettings):
     )
 
     # --- Public URL (required for OAuth callbacks with Google/SoundCloud) ---
-    PUBLIC_URL: str = ""  # e.g. https://fadeout.example.com — must be a real domain for Google OAuth
+    PUBLIC_URL: str = (
+        ""  # e.g. https://fadeout.example.com — must be a real domain for Google OAuth
+    )
 
     # --- Logging ---
     LOG_LEVEL: str = "INFO"
@@ -113,7 +115,9 @@ class Settings(BaseSettings):
         """Return NOTIFICATION_WEBHOOK_URLS split into a list."""
         if not self.NOTIFICATION_WEBHOOK_URLS:
             return []
-        return [u.strip() for u in self.NOTIFICATION_WEBHOOK_URLS.split(",") if u.strip()]
+        return [
+            u.strip() for u in self.NOTIFICATION_WEBHOOK_URLS.split(",") if u.strip()
+        ]
 
 
 settings = Settings()

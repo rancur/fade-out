@@ -30,10 +30,18 @@ class SoundCloudUploader:
 
     def __init__(self, db_settings_json: Optional[Dict[str, Any]] = None) -> None:
         sj = db_settings_json or {}
-        self._client_id = sj.get("soundcloud_client_id") or settings.SOUNDCLOUD_CLIENT_ID
-        self._client_secret = sj.get("soundcloud_client_secret") or settings.SOUNDCLOUD_CLIENT_SECRET
-        self._access_token: Optional[str] = sj.get("soundcloud_access_token") or settings.SOUNDCLOUD_ACCESS_TOKEN
-        self._refresh_token: Optional[str] = sj.get("soundcloud_refresh_token") or settings.SOUNDCLOUD_REFRESH_TOKEN
+        self._client_id = (
+            sj.get("soundcloud_client_id") or settings.SOUNDCLOUD_CLIENT_ID
+        )
+        self._client_secret = (
+            sj.get("soundcloud_client_secret") or settings.SOUNDCLOUD_CLIENT_SECRET
+        )
+        self._access_token: Optional[str] = (
+            sj.get("soundcloud_access_token") or settings.SOUNDCLOUD_ACCESS_TOKEN
+        )
+        self._refresh_token: Optional[str] = (
+            sj.get("soundcloud_refresh_token") or settings.SOUNDCLOUD_REFRESH_TOKEN
+        )
         self._email = settings.SOUNDCLOUD_EMAIL
         self._password = settings.SOUNDCLOUD_PASSWORD
         self._playwright = None
@@ -72,7 +80,10 @@ class SoundCloudUploader:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 f"{SOUNDCLOUD_API_BASE}/me",
-                headers={"Authorization": f"OAuth {token}", "Accept": "application/json"},
+                headers={
+                    "Authorization": f"OAuth {token}",
+                    "Accept": "application/json",
+                },
             )
             return resp.status_code == 200
 
@@ -140,14 +151,24 @@ class SoundCloudUploader:
         if self._client_id and self._client_secret:
             try:
                 return await self._api_upload(
-                    audio_path, title, description, genre, tags, cover_art_path,
+                    audio_path,
+                    title,
+                    description,
+                    genre,
+                    tags,
+                    cover_art_path,
                 )
             except Exception as exc:
                 logger.warning("API upload failed, falling back to browser: %s", exc)
 
         # Fall back to Playwright browser automation
         return await self._browser_upload(
-            audio_path, title, description, genre, tags, cover_art_path,
+            audio_path,
+            title,
+            description,
+            genre,
+            tags,
+            cover_art_path,
         )
 
     async def _api_upload(
@@ -174,11 +195,19 @@ class SoundCloudUploader:
         # Build multipart upload
         file_size = os.path.getsize(audio_path)
         if file_size > 500 * 1024 * 1024:  # 500MB API limit
-            raise ValueError(f"File too large for API upload ({file_size / 1024 / 1024:.0f}MB > 500MB)")
+            raise ValueError(
+                f"File too large for API upload ({file_size / 1024 / 1024:.0f}MB > 500MB)"
+            )
 
-        logger.info("Uploading to SoundCloud API: '%s' (%d MB)", title, file_size // (1024 * 1024))
+        logger.info(
+            "Uploading to SoundCloud API: '%s' (%d MB)",
+            title,
+            file_size // (1024 * 1024),
+        )
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(UPLOAD_TIMEOUT, connect=30)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(UPLOAD_TIMEOUT, connect=30)
+        ) as client:
             # Prepare multipart files and data
             files: Dict[str, Any] = {
                 "track[asset_data]": (
@@ -226,7 +255,8 @@ class SoundCloudUploader:
                 track_id = track_data.get("id", "")
                 logger.info(
                     "SoundCloud API upload successful: id=%s url=%s",
-                    track_id, permalink,
+                    track_id,
+                    permalink,
                 )
                 return permalink
             else:
@@ -254,12 +284,20 @@ class SoundCloudUploader:
 
         try:
             return await self._do_browser_upload(
-                page, audio_path, title, description, genre, tags, cover_art_path,
+                page,
+                audio_path,
+                title,
+                description,
+                genre,
+                tags,
+                cover_art_path,
             )
         except Exception:
             try:
                 await page.screenshot(path="/data/soundcloud-upload-error.png")
-                logger.error("Error screenshot saved to /data/soundcloud-upload-error.png")
+                logger.error(
+                    "Error screenshot saved to /data/soundcloud-upload-error.png"
+                )
             except Exception:
                 pass
             raise
@@ -290,11 +328,17 @@ class SoundCloudUploader:
         """Check if logged in via browser, attempt login if not."""
         page = await self._browser.new_page()
         try:
-            await page.goto(SOUNDCLOUD_WEB_BASE, wait_until="domcontentloaded", timeout=30_000)
+            await page.goto(
+                SOUNDCLOUD_WEB_BASE, wait_until="domcontentloaded", timeout=30_000
+            )
             await page.wait_for_timeout(2000)
-            logged_in = await page.query_selector('[aria-label="Your profile"]') is not None
+            logged_in = (
+                await page.query_selector('[aria-label="Your profile"]') is not None
+            )
             if not logged_in:
-                logged_in = await page.query_selector('.header__userNavButton') is not None
+                logged_in = (
+                    await page.query_selector(".header__userNavButton") is not None
+                )
             if logged_in:
                 logger.info("Already logged in to SoundCloud (browser)")
                 return
@@ -305,9 +349,15 @@ class SoundCloudUploader:
     async def _browser_login(self, page: Page) -> None:
         """Perform browser login flow."""
         if not self._email or not self._password:
-            raise RuntimeError("SoundCloud credentials not configured for browser login")
+            raise RuntimeError(
+                "SoundCloud credentials not configured for browser login"
+            )
 
-        await page.goto(f"{SOUNDCLOUD_WEB_BASE}/signin", wait_until="domcontentloaded", timeout=30_000)
+        await page.goto(
+            f"{SOUNDCLOUD_WEB_BASE}/signin",
+            wait_until="domcontentloaded",
+            timeout=30_000,
+        )
         await page.wait_for_timeout(2000)
 
         email_btn = await page.query_selector('button:has-text("email")')
@@ -316,13 +366,15 @@ class SoundCloudUploader:
             await page.wait_for_timeout(1000)
 
         email_input = await page.wait_for_selector(
-            'input[type="email"], input[name="email"], input[id="email"]', timeout=10_000,
+            'input[type="email"], input[name="email"], input[id="email"]',
+            timeout=10_000,
         )
         await email_input.fill(self._email)
         await page.wait_for_timeout(500)
 
         password_input = await page.wait_for_selector(
-            'input[type="password"], input[name="password"]', timeout=10_000,
+            'input[type="password"], input[name="password"]',
+            timeout=10_000,
         )
         await password_input.fill(self._password)
         await page.wait_for_timeout(500)
@@ -339,7 +391,9 @@ class SoundCloudUploader:
             await page.wait_for_url(f"{SOUNDCLOUD_WEB_BASE}/**", timeout=15_000)
             logger.info("SoundCloud browser login successful")
         except Exception:
-            error_el = await page.query_selector('.formControl__validationMessage, .loginForm__error')
+            error_el = await page.query_selector(
+                ".formControl__validationMessage, .loginForm__error"
+            )
             error_text = await error_el.inner_text() if error_el else "unknown error"
             raise RuntimeError(f"SoundCloud browser login failed: {error_text}")
 
@@ -360,7 +414,8 @@ class SoundCloudUploader:
 
         # Upload file
         file_input = await page.wait_for_selector(
-            'input[type="file"][accept*="audio"], input[type="file"]', timeout=15_000,
+            'input[type="file"][accept*="audio"], input[type="file"]',
+            timeout=15_000,
         )
         await file_input.set_input_files(audio_path)
         logger.info("Audio file selected: %s", audio_path)
@@ -447,7 +502,8 @@ class SoundCloudUploader:
         # Wait for track URL
         try:
             await page.wait_for_url(
-                f"{SOUNDCLOUD_WEB_BASE}/*/**", timeout=900_000,
+                f"{SOUNDCLOUD_WEB_BASE}/*/**",
+                timeout=900_000,
             )
             url = page.url
             if "/upload" not in url:
@@ -462,7 +518,9 @@ class SoundCloudUploader:
         if track_link:
             href = await track_link.get_attribute("href")
             if href:
-                return href if href.startswith("http") else f"{SOUNDCLOUD_WEB_BASE}{href}"
+                return (
+                    href if href.startswith("http") else f"{SOUNDCLOUD_WEB_BASE}{href}"
+                )
 
         current = page.url
         if "/upload" not in current:
@@ -493,7 +551,9 @@ class SoundCloudUploader:
                     if resp.status_code == 200:
                         data = resp.json()
                         if data.get("kind") == "track":
-                            logger.info("SoundCloud upload verified via API: %s", track_url)
+                            logger.info(
+                                "SoundCloud upload verified via API: %s", track_url
+                            )
                             return True
             except Exception as exc:
                 logger.debug("API verification failed, trying HTTP: %s", exc)

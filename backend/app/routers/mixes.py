@@ -16,15 +16,19 @@ from app.config import settings
 from app.database import get_db
 from app.models import Mix, PipelineStep
 
+
 # Lazy import to avoid circular dependency -- the orchestrator is set at app startup
 def _get_orchestrator():
     from app.main import orchestrator
+
     return orchestrator
+
 
 router = APIRouter(prefix="/api/mixes", tags=["mixes"])
 
 
 # --- Schemas ---
+
 
 class TracklistItem(BaseModel):
     title: str
@@ -114,6 +118,7 @@ class MixListResponse(BaseModel):
 
 # --- Endpoints ---
 
+
 @router.get("", response_model=MixListResponse)
 async def list_mixes(
     page: int = Query(1, ge=1),
@@ -157,8 +162,7 @@ async def get_mix(mix_id: str, db: AsyncSession = Depends(get_db)):
     # Convert to dict to avoid lazy-load issues with Pydantic
     mix_dict = {c.name: getattr(mix, c.name) for c in mix.__table__.columns}
     mix_dict["steps"] = [
-        {c.name: getattr(s, c.name) for c in s.__table__.columns}
-        for s in mix.steps
+        {c.name: getattr(s, c.name) for c in s.__table__.columns} for s in mix.steps
     ]
     return MixDetail(**mix_dict)
 
@@ -198,9 +202,15 @@ async def create_mix(body: MixCreate, db: AsyncSession = Depends(get_db)):
 
     # Create initial pipeline steps
     step_names = [
-        "detect", "analyze", "generate_description", "generate_art",
-        "upload_soundcloud", "upload_youtube", "verify_soundcloud",
-        "verify_youtube", "cross_link",
+        "detect",
+        "analyze",
+        "generate_description",
+        "generate_art",
+        "upload_soundcloud",
+        "upload_youtube",
+        "verify_soundcloud",
+        "verify_youtube",
+        "cross_link",
     ]
     for name in step_names:
         db.add(PipelineStep(mix_id=mix.id, step_name=name, status="pending"))

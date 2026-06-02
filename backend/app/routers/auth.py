@@ -41,6 +41,7 @@ MANAGED_CREDENTIALS = [
 # Models
 # ---------------------------------------------------------------------------
 
+
 class SoundCloudStatus(BaseModel):
     connected: bool
     username: Optional[str] = None
@@ -98,6 +99,7 @@ class CredentialsUpdate(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 async def _get_settings(db: AsyncSession) -> AppSettings:
     result = await db.execute(select(AppSettings).where(AppSettings.id == 1))
     row = result.scalar_one_or_none()
@@ -149,7 +151,9 @@ async def _get_soundcloud_status(db: AsyncSession) -> SoundCloudStatus:
                 connected=False,
                 error="Client credentials configured but no access token. Use Auto Connect or paste a token.",
             )
-        return SoundCloudStatus(connected=False, error="No SoundCloud credentials configured")
+        return SoundCloudStatus(
+            connected=False, error="No SoundCloud credentials configured"
+        )
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -163,7 +167,9 @@ async def _get_soundcloud_status(db: AsyncSession) -> SoundCloudStatus:
                 connected=True,
                 username=data.get("username") or data.get("permalink"),
             )
-        return SoundCloudStatus(connected=False, error=f"Token invalid (HTTP {resp.status_code})")
+        return SoundCloudStatus(
+            connected=False, error=f"Token invalid (HTTP {resp.status_code})"
+        )
     except Exception as exc:
         return SoundCloudStatus(connected=False, error=str(exc))
 
@@ -213,8 +219,12 @@ async def _get_youtube_status(db: AsyncSession) -> YouTubeStatus:
                 items = yt_resp.json().get("items", [])
                 if items:
                     channel_name = items[0].get("snippet", {}).get("title")
-                    return YouTubeStatus(connected=True, channel_name=channel_name, can_upload=True)
-                return YouTubeStatus(connected=True, channel_name="(no channel found)", can_upload=True)
+                    return YouTubeStatus(
+                        connected=True, channel_name=channel_name, can_upload=True
+                    )
+                return YouTubeStatus(
+                    connected=True, channel_name="(no channel found)", can_upload=True
+                )
 
             return YouTubeStatus(
                 connected=False,
@@ -276,6 +286,7 @@ async def _get_youtube_status(db: AsyncSession) -> YouTubeStatus:
 # General Status
 # ---------------------------------------------------------------------------
 
+
 @router.get("/status", response_model=AllStatus)
 async def all_status(db: AsyncSession = Depends(get_db)):
     """Returns status of ALL connections in one call."""
@@ -300,6 +311,7 @@ async def all_status(db: AsyncSession = Depends(get_db)):
 # Credentials Management (Web UI)
 # ---------------------------------------------------------------------------
 
+
 @router.get("/credentials", response_model=CredentialsResponse)
 async def get_credentials(db: AsyncSession = Depends(get_db)):
     """Return which credentials are configured (with masked values)."""
@@ -312,32 +324,40 @@ async def get_credentials(db: AsyncSession = Depends(get_db)):
         env_val = getattr(settings, name.upper(), "") or ""
 
         if db_val:
-            result.append(CredentialInfo(
-                name=name,
-                is_set=True,
-                source="db",
-                masked_value=_mask_value(str(db_val)),
-            ))
+            result.append(
+                CredentialInfo(
+                    name=name,
+                    is_set=True,
+                    source="db",
+                    masked_value=_mask_value(str(db_val)),
+                )
+            )
         elif env_val:
-            result.append(CredentialInfo(
-                name=name,
-                is_set=True,
-                source="env",
-                masked_value=_mask_value(env_val),
-            ))
+            result.append(
+                CredentialInfo(
+                    name=name,
+                    is_set=True,
+                    source="env",
+                    masked_value=_mask_value(env_val),
+                )
+            )
         else:
-            result.append(CredentialInfo(
-                name=name,
-                is_set=False,
-                source=None,
-                masked_value=None,
-            ))
+            result.append(
+                CredentialInfo(
+                    name=name,
+                    is_set=False,
+                    source=None,
+                    masked_value=None,
+                )
+            )
 
     return CredentialsResponse(credentials=result)
 
 
 @router.put("/credentials", response_model=CredentialsResponse)
-async def update_credentials(body: CredentialsUpdate, db: AsyncSession = Depends(get_db)):
+async def update_credentials(
+    body: CredentialsUpdate, db: AsyncSession = Depends(get_db)
+):
     """Save credential values to AppSettings.settings_json."""
     row = await _get_settings(db)
     sj = dict(row.settings_json or {})
@@ -362,6 +382,7 @@ async def update_credentials(body: CredentialsUpdate, db: AsyncSession = Depends
 # ---------------------------------------------------------------------------
 # SoundCloud
 # ---------------------------------------------------------------------------
+
 
 @router.get("/soundcloud/status", response_model=SoundCloudStatus)
 async def soundcloud_status(db: AsyncSession = Depends(get_db)):
@@ -391,7 +412,9 @@ async def set_soundcloud_token(body: TokenUpdate, db: AsyncSession = Depends(get
                 connected=True,
                 username=data.get("username") or data.get("permalink"),
             )
-        return SoundCloudStatus(connected=False, error=f"Token rejected (HTTP {resp.status_code})")
+        return SoundCloudStatus(
+            connected=False, error=f"Token rejected (HTTP {resp.status_code})"
+        )
     except Exception as exc:
         return SoundCloudStatus(connected=False, error=str(exc))
 
@@ -408,7 +431,10 @@ async def soundcloud_oauth_url(
     client_id = _get_credential("soundcloud_client_id", sj)
 
     if not client_id:
-        raise HTTPException(status_code=400, detail="SoundCloud Client ID not configured. Add it in Settings.")
+        raise HTTPException(
+            status_code=400,
+            detail="SoundCloud Client ID not configured. Add it in Settings.",
+        )
 
     # Build callback URI dynamically from request host
     if not redirect_uri:
@@ -443,7 +469,9 @@ async def soundcloud_callback(
     client_secret = _get_credential("soundcloud_client_secret", sj)
 
     if not client_id or not client_secret:
-        return RedirectResponse(url="/settings?auth=soundcloud&error=missing_client_credentials")
+        return RedirectResponse(
+            url="/settings?auth=soundcloud&error=missing_client_credentials"
+        )
 
     # The redirect_uri used here must match what was used to generate the auth URL
     callback_uri = f"http://{request.headers.get('host', 'localhost:8500')}/api/auth/soundcloud/callback"
@@ -463,7 +491,9 @@ async def soundcloud_callback(
 
         if resp.status_code != 200:
             logger.error("SoundCloud code exchange failed: %s", resp.text[:300])
-            return RedirectResponse(url="/settings?auth=soundcloud&error=code_exchange_failed")
+            return RedirectResponse(
+                url="/settings?auth=soundcloud&error=code_exchange_failed"
+            )
 
         token_data = resp.json()
         access_token = token_data.get("access_token", "")
@@ -486,7 +516,9 @@ async def soundcloud_callback(
 
 
 @router.post("/soundcloud/exchange-code", response_model=SoundCloudStatus)
-async def soundcloud_exchange_code(body: CodeExchange, db: AsyncSession = Depends(get_db)):
+async def soundcloud_exchange_code(
+    body: CodeExchange, db: AsyncSession = Depends(get_db)
+):
     """Exchange a SoundCloud authorization code for tokens."""
     row = await _get_settings(db)
     sj = row.settings_json or {}
@@ -549,6 +581,7 @@ async def soundcloud_exchange_code(body: CodeExchange, db: AsyncSession = Depend
 # YouTube
 # ---------------------------------------------------------------------------
 
+
 @router.get("/youtube/status", response_model=YouTubeStatus)
 async def youtube_status(db: AsyncSession = Depends(get_db)):
     """Check YouTube connection. can_upload is true only with a valid refresh token."""
@@ -579,7 +612,10 @@ async def youtube_oauth_url(
     yt_client_id = _get_credential("youtube_client_id", sj)
 
     if not yt_client_id:
-        raise HTTPException(status_code=400, detail="YouTube Client ID not configured. Add it in Settings.")
+        raise HTTPException(
+            status_code=400,
+            detail="YouTube Client ID not configured. Add it in Settings.",
+        )
 
     # Build redirect URI from the actual request host.
     # For Web Application OAuth clients, the redirect URI must be registered in Google Console.
@@ -621,7 +657,9 @@ async def youtube_callback(
     yt_client_secret = _get_credential("youtube_client_secret", sj)
 
     if not yt_client_id or not yt_client_secret:
-        return RedirectResponse(url="/settings?auth=youtube&error=missing_client_credentials")
+        return RedirectResponse(
+            url="/settings?auth=youtube&error=missing_client_credentials"
+        )
 
     # Must match the redirect_uri used in the auth URL
     host = request.headers.get("host", "localhost:8500")
@@ -643,7 +681,9 @@ async def youtube_callback(
 
         if resp.status_code != 200:
             logger.error("YouTube code exchange failed: %s", resp.text[:300])
-            return RedirectResponse(url="/settings?auth=youtube&error=code_exchange_failed")
+            return RedirectResponse(
+                url="/settings?auth=youtube&error=code_exchange_failed"
+            )
 
         token_data = resp.json()
         refresh_token = token_data.get("refresh_token")
@@ -732,8 +772,12 @@ async def youtube_exchange_code(body: CodeExchange, db: AsyncSession = Depends(g
             items = yt_resp.json().get("items", [])
             if items:
                 channel_name = items[0].get("snippet", {}).get("title")
-                return YouTubeStatus(connected=True, channel_name=channel_name, can_upload=True)
-            return YouTubeStatus(connected=True, channel_name="(no channel found)", can_upload=True)
+                return YouTubeStatus(
+                    connected=True, channel_name=channel_name, can_upload=True
+                )
+            return YouTubeStatus(
+                connected=True, channel_name="(no channel found)", can_upload=True
+            )
 
         # Token exchange succeeded but channel query failed — still save the token
         return YouTubeStatus(

@@ -70,7 +70,8 @@ class UpgradeService:
         self._task = asyncio.create_task(self._periodic_check())
         logger.info(
             "Upgrade service started: checking %s every %dh",
-            self._repo, self._check_interval_hours,
+            self._repo,
+            self._check_interval_hours,
         )
 
     async def stop(self) -> None:
@@ -102,7 +103,9 @@ class UpgradeService:
         """
         url = f"{GITHUB_API_BASE}/repos/{self._repo}/releases/latest"
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url, headers={"Accept": "application/vnd.github.v3+json"})
+            resp = await client.get(
+                url, headers={"Accept": "application/vnd.github.v3+json"}
+            )
             if resp.status_code == 404:
                 logger.debug("No releases found for %s", self._repo)
                 return None
@@ -115,7 +118,8 @@ class UpgradeService:
         if _is_newer(remote_version, local_version):
             logger.info(
                 "Update available: %s -> %s",
-                local_version, remote_version,
+                local_version,
+                remote_version,
             )
             return {
                 "current_version": local_version,
@@ -144,7 +148,10 @@ class UpgradeService:
         # Perform upgrade
         success = await self._perform_upgrade(update_info["latest_version"])
         if success:
-            logger.info("Upgrade to %s completed, signaling restart", update_info["latest_version"])
+            logger.info(
+                "Upgrade to %s completed, signaling restart",
+                update_info["latest_version"],
+            )
             await self._signal_restart()
         else:
             logger.error("Upgrade failed")
@@ -163,7 +170,9 @@ class UpgradeService:
             result = await asyncio.to_thread(
                 subprocess.run,
                 ["docker", "pull", docker_image],
-                capture_output=True, text=True, timeout=300,
+                capture_output=True,
+                text=True,
+                timeout=300,
             )
             if result.returncode == 0:
                 logger.info("Docker image pulled: %s", docker_image)
@@ -177,7 +186,9 @@ class UpgradeService:
             result = await asyncio.to_thread(
                 subprocess.run,
                 ["git", "pull", "origin", "main"],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True,
+                text=True,
+                timeout=60,
                 cwd="/app" if os.path.isdir("/app/.git") else ".",
             )
             if result.returncode == 0:
@@ -193,9 +204,7 @@ class UpgradeService:
         """Signal for container/process restart."""
         # Write a restart flag that a supervisor can watch
         restart_flag = "/data/.restart-requested"
-        Path(restart_flag).write_text(
-            datetime.now(timezone.utc).isoformat()
-        )
+        Path(restart_flag).write_text(datetime.now(timezone.utc).isoformat())
         logger.info("Restart flag written to %s", restart_flag)
 
         # Also try sending SIGHUP to PID 1 (works in Docker)
@@ -225,29 +234,32 @@ class UpgradeService:
         async with async_session_factory() as session:
             # Export mixes
             from sqlalchemy import select
+
             result = await session.execute(select(Mix))
             mixes = result.scalars().all()
             for mix in mixes:
-                backup_data["mixes"].append({
-                    "id": mix.id,
-                    "title": mix.title,
-                    "audio_file_path": mix.audio_file_path,
-                    "video_file_path": mix.video_file_path,
-                    "duration_seconds": mix.duration_seconds,
-                    "genres": mix.genres,
-                    "vibes": mix.vibes,
-                    "tracklist": mix.tracklist,
-                    "description_soundcloud": mix.description_soundcloud,
-                    "description_youtube": mix.description_youtube,
-                    "title_youtube": mix.title_youtube,
-                    "tags": mix.tags,
-                    "cover_art_path": mix.cover_art_path,
-                    "thumbnail_path": mix.thumbnail_path,
-                    "soundcloud_url": mix.soundcloud_url,
-                    "youtube_url": mix.youtube_url,
-                    "pipeline_status": mix.pipeline_status,
-                    "metadata_json": mix.metadata_json,
-                })
+                backup_data["mixes"].append(
+                    {
+                        "id": mix.id,
+                        "title": mix.title,
+                        "audio_file_path": mix.audio_file_path,
+                        "video_file_path": mix.video_file_path,
+                        "duration_seconds": mix.duration_seconds,
+                        "genres": mix.genres,
+                        "vibes": mix.vibes,
+                        "tracklist": mix.tracklist,
+                        "description_soundcloud": mix.description_soundcloud,
+                        "description_youtube": mix.description_youtube,
+                        "title_youtube": mix.title_youtube,
+                        "tags": mix.tags,
+                        "cover_art_path": mix.cover_art_path,
+                        "thumbnail_path": mix.thumbnail_path,
+                        "soundcloud_url": mix.soundcloud_url,
+                        "youtube_url": mix.youtube_url,
+                        "pipeline_status": mix.pipeline_status,
+                        "metadata_json": mix.metadata_json,
+                    }
+                )
 
             # Export app settings
             app_settings = await session.get(AppSettings, 1)
@@ -284,7 +296,9 @@ class UpgradeService:
         with open(backup_path, "w") as f:
             json.dump(backup_data, f, indent=2, default=str)
 
-        logger.info("Backup saved: %s (%d mixes)", backup_path, len(backup_data["mixes"]))
+        logger.info(
+            "Backup saved: %s (%d mixes)", backup_path, len(backup_data["mixes"])
+        )
 
         # Prune old backups (keep last 10)
         self._prune_backups()
@@ -331,7 +345,11 @@ class UpgradeService:
         if not os.path.isdir(BACKUP_DIR):
             return
         backups = sorted(
-            [os.path.join(BACKUP_DIR, f) for f in os.listdir(BACKUP_DIR) if f.endswith(".json")],
+            [
+                os.path.join(BACKUP_DIR, f)
+                for f in os.listdir(BACKUP_DIR)
+                if f.endswith(".json")
+            ],
             key=os.path.getmtime,
             reverse=True,
         )
@@ -353,12 +371,16 @@ class UpgradeService:
             fpath = os.path.join(BACKUP_DIR, fname)
             try:
                 stat = os.stat(fpath)
-                backups.append({
-                    "filename": fname,
-                    "path": fpath,
-                    "size_bytes": stat.st_size,
-                    "created_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-                })
+                backups.append(
+                    {
+                        "filename": fname,
+                        "path": fpath,
+                        "size_bytes": stat.st_size,
+                        "created_at": datetime.fromtimestamp(
+                            stat.st_mtime, tz=timezone.utc
+                        ).isoformat(),
+                    }
+                )
             except OSError:
                 continue
         return backups

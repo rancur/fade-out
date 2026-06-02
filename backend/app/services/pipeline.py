@@ -78,7 +78,9 @@ class PipelineOrchestrator:
     # Events
     # ------------------------------------------------------------------
 
-    async def _emit(self, event_type: str, mix_id: str, data: Optional[dict] = None) -> None:
+    async def _emit(
+        self, event_type: str, mix_id: str, data: Optional[dict] = None
+    ) -> None:
         for listener in self._event_listeners:
             try:
                 result = listener(event_type, mix_id, data or {})
@@ -143,7 +145,10 @@ class PipelineOrchestrator:
 
                 # Draft mode pause after generate_art
                 if settings.DRAFT_MODE and step_name == "generate_art":
-                    logger.info("DRAFT_MODE: pausing pipeline for mix %s after generate_art", mix_id)
+                    logger.info(
+                        "DRAFT_MODE: pausing pipeline for mix %s after generate_art",
+                        mix_id,
+                    )
                     await self._set_mix_status(mix_id, "draft_review", step_name)
                     await self._emit("draft_ready", mix_id)
                     return
@@ -170,7 +175,7 @@ class PipelineOrchestrator:
             logger.error("Unknown step %s for mix %s", current_step, mix_id)
             return
 
-        remaining_steps = PIPELINE_STEPS[idx + 1:]
+        remaining_steps = PIPELINE_STEPS[idx + 1 :]
         if not remaining_steps:
             return
 
@@ -200,11 +205,13 @@ class PipelineOrchestrator:
                 idx = PIPELINE_STEPS.index(step_name)
             except ValueError:
                 return success
-            remaining = PIPELINE_STEPS[idx + 1:]
+            remaining = PIPELINE_STEPS[idx + 1 :]
             if remaining:
                 task = asyncio.create_task(self._run_remaining(mix_id, remaining))
                 self._running_pipelines[mix_id] = task
-                task.add_done_callback(lambda _t: self._running_pipelines.pop(mix_id, None))
+                task.add_done_callback(
+                    lambda _t: self._running_pipelines.pop(mix_id, None)
+                )
         return success
 
     async def _execute_step(
@@ -233,7 +240,11 @@ class PipelineOrchestrator:
                     )
                 ).scalar_one_or_none()
                 if existing:
-                    logger.info("Step %s already completed for mix %s, skipping", step_name, mix_id)
+                    logger.info(
+                        "Step %s already completed for mix %s, skipping",
+                        step_name,
+                        mix_id,
+                    )
                     return True
 
         for attempt in range(1, MAX_RETRIES + 1):
@@ -242,7 +253,10 @@ class PipelineOrchestrator:
 
             logger.info(
                 "Executing step %s for mix %s (attempt %d/%d)",
-                step_name, mix_id, attempt, MAX_RETRIES,
+                step_name,
+                mix_id,
+                attempt,
+                MAX_RETRIES,
             )
             started_at = datetime.now(timezone.utc)
             await self._set_mix_status(mix_id, "running", step_name)
@@ -254,20 +268,38 @@ class PipelineOrchestrator:
 
                 elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
                 await self._record_step(
-                    mix_id, step_name, StepStatus.COMPLETED,
-                    started_at=started_at, output=output, retry_count=attempt - 1,
+                    mix_id,
+                    step_name,
+                    StepStatus.COMPLETED,
+                    started_at=started_at,
+                    output=output,
+                    retry_count=attempt - 1,
                 )
-                await self._emit("step_completed", mix_id, {
-                    "step": step_name, "elapsed_seconds": elapsed,
-                })
-                logger.info("Step %s completed for mix %s in %.1fs", step_name, mix_id, elapsed)
+                await self._emit(
+                    "step_completed",
+                    mix_id,
+                    {
+                        "step": step_name,
+                        "elapsed_seconds": elapsed,
+                    },
+                )
+                logger.info(
+                    "Step %s completed for mix %s in %.1fs", step_name, mix_id, elapsed
+                )
                 return True
 
             except _VideoNotReady:
-                logger.info("Video not ready for mix %s at step %s, entering wait", mix_id, step_name)
+                logger.info(
+                    "Video not ready for mix %s at step %s, entering wait",
+                    mix_id,
+                    step_name,
+                )
                 await self._record_step(
-                    mix_id, step_name, StepStatus.WAITING,
-                    started_at=started_at, retry_count=attempt - 1,
+                    mix_id,
+                    step_name,
+                    StepStatus.WAITING,
+                    started_at=started_at,
+                    retry_count=attempt - 1,
                 )
                 resolved = await self._wait_for_video(mix_id)
                 if resolved:
@@ -275,8 +307,11 @@ class PipelineOrchestrator:
                     continue
                 else:
                     await self._record_step(
-                        mix_id, step_name, StepStatus.FAILED,
-                        started_at=started_at, error="Video file never appeared",
+                        mix_id,
+                        step_name,
+                        StepStatus.FAILED,
+                        started_at=started_at,
+                        error="Video file never appeared",
                         retry_count=attempt - 1,
                     )
                     return False
@@ -284,7 +319,10 @@ class PipelineOrchestrator:
             except Exception as exc:
                 logger.exception(
                     "Step %s failed for mix %s (attempt %d): %s",
-                    step_name, mix_id, attempt, exc,
+                    step_name,
+                    mix_id,
+                    attempt,
+                    exc,
                 )
                 if attempt < MAX_RETRIES:
                     backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
@@ -292,13 +330,21 @@ class PipelineOrchestrator:
                     await asyncio.sleep(backoff)
                 else:
                     await self._record_step(
-                        mix_id, step_name, StepStatus.FAILED,
-                        started_at=started_at, error=str(exc),
+                        mix_id,
+                        step_name,
+                        StepStatus.FAILED,
+                        started_at=started_at,
+                        error=str(exc),
                         retry_count=attempt - 1,
                     )
-                    await self._emit("error", mix_id, {
-                        "step": step_name, "error": str(exc),
-                    })
+                    await self._emit(
+                        "error",
+                        mix_id,
+                        {
+                            "step": step_name,
+                            "error": str(exc),
+                        },
+                    )
                     return False
 
         return False
@@ -310,9 +356,16 @@ class PipelineOrchestrator:
             async with async_session_factory() as session:
                 mix = await session.get(Mix, mix_id)
                 if mix and mix.video_file_path and os.path.exists(mix.video_file_path):
-                    logger.info("Video file found for mix %s: %s", mix_id, mix.video_file_path)
+                    logger.info(
+                        "Video file found for mix %s: %s", mix_id, mix.video_file_path
+                    )
                     return True
-            logger.debug("Video check %d/%d for mix %s -- not found yet", i + 1, max_checks, mix_id)
+            logger.debug(
+                "Video check %d/%d for mix %s -- not found yet",
+                i + 1,
+                max_checks,
+                mix_id,
+            )
         return False
 
     # ------------------------------------------------------------------
@@ -335,9 +388,10 @@ class PipelineOrchestrator:
                 step_name=step_name,
                 status=status.value,
                 started_at=started_at or datetime.now(timezone.utc),
-                completed_at=datetime.now(timezone.utc) if status in (
-                    StepStatus.COMPLETED, StepStatus.FAILED, StepStatus.SKIPPED
-                ) else None,
+                completed_at=datetime.now(timezone.utc)
+                if status
+                in (StepStatus.COMPLETED, StepStatus.FAILED, StepStatus.SKIPPED)
+                else None,
                 output_json=output,
                 error=error,
                 retry_count=retry_count,
@@ -392,6 +446,7 @@ class PipelineOrchestrator:
 
 class _VideoNotReady(Exception):
     """Raised by upload_youtube handler when video file is missing."""
+
     pass
 
 

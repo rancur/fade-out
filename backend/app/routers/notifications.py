@@ -19,6 +19,7 @@ router = APIRouter(prefix="/api/notifications", tags=["notifications"])
 
 # --- Schemas ---
 
+
 class NotificationOut(BaseModel):
     id: int
     mix_id: Optional[str] = None
@@ -75,6 +76,7 @@ class NotificationSettingsOut(BaseModel):
 
 # --- Helpers ---
 
+
 async def _get_or_create_app_settings(db: AsyncSession) -> AppSettings:
     """Get or create the singleton app settings row."""
     result = await db.execute(select(AppSettings).where(AppSettings.id == 1))
@@ -101,12 +103,15 @@ def _extract_notification_settings(app_settings: AppSettings) -> dict:
 
 # --- Endpoints ---
 
+
 @router.get("", response_model=NotificationListResponse)
 async def list_notifications(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     type: Optional[str] = Query(None, description="Filter by notification type"),
-    channel: Optional[str] = Query(None, description="Filter by channel (discord/email/webhook)"),
+    channel: Optional[str] = Query(
+        None, description="Filter by channel (discord/email/webhook)"
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """List notification records with pagination and optional filters."""
@@ -157,14 +162,16 @@ async def test_notification(body: TestNotificationRequest):
         )
         # The notification service queues and sends asynchronously.
         # For a direct test, attempt immediate delivery.
-        await service._send_all_channels({
-            "type": "info",
-            "mix_id": None,
-            "title": "Test Notification",
-            "message": body.message or "This is a test notification from Fade-Out.",
-            "data": {},
-            "timestamp": datetime.utcnow().isoformat(),
-        })
+        await service._send_all_channels(
+            {
+                "type": "info",
+                "mix_id": None,
+                "title": "Test Notification",
+                "message": body.message or "This is a test notification from Fade-Out.",
+                "data": {},
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        )
         return TestNotificationResponse(
             success=True,
             channel=body.channel,

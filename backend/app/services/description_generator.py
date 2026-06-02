@@ -226,7 +226,9 @@ class DescriptionGenerator:
         # Build a tracklist hint (first few artists for inspiration)
         tracklist_hint = ""
         if tracklist:
-            artists = list({t.get("artist", "") for t in tracklist[:8] if t.get("artist")})
+            artists = list(
+                {t.get("artist", "") for t in tracklist[:8] if t.get("artist")}
+            )
             if artists:
                 tracklist_hint = f"- Key artists: {', '.join(artists[:6])}"
 
@@ -254,7 +256,9 @@ class DescriptionGenerator:
         # Track usage
         if session and mix_id:
             await self._track_usage(
-                session, mix_id, "creative_title",
+                session,
+                mix_id,
+                "creative_title",
                 response.usage.prompt_tokens,
                 response.usage.completion_tokens,
             )
@@ -295,7 +299,9 @@ class DescriptionGenerator:
         # Track usage
         if session and mix_id:
             await self._track_usage(
-                session, mix_id, "youtube_title",
+                session,
+                mix_id,
+                "youtube_title",
                 response.usage.prompt_tokens,
                 response.usage.completion_tokens,
             )
@@ -330,7 +336,9 @@ class DescriptionGenerator:
                 ts = t.get("timestamp_formatted") or _seconds_to_timestamp(
                     t.get("timestamp_seconds", 0)
                 )
-                lines.append(f"  {ts} {t.get('artist', 'Unknown')} - {t.get('title', 'Unknown')}")
+                lines.append(
+                    f"  {ts} {t.get('artist', 'Unknown')} - {t.get('title', 'Unknown')}"
+                )
             tracklist_section = "\n".join(lines)
 
         # Energy summary
@@ -352,7 +360,9 @@ class DescriptionGenerator:
         # Custom template from brand settings
         custom_template = ""
         if brand_settings and brand_settings.description_template:
-            custom_template = f"ADDITIONAL BRAND TEMPLATE:\n{brand_settings.description_template}"
+            custom_template = (
+                f"ADDITIONAL BRAND TEMPLATE:\n{brand_settings.description_template}"
+            )
 
         prompt = DEFAULT_DESCRIPTION_PROMPT.format(
             brand_name=settings.BRAND_NAME,
@@ -380,10 +390,10 @@ class DescriptionGenerator:
         # Strip any lines that look like URLs, bracketed placeholder links,
         # or link introduction phrases ("Find us on:", "Explore more:", etc.)
         url_line_pattern = re.compile(
-            r"^\s*(\[?\s*https?://\S+\s*\]?|"       # lines starting with a URL or [url]
-            r"\[?\s*\w+\.\w+\S*\s*\]?)\s*$|"        # lines that are just a domain like [example.com]
-            r"^\s*\w+:\s*https?://\S+\s*$|"          # lines like "YouTube: https://..."
-            r"^\s*\w+:\s*\[?\s*\w+\.\w+\S*\s*\]?$", # lines like "Website: [example.com]"
+            r"^\s*(\[?\s*https?://\S+\s*\]?|"  # lines starting with a URL or [url]
+            r"\[?\s*\w+\.\w+\S*\s*\]?)\s*$|"  # lines that are just a domain like [example.com]
+            r"^\s*\w+:\s*https?://\S+\s*$|"  # lines like "YouTube: https://..."
+            r"^\s*\w+:\s*\[?\s*\w+\.\w+\S*\s*\]?$",  # lines like "Website: [example.com]"
             re.IGNORECASE,
         )
         link_intro_pattern = re.compile(
@@ -408,12 +418,19 @@ class DescriptionGenerator:
         # Track usage
         if session and mix_id:
             await self._track_usage(
-                session, mix_id, f"{platform.lower()}_description",
+                session,
+                mix_id,
+                f"{platform.lower()}_description",
                 response.usage.prompt_tokens,
                 response.usage.completion_tokens,
             )
 
-        logger.info("Generated %s description (%d chars) for mix %s", platform, len(description), mix_id)
+        logger.info(
+            "Generated %s description (%d chars) for mix %s",
+            platform,
+            len(description),
+            mix_id,
+        )
         return description
 
     async def _track_usage(
@@ -428,7 +445,9 @@ class DescriptionGenerator:
         # Rough pricing for gpt-4o (as of 2025)
         cost_per_input_token = 2.50 / 1_000_000
         cost_per_output_token = 10.00 / 1_000_000
-        cost = (input_tokens * cost_per_input_token) + (output_tokens * cost_per_output_token)
+        cost = (input_tokens * cost_per_input_token) + (
+            output_tokens * cost_per_output_token
+        )
 
         usage = AIUsage(
             mix_id=mix_id,
@@ -442,13 +461,17 @@ class DescriptionGenerator:
         session.add(usage)
         logger.debug(
             "AI usage: %s %d/%d tokens, $%.4f",
-            operation, input_tokens, output_tokens, cost,
+            operation,
+            input_tokens,
+            output_tokens,
+            cost,
         )
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _format_duration(seconds: float) -> str:
     total = int(seconds)

@@ -94,7 +94,11 @@ class AudioAnalyzer:
         info = sf.info(audio_path)
         result.duration_seconds = info.duration
         sr_native = info.samplerate
-        logger.info("File duration: %.1f seconds (%.1f hours)", info.duration, info.duration / 3600)
+        logger.info(
+            "File duration: %.1f seconds (%.1f hours)",
+            info.duration,
+            info.duration / 3600,
+        )
 
         # Determine sample points
         sample_times = self._get_sample_times(info.duration)
@@ -118,11 +122,13 @@ class AudioAnalyzer:
             centroids.append(features["centroid"])
             bandwidths.append(features["bandwidth"])
             rolloffs.append(features["rolloff"])
-            energy_points.append({
-                "timestamp_seconds": t,
-                "rms": round(features["rms"], 4),
-                "bpm": round(features["bpm"], 1),
-            })
+            energy_points.append(
+                {
+                    "timestamp_seconds": t,
+                    "rms": round(features["rms"], 4),
+                    "bpm": round(features["bpm"], 1),
+                }
+            )
 
         result.energy_profile = energy_points
 
@@ -134,17 +140,18 @@ class AudioAnalyzer:
         result.tracklist = [t.to_dict() for t in tracklist]
 
         # Genre classification from features + identified tracks
-        result.genres = self._classify_genres(
-            bpms, centroids, tracklist
-        )
+        result.genres = self._classify_genres(bpms, centroids, tracklist)
 
         # Vibe classification from energy profile
         result.vibes = self._classify_vibes(energy_points)
 
         logger.info(
             "Analysis complete: %d tracks, genres=%s, vibes=%s, bpm=%.0f-%.0f",
-            len(tracklist), result.genres, result.vibes,
-            result.bpm_range[0], result.bpm_range[1],
+            len(tracklist),
+            result.genres,
+            result.vibes,
+            result.bpm_range[0],
+            result.bpm_range[1],
         )
         return result
 
@@ -231,7 +238,9 @@ class AudioAnalyzer:
             # Secondary clip at +30s to catch tracks during transitions
             # Only add if we didn't already get a hit at this point
             if not hit:
-                hit2 = await self._shazam_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
+                hit2 = await self._shazam_segment(
+                    path, t + SECONDARY_CLIP_OFFSET, sr_native
+                )
                 if hit2:
                     title_key = hit2.title.lower()
                     title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
@@ -258,14 +267,26 @@ class AudioAnalyzer:
                     continue
 
                 # Keep if there's enough gap from at least one neighbor
-                prev_gap = (track.timestamp_seconds - identified[i - 1].timestamp_seconds) if i > 0 else 999
-                next_gap = (identified[i + 1].timestamp_seconds - track.timestamp_seconds) if i < len(identified) - 1 else 999
+                prev_gap = (
+                    (track.timestamp_seconds - identified[i - 1].timestamp_seconds)
+                    if i > 0
+                    else 999
+                )
+                next_gap = (
+                    (identified[i + 1].timestamp_seconds - track.timestamp_seconds)
+                    if i < len(identified) - 1
+                    else 999
+                )
 
                 # Only filter if BOTH gaps are tiny (sandwiched between close tracks)
                 if prev_gap < 45 and next_gap < 45:
                     logger.debug(
                         "Filtering likely false positive: %s - %s at %.0fs (single hit, gaps: %.0fs/%.0fs)",
-                        track.artist, track.title, track.timestamp_seconds, prev_gap, next_gap,
+                        track.artist,
+                        track.title,
+                        track.timestamp_seconds,
+                        prev_gap,
+                        next_gap,
                     )
                 else:
                     filtered.append(track)
@@ -279,7 +300,11 @@ class AudioAnalyzer:
         """Extract a segment and run Shazam on it."""
         try:
             y, sr = await asyncio.to_thread(
-                librosa.load, path, sr=sr_native, offset=offset, duration=SEGMENT_DURATION
+                librosa.load,
+                path,
+                sr=sr_native,
+                offset=offset,
+                duration=SEGMENT_DURATION,
             )
         except Exception:
             return None

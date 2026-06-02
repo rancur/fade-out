@@ -19,6 +19,7 @@ router = APIRouter(prefix="/api/brand", tags=["brand"])
 
 # --- Schemas ---
 
+
 class BrandSettingsOut(BaseModel):
     id: int = 1
     brand_name: Optional[str] = "Will See"
@@ -75,6 +76,7 @@ class PreviewArtResponse(BaseModel):
 
 # --- Helpers ---
 
+
 def _brand_to_dict(row: BrandSettings) -> dict:
     """Convert ORM model to dict to avoid lazy-load issues outside async context."""
     return {
@@ -106,6 +108,7 @@ async def _get_or_create_brand(db: AsyncSession) -> BrandSettings:
 
 # --- Endpoints ---
 
+
 @router.get("", response_model=BrandSettingsOut)
 async def get_brand_settings(db: AsyncSession = Depends(get_db)):
     """Get brand settings, creating defaults if none exist."""
@@ -114,7 +117,9 @@ async def get_brand_settings(db: AsyncSession = Depends(get_db)):
 
 
 @router.put("", response_model=BrandSettingsOut)
-async def update_brand_settings(body: BrandSettingsUpdate, db: AsyncSession = Depends(get_db)):
+async def update_brand_settings(
+    body: BrandSettingsUpdate, db: AsyncSession = Depends(get_db)
+):
     """Update brand settings."""
     row = await _get_or_create_brand(db)
     update_data = body.model_dump(exclude_unset=True)
@@ -126,7 +131,9 @@ async def update_brand_settings(body: BrandSettingsUpdate, db: AsyncSession = De
 
 
 @router.post("/preview-description", response_model=PreviewDescriptionResponse)
-async def preview_description(body: PreviewDescriptionRequest, db: AsyncSession = Depends(get_db)):
+async def preview_description(
+    body: PreviewDescriptionRequest, db: AsyncSession = Depends(get_db)
+):
     """Generate a preview description using the description generator (not saved to any mix)."""
     from app.services.description_generator import DescriptionGenerator
 
@@ -170,7 +177,9 @@ async def preview_art(body: PreviewArtRequest, db: AsyncSession = Depends(get_db
     image_url: Optional[str] = None
     try:
         image_url = await generator._generate_with_fal(
-            prompt, width=1400, height=1400,
+            prompt,
+            width=1400,
+            height=1400,
         )
         if not image_url:
             image_url = await generator._generate_with_dalle(prompt, size="1024x1024")

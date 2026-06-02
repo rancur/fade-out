@@ -31,11 +31,11 @@ RATE_LIMIT_SECONDS = 300
 
 # Color codes for Discord embeds
 DISCORD_COLORS: Dict[str, int] = {
-    "pipeline_started": 0x3498DB,   # blue
-    "step_completed": 0x2ECC71,     # green
-    "upload_complete": 0x9B59B6,    # purple
-    "error": 0xE74C3C,              # red
-    "draft_ready": 0xF39C12,        # orange
+    "pipeline_started": 0x3498DB,  # blue
+    "step_completed": 0x2ECC71,  # green
+    "upload_complete": 0x9B59B6,  # purple
+    "error": 0xE74C3C,  # red
+    "draft_ready": 0xF39C12,  # orange
     "upgrade_available": 0x1ABC9C,  # teal
 }
 
@@ -140,14 +140,28 @@ class NotificationService:
         if data.get("step"):
             fields.append({"name": "Step", "value": data["step"], "inline": True})
         if data.get("elapsed_seconds"):
-            fields.append({"name": "Duration", "value": f"{data['elapsed_seconds']:.1f}s", "inline": True})
+            fields.append(
+                {
+                    "name": "Duration",
+                    "value": f"{data['elapsed_seconds']:.1f}s",
+                    "inline": True,
+                }
+            )
         if data.get("error"):
-            fields.append({"name": "Error", "value": data["error"][:1024], "inline": False})
+            fields.append(
+                {"name": "Error", "value": data["error"][:1024], "inline": False}
+            )
 
         # Add platform links if available
         for key in ("soundcloud_url", "youtube_url"):
             if data.get(key):
-                fields.append({"name": key.replace("_", " ").title(), "value": data[key], "inline": True})
+                fields.append(
+                    {
+                        "name": key.replace("_", " ").title(),
+                        "value": data[key],
+                        "inline": True,
+                    }
+                )
 
         embed: Dict[str, Any] = {
             "title": payload.get("title", "Fade-Out Notification"),
@@ -164,12 +178,16 @@ class NotificationService:
         body = {"embeds": [embed]}
 
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(settings.NOTIFICATION_DISCORD_WEBHOOK_URL, json=body)
+            resp = await client.post(
+                settings.NOTIFICATION_DISCORD_WEBHOOK_URL, json=body
+            )
             if resp.status_code in (200, 204):
                 await self._record(mix_id, ntype, "discord", payload.get("message", ""))
                 logger.info("Discord notification sent: %s", ntype)
             else:
-                logger.warning("Discord webhook returned %d: %s", resp.status_code, resp.text[:200])
+                logger.warning(
+                    "Discord webhook returned %d: %s", resp.status_code, resp.text[:200]
+                )
 
     # ------------------------------------------------------------------
     # Email
@@ -199,9 +217,14 @@ class NotificationService:
         msg["Subject"] = subject
         msg.attach(MIMEText(html_body, "html"))
 
-        with smtplib.SMTP(settings.NOTIFICATION_EMAIL_SMTP_HOST, settings.NOTIFICATION_EMAIL_SMTP_PORT) as server:
+        with smtplib.SMTP(
+            settings.NOTIFICATION_EMAIL_SMTP_HOST, settings.NOTIFICATION_EMAIL_SMTP_PORT
+        ) as server:
             server.starttls()
-            server.login(settings.NOTIFICATION_EMAIL_SMTP_USER, settings.NOTIFICATION_EMAIL_SMTP_PASSWORD)
+            server.login(
+                settings.NOTIFICATION_EMAIL_SMTP_USER,
+                settings.NOTIFICATION_EMAIL_SMTP_PASSWORD,
+            )
             server.send_message(msg)
 
     def _build_email_html(self, payload: Dict[str, Any]) -> str:
@@ -236,7 +259,7 @@ class NotificationService:
                 {error_html}
                 {links_html}
                 <hr style="border:none;border-top:1px solid #DDD;margin:20px 0">
-                <p style="color:#999;font-size:12px">Fade-Out Pipeline | {payload.get('timestamp', '')}</p>
+                <p style="color:#999;font-size:12px">Fade-Out Pipeline | {payload.get("timestamp", "")}</p>
             </div>
         </div>
         """
@@ -256,7 +279,9 @@ class NotificationService:
             try:
                 resp = await client.post(url, json=payload)
                 if resp.status_code < 300:
-                    await self._record(mix_id, ntype, "webhook", payload.get("message", ""))
+                    await self._record(
+                        mix_id, ntype, "webhook", payload.get("message", "")
+                    )
                     logger.info("Webhook notification sent to %s: %s", url, ntype)
                 else:
                     logger.warning("Webhook %s returned %d", url, resp.status_code)
@@ -267,7 +292,9 @@ class NotificationService:
     # Rate limiting
     # ------------------------------------------------------------------
 
-    def _check_rate_limit(self, mix_id: Optional[str], ntype: str, channel: str) -> bool:
+    def _check_rate_limit(
+        self, mix_id: Optional[str], ntype: str, channel: str
+    ) -> bool:
         if not mix_id:
             return True
         key = (mix_id, ntype, channel)

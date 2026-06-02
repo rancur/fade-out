@@ -47,22 +47,36 @@ class PauseResponse(BaseModel):
 @router.get("/status", response_model=PipelineStatusResponse)
 async def pipeline_status(db: AsyncSession = Depends(get_db)):
     """Get overall pipeline status with counts of active, queued, completed, and failed mixes."""
-    active_statuses = ["analyzing", "generating", "uploading_soundcloud", "uploading_youtube", "verifying"]
+    active_statuses = [
+        "analyzing",
+        "generating",
+        "uploading_soundcloud",
+        "uploading_youtube",
+        "verifying",
+    ]
     queued_statuses = ["pending"]
     completed_statuses = ["completed"]
     failed_statuses = ["failed"]
 
     active_result = await db.execute(
-        select(sa_func.count()).select_from(Mix).where(Mix.pipeline_status.in_(active_statuses))
+        select(sa_func.count())
+        .select_from(Mix)
+        .where(Mix.pipeline_status.in_(active_statuses))
     )
     queued_result = await db.execute(
-        select(sa_func.count()).select_from(Mix).where(Mix.pipeline_status.in_(queued_statuses))
+        select(sa_func.count())
+        .select_from(Mix)
+        .where(Mix.pipeline_status.in_(queued_statuses))
     )
     completed_result = await db.execute(
-        select(sa_func.count()).select_from(Mix).where(Mix.pipeline_status.in_(completed_statuses))
+        select(sa_func.count())
+        .select_from(Mix)
+        .where(Mix.pipeline_status.in_(completed_statuses))
     )
     failed_result = await db.execute(
-        select(sa_func.count()).select_from(Mix).where(Mix.pipeline_status.in_(failed_statuses))
+        select(sa_func.count())
+        .select_from(Mix)
+        .where(Mix.pipeline_status.in_(failed_statuses))
     )
 
     return PipelineStatusResponse(
@@ -79,7 +93,9 @@ async def pause_pipeline():
     """Pause all pipeline processing."""
     global _pipeline_paused
     _pipeline_paused = True
-    return PauseResponse(paused=True, message="Pipeline paused. No new steps will be started.")
+    return PauseResponse(
+        paused=True, message="Pipeline paused. No new steps will be started."
+    )
 
 
 @router.post("/resume", response_model=PauseResponse)
@@ -87,16 +103,22 @@ async def resume_pipeline():
     """Resume pipeline processing."""
     global _pipeline_paused
     _pipeline_paused = False
-    return PauseResponse(paused=False, message="Pipeline resumed. Queued items will begin processing.")
+    return PauseResponse(
+        paused=False, message="Pipeline resumed. Queued items will begin processing."
+    )
 
 
 @router.get("/queue", response_model=QueueResponse)
 async def get_queue(db: AsyncSession = Depends(get_db)):
     """Get all queued and in-progress pipeline items."""
     active_or_queued = [
-        "pending", "analyzing", "generating",
-        "uploading_soundcloud", "uploading_youtube",
-        "verifying", "draft_review",
+        "pending",
+        "analyzing",
+        "generating",
+        "uploading_soundcloud",
+        "uploading_youtube",
+        "verifying",
+        "draft_review",
     ]
     result = await db.execute(
         select(Mix)

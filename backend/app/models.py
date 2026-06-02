@@ -44,7 +44,9 @@ class Mix(Base):
     soundcloud_url = Column(String)
     youtube_url = Column(String)
     youtube_playlist_id = Column(String)
-    youtube_timestamp_offset = Column(Float, default=0.0)  # seconds to add to FLAC timestamps for YT chapters
+    youtube_timestamp_offset = Column(
+        Float, default=0.0
+    )  # seconds to add to FLAC timestamps for YT chapters
     pipeline_status = Column(String, default="pending")
     pipeline_step = Column(String)
     pipeline_error = Column(Text)
@@ -54,9 +56,15 @@ class Mix(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     metadata_json = Column(JSON)
 
-    steps = relationship("PipelineStep", back_populates="mix", cascade="all, delete-orphan")
-    ai_usages = relationship("AIUsage", back_populates="mix", cascade="all, delete-orphan")
-    notifications = relationship("Notification", back_populates="mix", cascade="all, delete-orphan")
+    steps = relationship(
+        "PipelineStep", back_populates="mix", cascade="all, delete-orphan"
+    )
+    ai_usages = relationship(
+        "AIUsage", back_populates="mix", cascade="all, delete-orphan"
+    )
+    notifications = relationship(
+        "Notification", back_populates="mix", cascade="all, delete-orphan"
+    )
 
 
 class PipelineStep(Base):
@@ -64,7 +72,9 @@ class PipelineStep(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     mix_id = Column(String, ForeignKey("mixes.id"))
-    step_name = Column(String)  # detect, analyze, generate_description, generate_art, upload_soundcloud, upload_youtube, verify_soundcloud, verify_youtube, cross_link
+    step_name = Column(
+        String
+    )  # detect, analyze, generate_description, generate_art, upload_soundcloud, upload_youtube, verify_soundcloud, verify_youtube, cross_link
     status = Column(String)  # pending, running, completed, failed, skipped
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
