@@ -463,7 +463,7 @@ async def soundcloud_callback(
 
         if resp.status_code != 200:
             logger.error("SoundCloud code exchange failed: %s", resp.text[:300])
-            return RedirectResponse(url=f"/settings?auth=soundcloud&error=code_exchange_failed")
+            return RedirectResponse(url="/settings?auth=soundcloud&error=code_exchange_failed")
 
         token_data = resp.json()
         access_token = token_data.get("access_token", "")
@@ -642,9 +642,8 @@ async def youtube_callback(
             )
 
         if resp.status_code != 200:
-            error_detail = resp.json().get("error_description", "unknown")
             logger.error("YouTube code exchange failed: %s", resp.text[:300])
-            return RedirectResponse(url=f"/settings?auth=youtube&error=code_exchange_failed")
+            return RedirectResponse(url="/settings?auth=youtube&error=code_exchange_failed")
 
         token_data = resp.json()
         refresh_token = token_data.get("refresh_token")
