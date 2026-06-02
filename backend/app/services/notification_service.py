@@ -10,7 +10,6 @@ from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import async_session_factory

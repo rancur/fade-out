@@ -54,8 +54,6 @@ async def _detect_video_offset(
     identified track starts, then calculates the difference from the FLAC
     tracklist's first track timestamp.
     """
-    from app.services.audio_analyzer import TrackHit
-
     first_flac_track = flac_tracklist[0] if flac_tracklist else None
     if not first_flac_track:
         return 0.0

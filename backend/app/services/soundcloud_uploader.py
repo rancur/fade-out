@@ -1,12 +1,11 @@
 """SoundCloud uploader using the official API with Playwright fallback."""
 
-import asyncio
 import logging
 import os
 from typing import Any, Dict, List, Optional
 
 import httpx
-from playwright.async_api import BrowserContext, Page, async_playwright
+from playwright.async_api import Page, async_playwright
 
 from app.config import settings
 
