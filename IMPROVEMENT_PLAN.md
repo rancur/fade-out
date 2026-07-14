@@ -15,6 +15,10 @@ Items marked **[DONE 07-13b]** shipped in the third follow-up
 Alembic migrations, gated Mixcloud upload path, WebSocket live status, genre
 word-boundary matching).
 
+Items marked **[DONE 07-13c]** shipped in the fourth follow-up
+`feat/fade-out-confidence-merge` branch (confidence-scored multi-source
+detection merge, crash-safe file-watcher state, watcher import-annotation fix).
+
 Legend: impact (H/M/L) · effort (S/M/L).
 
 ---
@@ -35,10 +39,19 @@ Legend: impact (H/M/L) · effort (S/M/L).
   already added the optional `AUDD_API_TOKEN` hook. Enabling it (paid) is the
   single biggest recall win on layered/underground DJ audio. Decision + token
   needed.
-- **[LATER] Weight CUE/DJCTL timestamps over Shazam when both exist** (M/M) —
-  `merge_tracklists` currently only backfills CUE `Track N` placeholders from
-  Shazam by coarse 60s buckets. A confidence-scored merge (CUE time authoritative,
-  Shazam/AudD for names) would be more robust.
+- **[DONE 07-13c] Weight CUE/DJCTL timestamps over Shazam when both exist** (M/M)
+  — new pure `confidence_merge.merge_detections()` replaces the coarse 60s-bucket
+  backfill. Every source (CUE, DJCTL/Serato, Shazam, AudD) becomes scored
+  candidates; authoritative CUE/DJCTL are laid down first and win any overlap
+  (name *and* timestamp). Lower-confidence Shazam/AudD only fill time gaps, and
+  fill a CUE `Track N` / ID placeholder *only* when confident enough — always
+  keeping the authoritative CUE timestamp. A gap-filling hit scoring below
+  `DETECTION_NAME_CONFIDENCE_THRESHOLD` (config, default 0.50 = single-hit Shazam,
+  so recall is preserved; raise toward 0.6 to be stricter) collapses to an honest
+  `ID - ID` marker instead of a probable mis-ID. The analyzer now tags each Shazam
+  hit with a confidence from its independent-recognition count (confirmed 0.70 /
+  single 0.50). Wired into `handle_analyze`; 17 unit tests. `merge_tracklists` is
+  retained for back-compat.
 - **[DONE 07-13b] Genre keyword over-matching** (L/S) — extracted the keyword
   boost into a pure, tested `genre_utils` module and switched substring matching
   to word-boundary matching (`keyword_matches`). "bassline" / "embassy" no longer
@@ -63,9 +76,17 @@ Legend: impact (H/M/L) · effort (S/M/L).
   the hard-coded gpt-4o rate with a per-model table (longest-prefix match for
   dated snapshots, gpt-4o fallback for unknown models). Wired into
   `_track_usage`; unit-tested.
-- **[LATER] Persist file-watcher "seen" state atomically** (L/M) — a crash between
-  `mark_seen` and callback success can drop a file. Consider marking seen only
-  after successful hand-off, or a processing/done state.
+- **[DONE 07-13c] Persist file-watcher "seen" state atomically** (L/M) — the
+  `_SeenFilesDB` store now uses a `processing`/`done` state machine: a file is
+  durably marked `processing` *before* the callback and only `done` *after* it
+  returns successfully. A crash mid-scan leaves it `processing`, so the next
+  startup scan re-processes it (no dropped mix) while a finished file is never
+  processed twice; a callback that raises clears the record for retry. SQLite runs
+  in WAL mode with `synchronous=FULL` so each single-statement transition is
+  atomic and crash-durable. Legacy `seen_at`-only DBs auto-migrate (old rows
+  adopted as `done`). Also fixed a latent `Callable[[str], asyncio.coroutines]`
+  annotation that made the module fail to import on Python 3.9. 8 unit tests
+  (state machine, crash-recovery, migration, dispatch success/failure).
 
 ## C. Output quality (descriptions / metadata / tags)
 

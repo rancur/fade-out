@@ -167,22 +167,30 @@ async def handle_analyze(mix_id: str, session: AsyncSession) -> Optional[dict]:
         raise RuntimeError("No audio file path on mix")
 
     from app.services.audio_analyzer import AudioAnalyzer
-    from app.services.djctl_integration import (
-        find_cue_for_audio,
-        merge_tracklists,
-        parse_cue_file,
-    )
+    from app.services.confidence_merge import DetectionSource, merge_detections
+    from app.services.djctl_integration import find_cue_for_audio, parse_cue_file
 
     analyzer = AudioAnalyzer()
     result = await analyzer.analyze(mix.audio_file_path)
 
-    # Try to merge with CUE-sheet tracklist
+    # Try to merge with CUE-sheet tracklist. The confidence merge weights the
+    # authoritative CUE timestamps/names above the Shazam fallback: CUE wins any
+    # overlap, Shazam only fills gaps (and fills CUE "Track N" placeholders),
+    # and weak Shazam guesses collapse to "ID - ID" rather than a wrong name.
     cue_path = find_cue_for_audio(mix.audio_file_path)
     cue_tracks = parse_cue_file(cue_path) if cue_path else None
 
-    merged = merge_tracklists(
-        cue_tracks=cue_tracks,
-        shazam_tracks=result.tracklist,
+    detection_sources = []
+    if cue_tracks:
+        detection_sources.append(
+            DetectionSource("cue", [t.to_dict() for t in cue_tracks])
+        )
+    if result.tracklist:
+        detection_sources.append(DetectionSource("shazam", result.tracklist))
+
+    merged = merge_detections(
+        detection_sources,
+        name_confidence_threshold=settings.DETECTION_NAME_CONFIDENCE_THRESHOLD,
     )
     from app.services.tracklist_utils import clean_tracklist
 
