@@ -178,8 +178,31 @@ class TagGenerator:
         return " ".join(formatted)
 
     def format_for_youtube(self, tags: List[str]) -> List[str]:
-        """Format tags for YouTube: plain list (YouTube API accepts them directly)."""
-        return list(tags)
+        """Format tags for YouTube, trimmed to the API's 500-char aggregate limit.
+
+        YouTube rejects the entire ``videos.insert`` call (400 error) if the
+        combined length of all tags exceeds 500 characters. The API counts a tag
+        containing a space or comma as quoted (both quote chars included) plus a
+        one-char separator between tags. We greedily keep tags in priority order
+        until the next one would blow the budget, so a long tail of low-priority
+        tags can never fail the whole upload.
+        """
+        budget = 500
+        used = 0
+        result: List[str] = []
+        for tag in tags:
+            tag = tag.strip()
+            if not tag:
+                continue
+            # A tag with a space/comma is wrapped in quotes by YouTube (+2 chars).
+            tag_cost = len(tag) + (2 if (" " in tag or "," in tag) else 0)
+            # Account for a separator between tags (not before the first).
+            separator = 1 if result else 0
+            if used + separator + tag_cost > budget:
+                continue
+            used += separator + tag_cost
+            result.append(tag)
+        return result
 
     def get_primary_genre_tag(self, genres: List[str]) -> str:
         """Get the best single genre label for dropdown selection (e.g., SoundCloud genre field)."""
