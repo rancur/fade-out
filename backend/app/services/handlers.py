@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,32 @@ async def _get_brand_settings(session: AsyncSession) -> Optional[BrandSettings]:
 async def _get_app_settings(session: AsyncSession) -> Optional[AppSettings]:
     """Load app settings (row id=1) if they exist."""
     return await session.get(AppSettings, 1)
+
+
+def extract_youtube_video_id(url: str) -> str:
+    """Extract the 11-char video ID from any common YouTube URL form.
+
+    Handles ``watch?v=<id>`` (with extra query params in any order),
+    ``youtu.be/<id>``, ``/embed/<id>``, and ``/shorts/<id>``. Falls back to the
+    trailing path segment so a bare ID still round-trips.
+    """
+    if not url:
+        return ""
+    url = url.strip()
+
+    # watch?v=<id> and any other ...?v=<id>&... form
+    query_match = re.search(r"[?&]v=([^&#]+)", url)
+    if query_match:
+        return query_match.group(1)
+
+    # youtu.be/<id>, /embed/<id>, /shorts/<id>, /v/<id>
+    path_match = re.search(r"(?:youtu\.be/|/embed/|/shorts/|/v/)([^?&#/]+)", url)
+    if path_match:
+        return path_match.group(1)
+
+    # Bare id or unknown form: take the last non-empty path/query segment.
+    tail = url.split("/")[-1]
+    return tail.split("?")[0].split("&")[0]
 
 
 def _title_from_filename(audio_path: str) -> str:
@@ -157,7 +184,12 @@ async def handle_analyze(mix_id: str, session: AsyncSession) -> Optional[dict]:
         cue_tracks=cue_tracks,
         shazam_tracks=result.tracklist,
     )
+    from app.services.tracklist_utils import clean_tracklist
+
     final_tracklist = merged.tracklist if merged.tracklist else result.tracklist
+    # Drop recognition noise (Unknown - Unknown) and consecutive duplicates, and
+    # normalize timestamps before this list drives descriptions + chapters.
+    final_tracklist = clean_tracklist(final_tracklist)
 
     mix.genres = result.genres
     mix.vibes = result.vibes
@@ -517,8 +549,8 @@ async def handle_verify_youtube(
 
     from app.services.youtube_uploader import YouTubeUploader
 
-    # Extract video ID from URL
-    video_id = mix.youtube_url.split("v=")[-1].split("&")[0]
+    # Extract video ID from URL (handles watch?v=, youtu.be, shorts, embed)
+    video_id = extract_youtube_video_id(mix.youtube_url)
 
     app_settings_yv = await _get_app_settings(session)
     sj_yv = (app_settings_yv.settings_json or {}) if app_settings_yv else {}
