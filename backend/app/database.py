@@ -1,5 +1,6 @@
 """SQLAlchemy database setup with async support."""
 
+import logging
 import os
 from typing import AsyncGenerator
 
@@ -14,12 +15,20 @@ _db_url = settings.DATABASE_URL
 if _db_url.startswith("sqlite:///"):
     _db_url = _db_url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
 
-# Ensure the data directory exists for SQLite
+# Ensure the data directory exists for SQLite. Do this best-effort: importing a
+# module must not hard-crash the process just because the target dir is not
+# writable yet (e.g. a read-only/sandboxed host or a not-yet-mounted volume).
+# If creation fails here, the engine will surface a clear error on first connect.
 if "sqlite" in _db_url:
     db_path = _db_url.split("///")[-1]
     db_dir = os.path.dirname(db_path)
     if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except OSError as exc:
+            logging.getLogger(__name__).warning(
+                "Could not create database directory %s at import: %s", db_dir, exc
+            )
 
 engine = create_async_engine(
     _db_url,
