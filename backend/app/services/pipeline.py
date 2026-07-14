@@ -25,6 +25,8 @@ PIPELINE_STEPS: List[str] = [
     "verify_soundcloud",
     "upload_youtube",
     "verify_youtube",
+    "upload_mixcloud",
+    "verify_mixcloud",
     "cross_link",
     "complete",
 ]
