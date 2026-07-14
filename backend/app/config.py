@@ -126,6 +126,15 @@ class Settings(BaseSettings):
     # opt-in; the code path is fully implemented and gated on this flag.
     CROSS_LINK_PUSH_ENABLED: bool = False
 
+    # --- Track-detection merge ---
+    # Gap-filling detections (Shazam/AudD) scoring strictly below this confidence
+    # keep their timestamp but render as the "ID - ID" placeholder instead of
+    # asserting a probably-wrong name. The default preserves current recall
+    # (single-hit Shazam sits exactly at this level); raise toward 0.6 to be
+    # stricter and turn weak guesses into honest "ID" markers. CUE/DJCTL entries
+    # are authoritative and always win an overlap regardless of this value.
+    DETECTION_NAME_CONFIDENCE_THRESHOLD: float = 0.50
+
     # --- Pipeline ---
     DRAFT_MODE: bool = True
     FILE_STABLE_SECONDS: int = 120
