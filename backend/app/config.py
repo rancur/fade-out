@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     YOUTUBE_CHANNEL_ID: str = ""
     YOUTUBE_DEFAULT_PLAYLIST_PREFIX: str = "Will See"
 
+    # --- Mixcloud ---
+    # Mixcloud is an optional third publishing target that mirrors the
+    # SoundCloud/YouTube uploader pattern. It needs an OAuth access token Will
+    # has not set up yet, so the whole path is gated behind MIXCLOUD_ENABLED and
+    # ships OFF by default -- the upload/verify steps no-op (skip) until the flag
+    # is flipped AND a token is present. Get a token via the OAuth flow at
+    # https://www.mixcloud.com/developers/ (client id/secret -> access token).
+    MIXCLOUD_ENABLED: bool = False
+    MIXCLOUD_ACCESS_TOKEN: str = ""  # OAuth access token (required for uploads)
+    MIXCLOUD_CLIENT_ID: str = ""  # OAuth client id (for future token refresh)
+    MIXCLOUD_CLIENT_SECRET: str = ""  # OAuth client secret (for future token refresh)
+
     # --- Premiere ---
     PREMIERE_MODE: str = "scheduled"  # instant, scheduled, unlisted
     PREMIERE_SCHEDULE_STRATEGY: str = "optimal_next_24h"

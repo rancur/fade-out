@@ -571,6 +571,82 @@ async def handle_verify_youtube(
 
 
 # ---------------------------------------------------------------------------
+# upload_mixcloud
+# ---------------------------------------------------------------------------
+
+async def handle_upload_mixcloud(
+    mix_id: str, session: AsyncSession
+) -> Optional[dict]:
+    """Upload the mix to Mixcloud (gated behind MIXCLOUD_ENABLED, default OFF)."""
+    mix = await _get_mix(mix_id, session)
+
+    app_settings = await _get_app_settings(session)
+    sj = (app_settings.settings_json or {}) if app_settings else {}
+
+    enabled = settings.MIXCLOUD_ENABLED or bool(sj.get("mixcloud_enabled"))
+    if not enabled:
+        logger.info("Mixcloud disabled -- skipping upload for mix %s", mix_id)
+        return {"skipped": True, "reason": "Mixcloud disabled (MIXCLOUD_ENABLED=false)"}
+
+    has_token = bool(settings.MIXCLOUD_ACCESS_TOKEN or sj.get("mixcloud_access_token"))
+    if not has_token:
+        logger.warning(
+            "Mixcloud enabled but no access token -- skipping upload for mix %s", mix_id,
+        )
+        return {"skipped": True, "reason": "No Mixcloud access token configured"}
+
+    if not mix.audio_file_path or not os.path.exists(mix.audio_file_path):
+        raise FileNotFoundError(f"Audio file missing: {mix.audio_file_path!r}")
+
+    from app.services.mixcloud_uploader import MixcloudUploader
+    from app.services.tag_generator import TagGenerator
+
+    tag_gen = TagGenerator()
+    genres = mix.genres or ["electronic"]
+    vibes = mix.vibes or ["mixed"]
+    tags = mix.tags or tag_gen.generate(genres=genres, vibes=vibes, tracklist=mix.tracklist)
+
+    uploader = MixcloudUploader(db_settings_json=sj)
+    url = await uploader.upload(
+        audio_path=mix.audio_file_path,
+        title=mix.title,
+        description=mix.description_soundcloud or "",
+        tags=tags,
+        cover_art_path=mix.cover_art_path,
+    )
+
+    mix.mixcloud_url = url
+    return {"mixcloud_url": url}
+
+
+# ---------------------------------------------------------------------------
+# verify_mixcloud
+# ---------------------------------------------------------------------------
+
+async def handle_verify_mixcloud(
+    mix_id: str, session: AsyncSession
+) -> Optional[dict]:
+    """Verify the Mixcloud upload is accessible."""
+    mix = await _get_mix(mix_id, session)
+
+    if not mix.mixcloud_url:
+        logger.info("No Mixcloud URL for mix %s -- skipping verification", mix_id)
+        return {"skipped": True, "reason": "No Mixcloud URL (upload was skipped)"}
+
+    from app.services.mixcloud_uploader import MixcloudUploader
+
+    app_settings_v = await _get_app_settings(session)
+    sj_v = (app_settings_v.settings_json or {}) if app_settings_v else {}
+    uploader = MixcloudUploader(db_settings_json=sj_v)
+    verified = await uploader.verify_upload(mix.mixcloud_url)
+
+    if not verified:
+        raise RuntimeError(f"Mixcloud verification failed for {mix.mixcloud_url}")
+
+    return {"verified": True, "url": mix.mixcloud_url}
+
+
+# ---------------------------------------------------------------------------
 # cross_link
 # ---------------------------------------------------------------------------
 
@@ -609,6 +685,18 @@ async def handle_cross_link(
         mix.description_youtube += f"\n\nListen on SoundCloud: {sc_url}"
         updated.append("youtube_description")
 
+    # Mixcloud is optional (gated + default OFF); only weave it in when present.
+    mc_url = getattr(mix, "mixcloud_url", None)
+    if mc_url:
+        if mix.description_soundcloud and mc_url not in mix.description_soundcloud:
+            mix.description_soundcloud += f"\n\nOn Mixcloud: {mc_url}"
+            if "soundcloud_description" not in updated:
+                updated.append("soundcloud_description")
+        if mix.description_youtube and mc_url not in mix.description_youtube:
+            mix.description_youtube += f"\n\nOn Mixcloud: {mc_url}"
+            if "youtube_description" not in updated:
+                updated.append("youtube_description")
+
     if updated:
         logger.info(
             "Cross-linked descriptions for mix %s (local update): %s",
@@ -645,6 +733,16 @@ async def handle_cross_link(
             except Exception as exc:
                 logger.warning("Cross-link SoundCloud push failed for mix %s: %s", mix_id, exc)
 
+        if mc_url and mix.description_soundcloud:
+            try:
+                from app.services.mixcloud_uploader import MixcloudUploader
+
+                mc_uploader = MixcloudUploader(db_settings_json=sj)
+                await mc_uploader.update_description(mc_url, mix.description_soundcloud)
+                pushed.append("mixcloud")
+            except Exception as exc:
+                logger.warning("Cross-link Mixcloud push failed for mix %s: %s", mix_id, exc)
+
         if pushed:
             logger.info("Cross-link pushed to live platforms for mix %s: %s", mix_id, ", ".join(pushed))
     else:
@@ -656,6 +754,7 @@ async def handle_cross_link(
     return {
         "soundcloud_url": sc_url,
         "youtube_url": yt_url,
+        "mixcloud_url": mc_url,
         "updated_descriptions": updated,
         "pushed_platforms": pushed,
     }
@@ -675,6 +774,8 @@ def register_all_handlers(orchestrator: PipelineOrchestrator) -> None:
     orchestrator.register_handler("verify_soundcloud", handle_verify_soundcloud)
     orchestrator.register_handler("upload_youtube", handle_upload_youtube)
     orchestrator.register_handler("verify_youtube", handle_verify_youtube)
+    orchestrator.register_handler("upload_mixcloud", handle_upload_mixcloud)
+    orchestrator.register_handler("verify_mixcloud", handle_verify_mixcloud)
     orchestrator.register_handler("cross_link", handle_cross_link)
 
     logger.info("All pipeline handlers registered")
