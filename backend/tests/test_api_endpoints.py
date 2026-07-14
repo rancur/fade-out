@@ -1,0 +1,175 @@
+"""Async HTTP-level tests for the real FastAPI endpoints.
+
+These drive the actual ASGI app through httpx.AsyncClient (ASGITransport) with a
+fresh SQLite schema per test (``client`` fixture in conftest). The orchestrator's
+pipeline launch methods are stubbed, so these assert the HTTP + DB behavior of
+the routers, not the background pipeline.
+"""
+
+import pytest
+
+
+class TestHealth:
+    async def test_health_ok(self, client):
+        resp = await client.get("/api/health")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert "version" in body
+
+
+class TestMixesCrud:
+    async def test_create_and_get_mix(self, client):
+        resp = await client.post("/api/mixes", json={"title": "Test Mix"})
+        assert resp.status_code == 201
+        created = resp.json()
+        assert created["title"] == "Test Mix"
+        assert created["pipeline_status"] == "pending"
+        mix_id = created["id"]
+
+        # mixcloud_url is part of the schema and serialized (default None)
+        assert "mixcloud_url" in created
+        assert created["mixcloud_url"] is None
+
+        detail = await client.get(f"/api/mixes/{mix_id}")
+        assert detail.status_code == 200
+        detail_body = detail.json()
+        assert detail_body["id"] == mix_id
+        # Detail view includes the initialized pipeline steps.
+        step_names = {s["step_name"] for s in detail_body["steps"]}
+        assert "upload_mixcloud" in step_names
+        assert "verify_mixcloud" in step_names
+        assert "cross_link" in step_names
+
+    async def test_get_missing_mix_404(self, client):
+        resp = await client.get("/api/mixes/does-not-exist")
+        assert resp.status_code == 404
+
+    async def test_list_mixes_pagination_and_filter(self, client):
+        for i in range(3):
+            await client.post("/api/mixes", json={"title": f"Mix {i}"})
+
+        resp = await client.get("/api/mixes", params={"page": 1, "page_size": 2})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 3
+        assert body["page_size"] == 2
+        assert len(body["items"]) == 2
+
+        # Filter by a status that no mix has.
+        filtered = await client.get("/api/mixes", params={"status": "completed"})
+        assert filtered.json()["total"] == 0
+
+    async def test_update_mix(self, client):
+        created = (await client.post("/api/mixes", json={"title": "Before"})).json()
+        mix_id = created["id"]
+
+        resp = await client.put(
+            f"/api/mixes/{mix_id}",
+            json={"title": "After", "genres": ["house", "techno"]},
+        )
+        assert resp.status_code == 200
+        updated = resp.json()
+        assert updated["title"] == "After"
+        assert updated["genres"] == ["house", "techno"]
+
+    async def test_update_missing_mix_404(self, client):
+        resp = await client.put("/api/mixes/nope", json={"title": "X"})
+        assert resp.status_code == 404
+
+    async def test_delete_mix(self, client):
+        created = (await client.post("/api/mixes", json={"title": "Doomed"})).json()
+        mix_id = created["id"]
+
+        resp = await client.delete(f"/api/mixes/{mix_id}")
+        assert resp.status_code == 204
+
+        # Now gone.
+        assert (await client.get(f"/api/mixes/{mix_id}")).status_code == 404
+
+    async def test_delete_missing_mix_404(self, client):
+        resp = await client.delete("/api/mixes/nope")
+        assert resp.status_code == 404
+
+
+class TestMixStateTransitions:
+    async def test_approve_requires_draft_review(self, client):
+        created = (await client.post("/api/mixes", json={"title": "Fresh"})).json()
+        mix_id = created["id"]
+        # Newly created mix is "pending", not "draft_review".
+        resp = await client.post(f"/api/mixes/{mix_id}/approve")
+        assert resp.status_code == 400
+
+    async def test_retry_requires_failed(self, client):
+        created = (await client.post("/api/mixes", json={"title": "Fresh"})).json()
+        mix_id = created["id"]
+        resp = await client.post(f"/api/mixes/{mix_id}/retry")
+        assert resp.status_code == 400
+
+    async def test_retry_step_missing_step_404(self, client):
+        created = (await client.post("/api/mixes", json={"title": "Fresh"})).json()
+        mix_id = created["id"]
+        resp = await client.post(f"/api/mixes/{mix_id}/retry-step/not_a_step")
+        assert resp.status_code == 404
+
+
+class TestPipelineEndpoints:
+    async def test_status_counts(self, client):
+        # Two pending mixes -> queued == 2.
+        await client.post("/api/mixes", json={"title": "A"})
+        await client.post("/api/mixes", json={"title": "B"})
+
+        resp = await client.get("/api/pipeline/status")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["queued"] == 2
+        assert body["completed"] == 0
+        assert body["failed"] == 0
+        assert body["paused"] is False
+
+    async def test_pause_and_resume(self, client):
+        paused = await client.post("/api/pipeline/pause")
+        assert paused.status_code == 200
+        assert paused.json()["paused"] is True
+
+        resumed = await client.post("/api/pipeline/resume")
+        assert resumed.status_code == 200
+        assert resumed.json()["paused"] is False
+
+    async def test_queue_lists_pending(self, client):
+        created = (await client.post("/api/mixes", json={"title": "Queued"})).json()
+        resp = await client.get("/api/pipeline/queue")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 1
+        assert body["items"][0]["mix_id"] == created["id"]
+
+
+class TestNotificationSettings:
+    async def test_get_and_update_settings_roundtrip(self, client):
+        # Defaults come back empty.
+        got = await client.get("/api/notifications/settings")
+        assert got.status_code == 200
+        assert got.json()["discord_webhook_url"] is None
+
+        updated = await client.put(
+            "/api/notifications/settings",
+            json={"discord_webhook_url": "https://discord.example/webhook"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["discord_webhook_url"] == "https://discord.example/webhook"
+
+        # Persisted.
+        got2 = await client.get("/api/notifications/settings")
+        assert got2.json()["discord_webhook_url"] == "https://discord.example/webhook"
+
+    async def test_test_notification_invalid_channel_400(self, client):
+        resp = await client.post(
+            "/api/notifications/test", json={"channel": "carrier-pigeon"}
+        )
+        assert resp.status_code == 400
+
+    async def test_list_notifications_empty(self, client):
+        resp = await client.get("/api/notifications")
+        assert resp.status_code == 200
+        assert resp.json()["total"] == 0

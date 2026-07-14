@@ -429,21 +429,15 @@ class AudioAnalyzer:
 
             scores[genre] = score
 
-        # Boost genres mentioned in Shazam track metadata
-        genre_keywords = {
-            "house": ["house"],
-            "techno": ["techno"],
-            "trance": ["trance"],
-            "drum and bass": ["drum", "bass", "dnb", "d&b", "jungle"],
-            "dubstep": ["dubstep", "riddim"],
-            "ambient": ["ambient", "chill"],
-            "breakbeat": ["breakbeat", "breaks"],
-        }
+        # Boost genres mentioned in Shazam track metadata. Word-boundary matching
+        # (see genre_utils.keyword_matches) avoids over-crediting e.g. "drum and
+        # bass" for titles that merely contain "bass" inside a longer word.
+        from app.services.genre_utils import keyword_boosts
+
         for track in tracklist:
-            combined = f"{track.title} {track.artist}".lower()
-            for genre, keywords in genre_keywords.items():
-                if any(kw in combined for kw in keywords):
-                    scores[genre] = scores.get(genre, 0) + 1.5
+            combined = f"{track.title} {track.artist}"
+            for genre, boost in keyword_boosts(combined).items():
+                scores[genre] = scores.get(genre, 0) + boost
 
         # Return top genres with score > 0
         sorted_genres = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)

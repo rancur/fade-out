@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import init_db
 from app.logging_config import configure_logging
-from app.routers import ai_usage, auth, brand, mixes, notifications, pipeline, settings as settings_router, upgrade
+from app.routers import ai_usage, auth, brand, mixes, notifications, pipeline, settings as settings_router, upgrade, ws
 from app.services.handlers import register_all_handlers
 from app.services.pipeline import PipelineOrchestrator
 
@@ -38,6 +38,9 @@ async def lifespan(app: FastAPI):
         "Pipeline orchestrator ready (%d handlers registered).",
         len(orchestrator._handlers),
     )
+
+    # Stream live pipeline events to any connected WebSocket clients.
+    orchestrator.on_event(ws.manager.broadcast_event)
 
     logger.info("Fade-Out is running.")
     yield
@@ -69,6 +72,7 @@ app.include_router(brand.router)
 app.include_router(ai_usage.router)
 app.include_router(notifications.router)
 app.include_router(upgrade.router)
+app.include_router(ws.router)
 
 
 # --- Health Check ---
