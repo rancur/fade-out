@@ -7,7 +7,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Awaitable, Callable, Dict, Optional
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -21,33 +21,96 @@ VIDEO_EXTENSIONS = {".mkv"}
 HASH_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB for dedup hash
 
 
+STATUS_PROCESSING = "processing"
+STATUS_DONE = "done"
+
+
 class _SeenFilesDB:
-    """SQLite-backed tracker of already-processed files to survive restarts."""
+    """Durable, crash-safe tracker of processed files.
+
+    A file moves through two states:
+
+    * ``processing`` — recorded *before* the callback runs, so a crash mid-scan
+      leaves a durable breadcrumb.
+    * ``done`` — recorded only *after* the callback returns successfully.
+
+    On restart only ``done`` files are skipped. A file left in ``processing`` by
+    a crash (or whose callback raised) is therefore re-processed rather than
+    silently dropped, and a genuinely-finished file is never processed twice.
+
+    Durability is provided by SQLite in WAL mode with ``synchronous=FULL`` and a
+    single atomic ``INSERT OR REPLACE`` commit per transition — no partial or
+    lost state across a crash.
+    """
 
     def __init__(self, db_path: str = "data/seen_files.db") -> None:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # Crash-safe durability: WAL survives a process kill, FULL sync flushes
+        # each commit to disk before returning.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS seen_files ("
             "  file_hash TEXT PRIMARY KEY,"
             "  file_path TEXT NOT NULL,"
             "  file_type TEXT NOT NULL,"
-            "  seen_at REAL NOT NULL"
+            "  status TEXT NOT NULL DEFAULT 'done',"
+            "  updated_at REAL NOT NULL"
             ")"
         )
+        self._migrate_legacy_schema()
         self._conn.commit()
 
-    def is_seen(self, file_hash: str) -> bool:
+    def _migrate_legacy_schema(self) -> None:
+        """Add the status/updated_at columns to a pre-existing legacy table.
+
+        Older DBs only had (file_hash, file_path, file_type, seen_at) and treated
+        any present row as processed; those rows are adopted as ``done``.
+        """
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(seen_files)")}
+        if not cols:
+            return
+        if "status" not in cols:
+            self._conn.execute(
+                "ALTER TABLE seen_files ADD COLUMN status TEXT NOT NULL DEFAULT 'done'"
+            )
+        if "updated_at" not in cols:
+            self._conn.execute("ALTER TABLE seen_files ADD COLUMN updated_at REAL")
+            self._conn.execute(
+                "UPDATE seen_files SET updated_at = COALESCE(updated_at, ?)",
+                (time.time(),),
+            )
+
+    def is_done(self, file_hash: str) -> bool:
+        """True only when the file has been fully processed."""
         row = self._conn.execute(
-            "SELECT 1 FROM seen_files WHERE file_hash = ?", (file_hash,)
+            "SELECT 1 FROM seen_files WHERE file_hash = ? AND status = ?",
+            (file_hash, STATUS_DONE),
         ).fetchone()
         return row is not None
 
-    def mark_seen(self, file_hash: str, file_path: str, file_type: str) -> None:
+    def begin_processing(self, file_hash: str, file_path: str, file_type: str) -> None:
+        """Durably record that processing has started (before the callback)."""
+        self._set_status(file_hash, file_path, file_type, STATUS_PROCESSING)
+
+    def mark_done(self, file_hash: str, file_path: str, file_type: str) -> None:
+        """Durably record successful processing (after the callback)."""
+        self._set_status(file_hash, file_path, file_type, STATUS_DONE)
+
+    def clear(self, file_hash: str) -> None:
+        """Drop a record so a failed file is retried on the next scan/restart."""
+        self._conn.execute("DELETE FROM seen_files WHERE file_hash = ?", (file_hash,))
+        self._conn.commit()
+
+    def _set_status(
+        self, file_hash: str, file_path: str, file_type: str, status: str
+    ) -> None:
         self._conn.execute(
-            "INSERT OR IGNORE INTO seen_files (file_hash, file_path, file_type, seen_at) "
-            "VALUES (?, ?, ?, ?)",
-            (file_hash, file_path, file_type, time.time()),
+            "INSERT OR REPLACE INTO seen_files "
+            "(file_hash, file_path, file_type, status, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (file_hash, file_path, file_type, status, time.time()),
         )
         self._conn.commit()
 
@@ -138,8 +201,8 @@ class FileWatcherService:
 
     def __init__(
         self,
-        on_audio_file: Callable[[str], asyncio.coroutines],
-        on_video_file: Callable[[str], asyncio.coroutines],
+        on_audio_file: Callable[[str], Awaitable[None]],
+        on_video_file: Callable[[str], Awaitable[None]],
         audio_path: Optional[str] = None,
         video_path: Optional[str] = None,
         stable_seconds: Optional[int] = None,
@@ -213,7 +276,7 @@ class FileWatcherService:
         self,
         tracker: _StabilityTracker,
         file_type: str,
-        callback: Callable[[str], asyncio.coroutines],
+        callback: Callable[[str], Awaitable[None]],
     ) -> None:
         for path in list(tracker.tracked_paths):
             if not os.path.exists(path):
@@ -233,12 +296,16 @@ class FileWatcherService:
                 tracker.remove(path)
                 continue
 
-            if self._seen_db.is_seen(file_hash):
-                logger.info("Skipping duplicate file: %s (hash=%s)", path, file_hash)
+            if self._seen_db.is_done(file_hash):
+                logger.info("Skipping already-processed file: %s (hash=%s)", path, file_hash)
                 tracker.remove(path)
                 continue
 
-            self._seen_db.mark_seen(file_hash, path, file_type)
+            # Durably mark 'processing' BEFORE the callback and drop it from the
+            # stability tracker so it is dispatched exactly once. If we crash
+            # mid-callback the record stays 'processing' (not 'done'), so the
+            # next startup scan re-processes it instead of losing the file.
+            self._seen_db.begin_processing(file_hash, path, file_type)
             tracker.remove(path)
             logger.info("Stable new %s file detected: %s", file_type, path)
 
@@ -246,6 +313,10 @@ class FileWatcherService:
                 await callback(path)
             except Exception:
                 logger.exception("Error in %s callback for %s", file_type, path)
+                # Not done: clear the record so it is retried next scan/restart.
+                self._seen_db.clear(file_hash)
+            else:
+                self._seen_db.mark_done(file_hash, path, file_type)
 
     async def stop(self) -> None:
         """Stop watching."""

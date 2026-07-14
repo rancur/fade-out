@@ -31,13 +31,20 @@ class TrackHit:
     title: str
     artist: str
     timestamp_seconds: float
+    # Recognition confidence in [0, 1]. Set from how many times the same title
+    # was independently recognized (a confirmed multi-hit is far more reliable
+    # than a lone hit on blended DJ audio). Consumed by the confidence merge.
+    confidence: Optional[float] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "title": self.title,
             "artist": self.artist,
             "timestamp_seconds": self.timestamp_seconds,
         }
+        if self.confidence is not None:
+            d["confidence"] = self.confidence
+        return d
 
 
 @dataclass
@@ -277,6 +284,21 @@ class AudioAnalyzer:
                 else:
                     filtered.append(track)
             identified = filtered
+
+        # Tag each surviving hit with a recognition confidence derived from how
+        # many times its title was independently recognized. The confidence
+        # merge uses this to decide whether a Shazam name is trustworthy enough
+        # to keep or should collapse to an "ID - ID" marker.
+        from app.services.confidence_merge import (
+            SHAZAM_CONFIRMED_CONFIDENCE,
+            SHAZAM_SINGLE_CONFIDENCE,
+        )
+
+        for hit in identified:
+            hits = title_hit_count.get(hit.title.lower(), 0)
+            hit.confidence = (
+                SHAZAM_CONFIRMED_CONFIDENCE if hits >= 2 else SHAZAM_SINGLE_CONFIDENCE
+            )
 
         return identified
 
