@@ -584,43 +584,80 @@ async def handle_cross_link(
     yt_url = mix.youtube_url
 
     updated = []
+    pushed = []
 
-    # For now, log the intent. Full cross-linking requires API calls to update
-    # existing descriptions. The generated descriptions already contain
-    # placeholder link sections, so this is a best-effort step.
-
-    if sc_url and yt_url:
-        # Update SoundCloud description to include YouTube link
-        if mix.description_soundcloud and yt_url not in mix.description_soundcloud:
-            mix.description_soundcloud += f"\n\nWatch on YouTube: {yt_url}"
-            updated.append("soundcloud_description")
-
-        # Update YouTube description to include SoundCloud link
-        if mix.description_youtube and sc_url not in mix.description_youtube:
-            mix.description_youtube += f"\n\nListen on SoundCloud: {sc_url}"
-            updated.append("youtube_description")
-
-        # Note: actually pushing these updates to the platforms would require
-        # additional API calls (SoundCloud PUT /tracks/:id, YouTube videos.update).
-        # That can be wired in later once the basic flow is stable.
-        if updated:
-            logger.info(
-                "Cross-linked descriptions for mix %s (local update): %s",
-                mix_id,
-                ", ".join(updated),
-            )
-    else:
+    if not (sc_url and yt_url):
         logger.info(
             "Cross-link: skipping for mix %s (sc=%s, yt=%s)",
             mix_id,
             bool(sc_url),
             bool(yt_url),
         )
+        return {
+            "soundcloud_url": sc_url,
+            "youtube_url": yt_url,
+            "updated_descriptions": updated,
+            "pushed_platforms": pushed,
+        }
+
+    # 1. Update the locally-stored descriptions to include the reciprocal link.
+    if mix.description_soundcloud and yt_url not in mix.description_soundcloud:
+        mix.description_soundcloud += f"\n\nWatch on YouTube: {yt_url}"
+        updated.append("soundcloud_description")
+
+    if mix.description_youtube and sc_url not in mix.description_youtube:
+        mix.description_youtube += f"\n\nListen on SoundCloud: {sc_url}"
+        updated.append("youtube_description")
+
+    if updated:
+        logger.info(
+            "Cross-linked descriptions for mix %s (local update): %s",
+            mix_id,
+            ", ".join(updated),
+        )
+
+    # 2. Optionally push the updated descriptions to the LIVE platforms. Gated
+    # behind CROSS_LINK_PUSH_ENABLED so a published description is never mutated
+    # without an explicit opt-in. Each push is best-effort: a failure is logged
+    # but never fails the pipeline's final step. Uses existing OAuth tokens.
+    if settings.CROSS_LINK_PUSH_ENABLED:
+        app_settings = await _get_app_settings(session)
+        sj = (app_settings.settings_json or {}) if app_settings else {}
+
+        if mix.description_youtube:
+            try:
+                from app.services.youtube_uploader import YouTubeUploader
+
+                video_id = extract_youtube_video_id(yt_url)
+                yt_uploader = YouTubeUploader(db_settings_json=sj)
+                await yt_uploader.update_description(video_id, mix.description_youtube)
+                pushed.append("youtube")
+            except Exception as exc:
+                logger.warning("Cross-link YouTube push failed for mix %s: %s", mix_id, exc)
+
+        if mix.description_soundcloud:
+            try:
+                from app.services.soundcloud_uploader import SoundCloudUploader
+
+                sc_uploader = SoundCloudUploader(db_settings_json=sj)
+                await sc_uploader.update_description(sc_url, mix.description_soundcloud)
+                pushed.append("soundcloud")
+            except Exception as exc:
+                logger.warning("Cross-link SoundCloud push failed for mix %s: %s", mix_id, exc)
+
+        if pushed:
+            logger.info("Cross-link pushed to live platforms for mix %s: %s", mix_id, ", ".join(pushed))
+    else:
+        logger.info(
+            "Cross-link push disabled (CROSS_LINK_PUSH_ENABLED=false); local descriptions updated only for mix %s",
+            mix_id,
+        )
 
     return {
         "soundcloud_url": sc_url,
         "youtube_url": yt_url,
         "updated_descriptions": updated,
+        "pushed_platforms": pushed,
     }
 
 

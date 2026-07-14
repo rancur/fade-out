@@ -104,6 +104,15 @@ class Settings(BaseSettings):
 
     # --- Logging ---
     LOG_LEVEL: str = "INFO"
+    LOG_JSON: bool = False  # emit structured JSON logs instead of plain text
+
+    # --- Cross-linking ---
+    # When True, the cross_link step pushes reciprocal links to the LIVE
+    # platform descriptions (YouTube videos.update + SoundCloud PUT /tracks/:id)
+    # using the existing OAuth tokens -- no new credentials required. Left OFF by
+    # default so a published description is never mutated without an explicit
+    # opt-in; the code path is fully implemented and gated on this flag.
+    CROSS_LINK_PUSH_ENABLED: bool = False
 
     # --- Pipeline ---
     DRAFT_MODE: bool = True
