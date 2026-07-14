@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import init_db
+from app.logging_config import configure_logging
 from app.routers import ai_usage, auth, brand, mixes, notifications, pipeline, settings as settings_router, upgrade
 from app.services.handlers import register_all_handlers
 from app.services.pipeline import PipelineOrchestrator
@@ -26,10 +27,7 @@ orchestrator = PipelineOrchestrator()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle handler."""
-    logging.basicConfig(
-        level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    configure_logging(settings.LOG_LEVEL, settings.LOG_JSON)
     logger.info("Initializing database...")
     await init_db()
     logger.info("Database ready.")

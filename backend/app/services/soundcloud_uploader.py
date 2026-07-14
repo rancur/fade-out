@@ -472,6 +472,46 @@ class SoundCloudUploader:
         raise RuntimeError("Could not determine uploaded track URL")
 
     # ------------------------------------------------------------------
+    # Description update (cross-linking)
+    # ------------------------------------------------------------------
+
+    async def update_description(self, track_url: str, description: str) -> bool:
+        """Update a track's description via ``PUT /tracks/:id`` (best-effort).
+
+        Resolves the permalink URL to a track id, then PUTs the new description.
+        Uses the existing OAuth access token -- no new credentials required.
+        """
+        token = await self._ensure_access_token()
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resolved = await client.get(
+                f"{SOUNDCLOUD_API_BASE}/resolve",
+                params={"url": track_url},
+                headers={"Authorization": f"OAuth {token}", "Accept": "application/json"},
+                follow_redirects=True,
+            )
+            if resolved.status_code != 200:
+                raise RuntimeError(
+                    f"SoundCloud resolve failed ({resolved.status_code}) for {track_url}"
+                )
+            track_id = resolved.json().get("id")
+            if not track_id:
+                raise RuntimeError(f"SoundCloud resolve returned no track id for {track_url}")
+
+            put = await client.put(
+                f"{SOUNDCLOUD_API_BASE}/tracks/{track_id}",
+                headers={"Authorization": f"OAuth {token}", "Accept": "application/json"},
+                data={"track[description]": description},
+            )
+            if put.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"SoundCloud description update failed ({put.status_code}): {put.text}"
+                )
+
+        logger.info("Updated SoundCloud description for track %s (%s)", track_id, track_url)
+        return True
+
+    # ------------------------------------------------------------------
     # Verification
     # ------------------------------------------------------------------
 

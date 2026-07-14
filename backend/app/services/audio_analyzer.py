@@ -348,8 +348,9 @@ class AudioAnalyzer:
         if not matches or not track_info:
             return None
 
-        title = track_info.get("title", "Unknown")
-        artist = track_info.get("subtitle", "Unknown")
+        # DJ convention: an unidentified field is labelled "ID" (renders "ID - ID").
+        title = track_info.get("title") or "ID"
+        artist = track_info.get("subtitle") or "ID"
         return TrackHit(title=title, artist=artist, timestamp_seconds=offset)
 
     async def _audd_wav(self, wav_path: str, offset: float) -> Optional[TrackHit]:
@@ -376,8 +377,8 @@ class AudioAnalyzer:
         if not track_info:
             return None
 
-        title = track_info.get("title") or "Unknown"
-        artist = track_info.get("artist") or "Unknown"
+        title = track_info.get("title") or "ID"
+        artist = track_info.get("artist") or "ID"
         return TrackHit(title=title, artist=artist, timestamp_seconds=offset)
 
     async def _shazam_segment(
