@@ -146,13 +146,25 @@ def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> 
         logger.debug("CUE directory does not exist: %s", cue_dir)
         return None
 
-    audio_mtime = os.path.getmtime(audio_path)
-    audio_date = datetime.fromtimestamp(audio_mtime).date()
+    date_pattern = re.compile(r'(\d{4}-\d{2}-\d{2})')
+
+    # Prefer a date embedded in the audio FILENAME over the file mtime. mtime
+    # shifts when a mix is copied, re-encoded, or moved between hosts, which
+    # silently breaks the (much more accurate) CUE-based tracklist and forces
+    # the Shazam fallback. The recording date in the name is stable.
+    audio_date = None
+    fname_match = date_pattern.search(os.path.basename(audio_path))
+    if fname_match:
+        try:
+            audio_date = datetime.strptime(fname_match.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            audio_date = None
+    if audio_date is None:
+        audio_mtime = os.path.getmtime(audio_path)
+        audio_date = datetime.fromtimestamp(audio_mtime).date()
 
     best_match: Optional[str] = None
     best_delta: int = 999
-
-    date_pattern = re.compile(r'(\d{4}-\d{2}-\d{2})')
 
     for fname in os.listdir(cue_dir):
         if not fname.lower().endswith(".cue"):
@@ -170,7 +182,9 @@ def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> 
             best_delta = delta
             best_match = os.path.join(cue_dir, fname)
 
-    if best_match and best_delta <= 1:
+    # Allow up to 2 days of slack: a set recorded past midnight, or a CUE
+    # exported the morning after, should still match its recording.
+    if best_match and best_delta <= 2:
         logger.info("Matched CUE %s to audio %s (delta=%d days)", best_match, audio_path, best_delta)
         return best_match
 

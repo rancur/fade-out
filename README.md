@@ -108,6 +108,7 @@ The web dashboard will be available at `http://<nas-ip>:8500`.
 |---|---|---|
 | `OPENAI_API_KEY` | Yes | OpenAI API key for tracklist analysis and metadata generation |
 | `FAL_API_KEY` | Yes | fal.ai API key for AI thumbnail/cover art generation |
+| `AUDD_API_TOKEN` | No | [AudD](https://dashboard.audd.io) fingerprint token. When set, used as a fallback for mix segments the Shazam identifier misses (better recall on layered/underground DJ audio). |
 | `SOUNDCLOUD_EMAIL` | Yes | SoundCloud account email |
 | `SOUNDCLOUD_PASSWORD` | Yes | SoundCloud account password |
 | `YOUTUBE_CLIENT_ID` | Yes | YouTube Data API OAuth2 client ID |

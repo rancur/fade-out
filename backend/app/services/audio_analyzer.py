@@ -7,6 +7,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 import librosa
 import numpy as np
 import soundfile as sf
@@ -17,9 +18,12 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 SEGMENT_DURATION = 15  # seconds per Shazam sample clip
-DEFAULT_SAMPLE_INTERVAL = settings.AUDIO_SAMPLE_INTERVAL_SECONDS  # 120s = 2 min
+DEFAULT_SAMPLE_INTERVAL = settings.AUDIO_SAMPLE_INTERVAL_SECONDS  # denser = better recall
 SECONDARY_CLIP_OFFSET = 30  # seconds after primary clip for transition catching
 RETRY_CLIP_OFFSET = 45  # seconds offset for retry if primary Shazam fails
+SHAZAM_TRANSIENT_RETRIES = 2  # in-place retries when recognize() errors (rate limit/network)
+SHAZAM_RETRY_BACKOFF = 1.5  # seconds base backoff between transient retries
+AUDD_ENDPOINT = "https://api.audd.io/"
 
 
 @dataclass
@@ -84,6 +88,7 @@ class AudioAnalyzer:
     def __init__(self, sample_interval: int = DEFAULT_SAMPLE_INTERVAL) -> None:
         self._sample_interval = sample_interval
         self._shazam = Shazam()
+        self._audd_token = (settings.AUDD_API_TOKEN or "").strip()
 
     async def analyze(self, audio_path: str) -> AnalysisResult:
         """Full analysis pipeline. Handles files up to 6 hours."""
@@ -203,7 +208,9 @@ class AudioAnalyzer:
         """Use Shazam to identify tracks at sample points.
 
         For each sample point, tries two clips (primary and +30s offset) to
-        catch transitions. If the primary clip fails Shazam, retries at +45s.
+        catch transitions. If the primary clip fails recognition, retries at
+        +45s. Each clip is run through Shazam first and, if an AudD token is
+        configured, falls back to AudD when Shazam returns nothing.
         Consecutive duplicate tracks are deduplicated (keep first occurrence).
         """
         identified: List[TrackHit] = []
@@ -215,10 +222,10 @@ class AudioAnalyzer:
 
         for t in sample_times:
             # Primary clip at sample point
-            hit = await self._shazam_segment(path, t, sr_native)
+            hit = await self._recognize_segment(path, t, sr_native)
             if not hit:
                 # Retry with offset if primary fails
-                hit = await self._shazam_segment(path, t + RETRY_CLIP_OFFSET, sr_native)
+                hit = await self._recognize_segment(path, t + RETRY_CLIP_OFFSET, sr_native)
 
             if hit:
                 title_key = hit.title.lower()
@@ -231,7 +238,7 @@ class AudioAnalyzer:
             # Secondary clip at +30s to catch tracks during transitions
             # Only add if we didn't already get a hit at this point
             if not hit:
-                hit2 = await self._shazam_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
+                hit2 = await self._recognize_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
                 if hit2:
                     title_key = hit2.title.lower()
                     title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
@@ -273,31 +280,68 @@ class AudioAnalyzer:
 
         return identified
 
-    async def _shazam_segment(
+    async def _recognize_segment(
         self, path: str, offset: float, sr_native: int
     ) -> Optional[TrackHit]:
-        """Extract a segment and run Shazam on it."""
+        """Recognize a single clip: Shazam first, AudD fallback if configured.
+
+        Extracts the segment to a temp WAV once and reuses it for both
+        providers so we don't decode the audio twice.
+        """
+        wav_path = await self._extract_segment_wav(path, offset, sr_native)
+        if wav_path is None:
+            return None
+        try:
+            hit = await self._shazam_wav(wav_path, offset)
+            if hit is None and self._audd_token:
+                hit = await self._audd_wav(wav_path, offset)
+            return hit
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+    async def _extract_segment_wav(
+        self, path: str, offset: float, sr_native: int
+    ) -> Optional[str]:
+        """Decode a clip and write it to a temp WAV. Returns the path or None."""
         try:
             y, sr = await asyncio.to_thread(
                 librosa.load, path, sr=sr_native, offset=offset, duration=SEGMENT_DURATION
             )
         except Exception:
             return None
-
-        # Write segment to a temp WAV file for Shazam
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         try:
             sf.write(tmp.name, y, sr)
             tmp.close()
-            result = await self._shazam.recognize(tmp.name)
         except Exception as exc:
-            logger.debug("Shazam failed at %.1fs: %s", offset, exc)
-            return None
-        finally:
+            logger.debug("Segment write failed at %.1fs: %s", offset, exc)
             try:
                 os.unlink(tmp.name)
             except OSError:
                 pass
+            return None
+        return tmp.name
+
+    async def _shazam_wav(self, wav_path: str, offset: float) -> Optional[TrackHit]:
+        """Run Shazam on an already-extracted WAV, retrying transient errors.
+
+        A clean "no match" returns immediately. Exceptions (rate limiting,
+        transient network failures) are retried in place with backoff so a
+        recoverable blip doesn't silently drop a real track.
+        """
+        for attempt in range(SHAZAM_TRANSIENT_RETRIES + 1):
+            try:
+                result = await self._shazam.recognize(wav_path)
+                break
+            except Exception as exc:
+                if attempt < SHAZAM_TRANSIENT_RETRIES:
+                    await asyncio.sleep(SHAZAM_RETRY_BACKOFF * (attempt + 1))
+                    continue
+                logger.debug("Shazam failed at %.1fs after retries: %s", offset, exc)
+                return None
 
         matches = result.get("matches", [])
         track_info = result.get("track")
@@ -307,6 +351,54 @@ class AudioAnalyzer:
         title = track_info.get("title", "Unknown")
         artist = track_info.get("subtitle", "Unknown")
         return TrackHit(title=title, artist=artist, timestamp_seconds=offset)
+
+    async def _audd_wav(self, wav_path: str, offset: float) -> Optional[TrackHit]:
+        """Fallback recognition via AudD (https://audd.io). Requires a token.
+
+        Any error is swallowed and returns None so the pipeline never breaks on
+        a provider hiccup.
+        """
+        try:
+            with open(wav_path, "rb") as fh:
+                files = {"file": ("segment.wav", fh, "audio/wav")}
+                data = {"api_token": self._audd_token}
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(AUDD_ENDPOINT, data=data, files=files)
+            payload = resp.json()
+        except Exception as exc:
+            logger.debug("AudD failed at %.1fs: %s", offset, exc)
+            return None
+
+        if payload.get("status") != "success":
+            logger.debug("AudD non-success at %.1fs: %s", offset, payload.get("error"))
+            return None
+        track_info = payload.get("result")
+        if not track_info:
+            return None
+
+        title = track_info.get("title") or "Unknown"
+        artist = track_info.get("artist") or "Unknown"
+        return TrackHit(title=title, artist=artist, timestamp_seconds=offset)
+
+    async def _shazam_segment(
+        self, path: str, offset: float, sr_native: int
+    ) -> Optional[TrackHit]:
+        """Extract a segment and run Shazam on it (Shazam-only entry point).
+
+        Kept for callers that specifically want Shazam (e.g. the YouTube
+        timestamp-offset probe in handlers). Track identification goes through
+        _recognize_segment, which also uses the AudD fallback.
+        """
+        wav_path = await self._extract_segment_wav(path, offset, sr_native)
+        if wav_path is None:
+            return None
+        try:
+            return await self._shazam_wav(wav_path, offset)
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
 
     def _classify_genres(
         self,
