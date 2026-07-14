@@ -156,7 +156,8 @@ class TagGenerator:
                 if artists_added >= 5:
                     break
                 artist = track.get("artist", "")
-                if artist and artist.lower() != "unknown":
+                # Skip unidentified placeholders ("ID") and legacy "Unknown".
+                if artist and artist.lower() not in ("unknown", "id"):
                     if _add(artist):
                         artists_added += 1
 

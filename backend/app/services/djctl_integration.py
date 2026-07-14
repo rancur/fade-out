@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import websockets
 
 from app.config import settings
+from app.services.tracklist_utils import ID_LABEL, label_or_id
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,7 @@ def parse_cue_file(cue_path: str) -> List[CueTrack]:
                 tracks.append(CueTrack(
                     number=current_track_num,
                     title=current_title or f"Track {current_track_num}",
-                    artist=current_performer or global_performer or "Unknown",
+                    artist=current_performer or global_performer or ID_LABEL,
                     index_mm=mm,
                     index_ss=ss,
                     index_ff=ff,
@@ -244,8 +245,8 @@ class DJCTLWebSocketListener:
         event_type = msg.get("event") or msg.get("type", "")
         if event_type in ("track_change", "now_playing", "track"):
             track = {
-                "title": msg.get("title", "Unknown"),
-                "artist": msg.get("artist", "Unknown"),
+                "title": label_or_id(msg.get("title", "")),
+                "artist": label_or_id(msg.get("artist", "")),
                 "timestamp_seconds": msg.get("timestamp", msg.get("elapsed", 0)),
             }
             self._tracks.append(track)
@@ -303,8 +304,8 @@ def merge_tracklists(
             m, s = divmod(rem, 60)
             tf = f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m}:{s:02d}"
             formatted.append({
-                "title": wt.get("title", "Unknown"),
-                "artist": wt.get("artist", "Unknown"),
+                "title": label_or_id(wt.get("title", "")),
+                "artist": label_or_id(wt.get("artist", "")),
                 "timestamp_seconds": ts,
                 "timestamp_formatted": tf,
             })
@@ -319,8 +320,8 @@ def merge_tracklists(
             m, s = divmod(rem, 60)
             tf = f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m}:{s:02d}"
             formatted.append({
-                "title": st.get("title", "Unknown"),
-                "artist": st.get("artist", "Unknown"),
+                "title": label_or_id(st.get("title", "")),
+                "artist": label_or_id(st.get("artist", "")),
                 "timestamp_seconds": ts,
                 "timestamp_formatted": tf,
             })
