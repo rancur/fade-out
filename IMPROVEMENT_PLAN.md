@@ -10,6 +10,11 @@ Items marked **[DONE 07-13]** shipped in the follow-up
 `feat/fade-out-id-labels-and-guards` branch (ID labels, OpenAI guards, chapter
 wiring, gated cross-link push, structured logging, more tests).
 
+Items marked **[DONE 07-13b]** shipped in the third follow-up
+`feat/fade-out-endpoint-tests-migrations` branch (async HTTP endpoint tests,
+Alembic migrations, gated Mixcloud upload path, WebSocket live status, genre
+word-boundary matching).
+
 Legend: impact (H/M/L) · effort (S/M/L).
 
 ---
@@ -34,8 +39,10 @@ Legend: impact (H/M/L) · effort (S/M/L).
   `merge_tracklists` currently only backfills CUE `Track N` placeholders from
   Shazam by coarse 60s buckets. A confidence-scored merge (CUE time authoritative,
   Shazam/AudD for names) would be more robust.
-- **[LATER] Genre keyword over-matching** (L/S) — `"bass"` matches "bassline",
-  "bass house", etc. and over-credits drum & bass. Use word-boundary matching.
+- **[DONE 07-13b] Genre keyword over-matching** (L/S) — extracted the keyword
+  boost into a pure, tested `genre_utils` module and switched substring matching
+  to word-boundary matching (`keyword_matches`). "bassline" / "embassy" no longer
+  credit drum & bass; only whole-word hits boost a genre. Unit-tested.
 
 ## B. Reliability / error-handling
 
@@ -91,7 +98,15 @@ Legend: impact (H/M/L) · effort (S/M/L).
   best-effort (a failure logs but never fails the pipeline). Gated behind
   `CROSS_LINK_PUSH_ENABLED` (default **OFF**) so a published description is never
   mutated without an explicit opt-in — Will flips the flag when ready.
-- **[LATER] Mixcloud upload support** (M/L) — roadmap item; new integration.
+- **[DONE 07-13b] Mixcloud upload support** (M/L) — new `MixcloudUploader`
+  mirrors the SoundCloud/YouTube uploader shape (`upload` / `verify_upload` /
+  `update_description`) against the official Mixcloud API. Added `upload_mixcloud`
+  + `verify_mixcloud` pipeline steps, a `mixes.mixcloud_url` column, and wove the
+  Mixcloud URL into the cross-link descriptions. The **entire path is gated**
+  behind `MIXCLOUD_ENABLED` (default **OFF**) AND requires an access token, so
+  the steps no-op (skip) until Will completes the Mixcloud OAuth flow and flips
+  the flag — no new live credentials required to ship. Unit-tested (uploader +
+  handler gating + cross-link weave).
 - **[NEEDS WILL] Scheduled release queue** (M/M) — premiere timing is Will's call.
 
 ## E. Code quality / tests
@@ -107,14 +122,30 @@ Legend: impact (H/M/L) · effort (S/M/L).
   block), `test_cross_link.py` (handler description-linking, idempotent, skip),
   `test_logging_config.py` (JSON formatter + handler setup), and expanded
   `test_tracklist_utils.py` for the ID-label behavior. 92 tests pass.
-- **[LATER] Full async API endpoint tests** (M/M) — HTTP-level tests still need an
-  async test client + DB fixtures (roadmap item). Handler-level coverage is now in
-  place as a stepping stone.
+- **[DONE 07-13b] Full async API endpoint tests** (M/M) — `test_api_endpoints.py`
+  drives the real ASGI app through `httpx.AsyncClient` + `ASGITransport` with a
+  fresh SQLite schema per test (`client`/`prepared_db` fixtures in `conftest.py`;
+  orchestrator launch methods stubbed). Covers health, mixes CRUD + 404s, draft/
+  retry state guards, pipeline status/pause/resume/queue, and notification
+  settings round-trip.
 - **[DONE 07-13] Structured logging** (M/M) — `app/logging_config.py` adds a JSON
   formatter + single-handler `configure_logging()`, wired into `main.lifespan`.
   Opt-in via `LOG_JSON` (default False → unchanged plain-text format).
 
 ## F. Developer / UX ergonomics
 
-- **[LATER] Alembic migrations** (M/M) — schema changes are currently implicit.
-- **[LATER] WebSocket live pipeline status** (M/M) — roadmap item.
+- **[DONE 07-13b] Alembic migrations** (M/M) — `backend/migrations/` (dir named
+  `migrations/` to avoid shadowing the installed `alembic` package on `sys.path`)
+  with `alembic.ini` + an async `env.py` that pulls `DATABASE_URL` from app
+  settings. `0001_initial_schema` is the create-from-scratch baseline;
+  `0002_add_mixcloud_url` adds the new column via a SQLite-safe batch ALTER.
+  `create_all` stays for the zero-config first-run path; existing DBs adopt
+  Alembic by stamping the baseline (see `migrations/README.md`). Verified:
+  `alembic upgrade head` builds the schema and `--autogenerate` reports **no
+  drift** vs the ORM models. Tested (`test_migrations.py`).
+- **[DONE 07-13b] WebSocket live pipeline status** (M/M) — `app/routers/ws.py`
+  adds a `ConnectionManager` registered as an orchestrator event listener
+  (`on_event`), so every `pipeline_started`/`step_completed`/`upload_complete`/
+  `error`/`draft_ready` event is fanned out to clients on `GET /api/ws/status`.
+  Clients get a one-shot queue-count `snapshot` on connect. Dead sockets are
+  pruned on broadcast. Unit-tested (connect/broadcast/prune/event-shape).

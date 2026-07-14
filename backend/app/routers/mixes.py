@@ -64,6 +64,7 @@ class MixOut(BaseModel):
     thumbnail_path: Optional[str] = None
     soundcloud_url: Optional[str] = None
     youtube_url: Optional[str] = None
+    mixcloud_url: Optional[str] = None
     youtube_playlist_id: Optional[str] = None
     youtube_timestamp_offset: Optional[float] = 0.0
     pipeline_status: Optional[str] = None
@@ -200,7 +201,7 @@ async def create_mix(body: MixCreate, db: AsyncSession = Depends(get_db)):
     step_names = [
         "detect", "analyze", "generate_description", "generate_art",
         "upload_soundcloud", "upload_youtube", "verify_soundcloud",
-        "verify_youtube", "cross_link",
+        "verify_youtube", "upload_mixcloud", "verify_mixcloud", "cross_link",
     ]
     for name in step_names:
         db.add(PipelineStep(mix_id=mix.id, step_name=name, status="pending"))

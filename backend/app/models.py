@@ -43,6 +43,7 @@ class Mix(Base):
     thumbnail_path = Column(String)  # 16:9 YouTube thumbnail
     soundcloud_url = Column(String)
     youtube_url = Column(String)
+    mixcloud_url = Column(String)
     youtube_playlist_id = Column(String)
     youtube_timestamp_offset = Column(Float, default=0.0)  # seconds to add to FLAC timestamps for YT chapters
     pipeline_status = Column(String, default="pending")
