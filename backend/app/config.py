@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     FAL_API_KEY: str = ""
     FAL_MODEL: str = "fal-ai/flux-pro/v1.1"
 
+    # --- Track Recognition (fallback provider) ---
+    # AudD (https://audd.io) is a paid fingerprint API that is markedly more
+    # accurate than the unofficial Shazam client on layered/transitioning DJ
+    # audio. Leave blank to disable; when set, it is used ONLY as a fallback for
+    # segments Shazam fails to identify. Get a token at https://dashboard.audd.io
+    AUDD_API_TOKEN: str = ""
+
     # --- SoundCloud ---
     SOUNDCLOUD_CLIENT_ID: str = ""
     SOUNDCLOUD_CLIENT_SECRET: str = ""
@@ -101,7 +108,7 @@ class Settings(BaseSettings):
     # --- Pipeline ---
     DRAFT_MODE: bool = True
     FILE_STABLE_SECONDS: int = 120
-    AUDIO_SAMPLE_INTERVAL_SECONDS: int = 120  # sample every 2 minutes
+    AUDIO_SAMPLE_INTERVAL_SECONDS: int = 75  # sample every 75s (denser = better track recall)
     MAX_CONCURRENT_PIPELINES: int = 2
 
     @field_validator("NOTIFICATION_WEBHOOK_URLS", mode="before")

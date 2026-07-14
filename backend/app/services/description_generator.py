@@ -69,13 +69,11 @@ Write the description now. Plain text, no markdown.\
 """
 
 SOUNDCLOUD_LINK_INSTRUCTION = (
-    "At the bottom, include links to: YouTube, Twitch, Website, Shop. "
-    "Do NOT include a SoundCloud link (they are already on SoundCloud)."
+    "Do not include any links or a link list; they are appended automatically."
 )
 
 YOUTUBE_LINK_INSTRUCTION = (
-    "At the bottom, include links to: SoundCloud, Twitch, Website, Shop. "
-    "Do NOT include a YouTube link (they are already on YouTube). "
+    "Do not include any links or a link list; they are appended automatically. "
     "Format the tracklist as YouTube chapters with timestamps starting at 0:00."
 )
 
@@ -393,11 +391,30 @@ class DescriptionGenerator:
             r"--+\s*will\s+see|—\s*will\s+see)\b",
             re.IGNORECASE,
         )
+        # Drop stray social-link label lines. The model sometimes emits the
+        # brand link labels without URLs (e.g. a "YouTube / Twitch / Website /
+        # Shop" block) when it tries to satisfy an (old) link-list instruction
+        # under the no-URLs rule. These appear either as one label per line:
+        #     YouTube
+        #     Twitch
+        #     Website
+        #     Shop
+        # or several labels on a single line ("YouTube, Twitch, Website, Shop").
+        # A line that is ONLY one of these brand labels (optionally repeated,
+        # comma/space separated) is never legitimate description prose, so drop
+        # it. The real links are appended separately below.
+        bare_label_pattern = re.compile(
+            r"^\s*(?:youtube|twitch|website|shop|soundcloud)"
+            r"(?:\s*[,/|]?\s*(?:youtube|twitch|website|shop|soundcloud))*\s*$",
+            re.IGNORECASE,
+        )
         cleaned_lines = []
         for line in description.split("\n"):
             if url_line_pattern.match(line):
                 continue
             if link_intro_pattern.match(line):
+                continue
+            if bare_label_pattern.match(line):
                 continue
             cleaned_lines.append(line)
         description = "\n".join(cleaned_lines).rstrip()
