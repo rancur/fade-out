@@ -10,8 +10,69 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import AIUsage, BrandSettings
+from app.services.tracklist_utils import (
+    ID_LABEL,
+    build_youtube_chapters,
+    format_timestamp,
+    label_or_id,
+)
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Model-aware token pricing (USD per 1,000,000 tokens: input, output)
+# ---------------------------------------------------------------------------
+# Longest key wins on prefix match, so dated snapshots like
+# "gpt-4o-2024-08-06" resolve to the "gpt-4o" rate. Unknown models fall back to
+# the gpt-4o rate rather than silently recording $0.
+MODEL_PRICING = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4-turbo": (10.00, 30.00),
+    "o1-mini": (1.10, 4.40),
+    "o1": (15.00, 60.00),
+    "o3-mini": (1.10, 4.40),
+}
+_DEFAULT_PRICING = (2.50, 10.00)  # gpt-4o
+
+
+def price_for_model(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Estimate OpenAI cost (USD) for a model, honoring ``OPENAI_MODEL`` changes.
+
+    Falls back to the gpt-4o rate for unrecognized models. Matches dated model
+    snapshots by longest-prefix (e.g. ``gpt-4o-2024-08-06`` -> ``gpt-4o``).
+    """
+    key = (model or "").lower()
+    rates = MODEL_PRICING.get(key)
+    if rates is None:
+        for name in sorted(MODEL_PRICING, key=len, reverse=True):
+            if key.startswith(name):
+                rates = MODEL_PRICING[name]
+                break
+    if rates is None:
+        rates = _DEFAULT_PRICING
+    cost_in, cost_out = rates
+    return (input_tokens * cost_in + output_tokens * cost_out) / 1_000_000
+
+
+def _response_text(response: Any) -> str:
+    """Extract stripped text content from a chat completion, or '' if empty.
+
+    ``response.choices[0].message.content`` can be ``None`` (content filter or a
+    length cutoff), which would make a bare ``.strip()`` raise. This returns an
+    empty string in every degenerate case so callers can guard cleanly.
+    """
+    try:
+        choice = response.choices[0]
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    content = getattr(getattr(choice, "message", None), "content", None)
+    if not content:
+        return ""
+    return content.strip()
 
 # ---------------------------------------------------------------------------
 # Default prompt template
@@ -74,7 +135,15 @@ SOUNDCLOUD_LINK_INSTRUCTION = (
 
 YOUTUBE_LINK_INSTRUCTION = (
     "Do not include any links or a link list; they are appended automatically. "
-    "Format the tracklist as YouTube chapters with timestamps starting at 0:00."
+    "Do NOT write a tracklist or chapter list yourself -- a validated chapter "
+    "list with timestamps is appended automatically."
+)
+
+# Used when there are too few tracks for a valid chapter block (YouTube needs
+# >=3 chapters), so the model should still surface whatever tracklist exists.
+YOUTUBE_LINK_INSTRUCTION_TRACKLIST = (
+    "Do not include any links or a link list; they are appended automatically. "
+    "If a tracklist is provided, include it with timestamps starting at 0:00."
 )
 
 CREATIVE_TITLE_PROMPT = """\
@@ -133,6 +202,42 @@ class DescriptionGenerator:
         api_key = sj.get("openai_api_key") or settings.OPENAI_API_KEY
         self._client = openai.AsyncOpenAI(api_key=api_key)
         self._model = settings.OPENAI_MODEL
+
+    async def _create_completion(
+        self, prompt: str, max_tokens: int, temperature: float
+    ):
+        """Call the chat API, guarding against empty content with one retry.
+
+        Returns ``(response, text)``. Raises ``RuntimeError`` if the model still
+        returns no usable content after a single retry (e.g. a content filter or
+        a length cutoff that produced ``None`` content).
+        """
+        messages = [{"role": "user", "content": prompt}]
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        text = _response_text(response)
+        if not text:
+            logger.warning(
+                "OpenAI returned empty content (model=%s); retrying once",
+                self._model,
+            )
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            text = _response_text(response)
+            if not text:
+                raise RuntimeError(
+                    f"OpenAI returned no usable content for model "
+                    f"{self._model!r} after retry"
+                )
+        return response, text
 
     async def generate_soundcloud_description(
         self,
@@ -196,20 +301,30 @@ class DescriptionGenerator:
                 adjusted["timestamp_formatted"] = _seconds_to_timestamp(ts)
                 adjusted_tracklist.append(adjusted)
 
+        # Build a guaranteed-valid YouTube chapter block (first stamp 0:00, >=3
+        # chapters, >=10s apart). When we have enough tracks for real chapters,
+        # append them deterministically and keep the model from writing its own
+        # (unreliable) tracklist. Otherwise fall back to the model tracklist.
+        chapter_block = _format_chapter_block(adjusted_tracklist)
+
         return await self._generate_description(
             platform="YouTube",
-            platform_link_instruction=YOUTUBE_LINK_INSTRUCTION,
+            platform_link_instruction=(
+                YOUTUBE_LINK_INSTRUCTION if chapter_block
+                else YOUTUBE_LINK_INSTRUCTION_TRACKLIST
+            ),
             links=settings.YOUTUBE_LINKS,
             mix_title=mix_title,
             genres=genres,
             vibes=vibes,
-            tracklist=adjusted_tracklist,
+            tracklist=None if chapter_block else adjusted_tracklist,
             energy_profile=energy_profile,
             bpm_range=bpm_range,
             duration_seconds=duration_seconds,
             session=session,
             mix_id=mix_id,
             brand_settings=brand_settings,
+            appended_block=chapter_block,
         )
 
     async def generate_creative_title(
@@ -237,14 +352,11 @@ class DescriptionGenerator:
             tracklist_hint=tracklist_hint,
         )
 
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=80,
-            temperature=0.9,
+        response, text = await self._create_completion(
+            prompt, max_tokens=80, temperature=0.9,
         )
 
-        title = response.choices[0].message.content.strip().strip('"').strip("'")
+        title = text.strip('"').strip("'")
 
         # Enforce 60-char limit
         if len(title) > 60:
@@ -282,14 +394,11 @@ class DescriptionGenerator:
             duration=duration_str,
         )
 
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
-            temperature=0.8,
+        response, text = await self._create_completion(
+            prompt, max_tokens=100, temperature=0.8,
         )
 
-        title = response.choices[0].message.content.strip().strip('"').strip("'")
+        title = text.strip('"').strip("'")
 
         # Track usage
         if session and mix_id:
@@ -317,11 +426,12 @@ class DescriptionGenerator:
         session: Optional[AsyncSession],
         mix_id: Optional[str],
         brand_settings: Optional[BrandSettings],
+        appended_block: str = "",
     ) -> str:
         duration_str = _format_duration(duration_seconds)
         bpm_str = f"{bpm_range[0]:.0f}-{bpm_range[1]:.0f}" if bpm_range else "unknown"
 
-        # Build tracklist section
+        # Build tracklist section (unidentified tracks render as "ID - ID")
         tracklist_section = ""
         if tracklist:
             lines = ["Tracklist:"]
@@ -329,7 +439,9 @@ class DescriptionGenerator:
                 ts = t.get("timestamp_formatted") or _seconds_to_timestamp(
                     t.get("timestamp_seconds", 0)
                 )
-                lines.append(f"  {ts} {t.get('artist', 'Unknown')} - {t.get('title', 'Unknown')}")
+                artist = label_or_id(t.get("artist", ""))
+                title = label_or_id(t.get("title", ""))
+                lines.append(f"  {ts} {artist} - {title}")
             tracklist_section = "\n".join(lines)
 
         # Energy summary
@@ -367,14 +479,9 @@ class DescriptionGenerator:
             custom_template=custom_template,
         )
 
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2000,
-            temperature=0.7,
+        response, description = await self._create_completion(
+            prompt, max_tokens=2000, temperature=0.7,
         )
-
-        description = response.choices[0].message.content.strip()
 
         # Strip any lines that look like URLs, bracketed placeholder links,
         # or link introduction phrases ("Find us on:", "Explore more:", etc.)
@@ -419,6 +526,12 @@ class DescriptionGenerator:
             cleaned_lines.append(line)
         description = "\n".join(cleaned_lines).rstrip()
 
+        # Append a deterministic, validated chapter/tracklist block (YouTube),
+        # guaranteeing correct 0:00-anchored chapter formatting rather than
+        # trusting the model to reproduce timestamps.
+        if appended_block:
+            description = f"{description}\n\n{appended_block}"
+
         # Always append the real links
         if links:
             description += f"\n\n{links}"
@@ -443,10 +556,8 @@ class DescriptionGenerator:
         output_tokens: int,
     ) -> None:
         """Record AI token usage and estimated cost."""
-        # Rough pricing for gpt-4o (as of 2025)
-        cost_per_input_token = 2.50 / 1_000_000
-        cost_per_output_token = 10.00 / 1_000_000
-        cost = (input_tokens * cost_per_input_token) + (output_tokens * cost_per_output_token)
+        # Model-aware pricing so a changed OPENAI_MODEL is costed correctly.
+        cost = price_for_model(self._model, input_tokens, output_tokens)
 
         usage = AIUsage(
             mix_id=mix_id,
@@ -467,6 +578,32 @@ class DescriptionGenerator:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _format_chapter_block(tracklist: Optional[List[Dict[str, Any]]]) -> str:
+    """Render a validated YouTube chapter block, or '' if too few chapters.
+
+    Uses ``build_youtube_chapters`` to guarantee YouTube renders chapters (first
+    stamp 0:00, >=3 chapters, >=10s apart). Unidentified tracks render as
+    ``ID - ID``; the synthetic 0:00 "Intro" marker renders as just ``Intro``.
+    """
+    chapters = build_youtube_chapters(tracklist or [])
+    if not chapters:
+        return ""
+
+    lines = ["Tracklist:"]
+    for chapter in chapters:
+        ts = chapter.get("timestamp_formatted") or format_timestamp(
+            chapter.get("timestamp_seconds", 0)
+        )
+        title = label_or_id(chapter.get("title", ""))
+        raw_artist = str(chapter.get("artist", "")).strip()
+        if raw_artist:
+            lines.append(f"{ts} {label_or_id(raw_artist)} - {title}")
+        else:
+            # Marker rows (e.g. the synthetic Intro) have no artist.
+            lines.append(f"{ts} {title}")
+    return "\n".join(lines)
+
 
 def _format_duration(seconds: float) -> str:
     total = int(seconds)

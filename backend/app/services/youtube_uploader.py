@@ -318,6 +318,44 @@ class YouTubeUploader:
             return None
 
     # ------------------------------------------------------------------
+    # Description update (cross-linking)
+    # ------------------------------------------------------------------
+
+    async def update_description(
+        self, video_id: str, description: str, title: Optional[str] = None
+    ) -> bool:
+        """Replace a video's description via ``videos.update`` (best-effort).
+
+        ``videos.update`` replaces the whole ``snippet`` part, so the current
+        snippet is fetched first and only the description (and optionally title)
+        is changed -- otherwise categoryId/title would be wiped. Uses the
+        existing OAuth token (needs the youtube manage scope, already requested).
+        """
+        import asyncio
+        youtube = self._get_service()
+
+        resp = await asyncio.to_thread(
+            youtube.videos().list(part="snippet", id=video_id).execute
+        )
+        items = resp.get("items", [])
+        if not items:
+            raise RuntimeError(f"YouTube video {video_id} not found for update")
+
+        snippet = items[0]["snippet"]
+        snippet["description"] = description[:5000]
+        if title:
+            snippet["title"] = title[:100]
+
+        await asyncio.to_thread(
+            youtube.videos().update(
+                part="snippet",
+                body={"id": video_id, "snippet": snippet},
+            ).execute
+        )
+        logger.info("Updated YouTube description for video %s", video_id)
+        return True
+
+    # ------------------------------------------------------------------
     # Verification
     # ------------------------------------------------------------------
 
