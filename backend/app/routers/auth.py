@@ -19,6 +19,23 @@ logger = logging.getLogger("fadeout.auth")
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
+
+def _youtube_redirect_uri(request: Request) -> str:
+    """Build the YouTube/Google OAuth redirect URI.
+
+    Google rejects redirect URIs that are a raw private IP over http
+    (e.g. http://192.168.1.221:8500/...). To stay compliant we prefer the
+    configured PUBLIC_URL (an https domain, or http://localhost) and only
+    fall back to deriving the URI from the incoming request headers when
+    PUBLIC_URL is unset.
+    """
+    if settings.PUBLIC_URL:
+        base = settings.PUBLIC_URL.rstrip("/")
+        return f"{base}/api/auth/youtube/callback"
+    host = request.headers.get("host", "localhost:8500")
+    scheme = request.headers.get("x-forwarded-proto", "http")
+    return f"{scheme}://{host}/api/auth/youtube/callback"
+
 YOUTUBE_OAUTH_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
@@ -585,9 +602,7 @@ async def youtube_oauth_url(
     # For Web Application OAuth clients, the redirect URI must be registered in Google Console.
     # For Desktop Application clients, Google only allows http://localhost or http://127.0.0.1.
     if not redirect_uri:
-        host = request.headers.get("host", "localhost:8500")
-        scheme = request.headers.get("x-forwarded-proto", "http")
-        redirect_uri = f"{scheme}://{host}/api/auth/youtube/callback"
+        redirect_uri = _youtube_redirect_uri(request)
 
     params = {
         "client_id": yt_client_id,
@@ -624,9 +639,7 @@ async def youtube_callback(
         return RedirectResponse(url="/settings?auth=youtube&error=missing_client_credentials")
 
     # Must match the redirect_uri used in the auth URL
-    host = request.headers.get("host", "localhost:8500")
-    scheme = request.headers.get("x-forwarded-proto", "http")
-    callback_uri = f"{scheme}://{host}/api/auth/youtube/callback"
+    callback_uri = _youtube_redirect_uri(request)
 
     try:
         async with httpx.AsyncClient(timeout=15) as http_client:
