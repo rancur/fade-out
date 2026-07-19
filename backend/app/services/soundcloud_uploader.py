@@ -3,7 +3,8 @@
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 from playwright.async_api import BrowserContext, Page, async_playwright
@@ -23,14 +24,100 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-UPLOAD_TIMEOUT = 600  # 10 minutes for large FLAC files
+UPLOAD_TIMEOUT = 3600  # large uploads on home upstream need well over 10 min
+
+# api.soundcloud.com/tracks rejects large bodies with an empty 413 (observed
+# live at 2.9GB despite the web uploader's documented 4GB cap). Anything over
+# this gets transcoded to 320kbps MP3 first — SoundCloud re-encodes for
+# streaming anyway, and downloads are disabled.
+API_MAX_UPLOAD_BYTES = 450 * 1024 * 1024
+TRANSCODE_BITRATE = "320k"
+
+
+def format_bytes(n: float) -> str:
+    """Human-readable byte count, e.g. 1.2 GB / 340 MB / 12 KB."""
+    for unit, div in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
+        if n >= div:
+            value = n / div
+            return f"{value:.1f} {unit}" if value < 10 else f"{value:.0f} {unit}"
+    return f"{int(n)} B"
+
+
+def parse_ffmpeg_progress_line(line: str, duration_seconds: float) -> Optional[int]:
+    """Parse one line of ffmpeg ``-progress pipe:1`` output into a percent.
+
+    Returns the transcode percent (0-100) when the line carries
+    ``out_time_ms=`` (microseconds despite the name), else None.
+    """
+    line = line.strip()
+    if not line.startswith("out_time_ms=") or duration_seconds <= 0:
+        return None
+    try:
+        out_us = int(line.split("=", 1)[1])
+    except ValueError:
+        return None
+    if out_us < 0:
+        return None
+    return min(100, int(out_us / 1_000_000 / duration_seconds * 100))
+
+
+class CountingReader:
+    """File wrapper that counts bytes read and reports (bytes_sent, total).
+
+    Used to derive live upload progress: httpx streams the multipart body by
+    calling ``read()`` in chunks, so bytes read == bytes handed to the socket
+    buffer. ``on_bytes`` is a SYNC callable — the caller bridges to async.
+    Delegates everything else (fileno/seek/tell/...) to the underlying file so
+    httpx can still stat it for Content-Length.
+    """
+
+    def __init__(self, fileobj, total: int, on_bytes: Optional[Callable[[int, int], None]] = None):
+        self._f = fileobj
+        self._total = total
+        self._sent = 0
+        self._on_bytes = on_bytes
+
+    @property
+    def bytes_sent(self) -> int:
+        return self._sent
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._f.read(size)
+        if data:
+            self._sent += len(data)
+            if self._on_bytes:
+                try:
+                    self._on_bytes(self._sent, self._total)
+                except Exception:  # pragma: no cover - progress must never break IO
+                    pass
+        return data
+
+    def seek(self, offset: int, whence: int = 0):
+        result = self._f.seek(offset, whence)
+        if offset == 0 and whence == 0:
+            self._sent = 0  # httpx may rewind and re-send (e.g. on redirect)
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._f, name)
 
 
 class SoundCloudUploader:
     """Upload mixes to SoundCloud via API (preferred) or browser automation (fallback)."""
 
-    def __init__(self, db_settings_json: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        db_settings_json: Optional[Dict[str, Any]] = None,
+        on_tokens_refreshed: Optional[Any] = None,
+        mix_id: Optional[str] = None,
+    ) -> None:
+        # on_tokens_refreshed: async callback (access_token, refresh_token) invoked
+        # after a successful refresh/grant. SoundCloud ROTATES refresh tokens on
+        # every use, so the new pair must be persisted or the next refresh gets
+        # invalid_grant and the upload falls into the flaky browser path.
         sj = db_settings_json or {}
+        self._on_tokens_refreshed = on_tokens_refreshed
+        self._mix_id = mix_id  # for activity-log attribution (optional)
         self._client_id = sj.get("soundcloud_client_id") or settings.SOUNDCLOUD_CLIENT_ID
         self._client_secret = sj.get("soundcloud_client_secret") or settings.SOUNDCLOUD_CLIENT_SECRET
         self._access_token: Optional[str] = sj.get("soundcloud_access_token") or settings.SOUNDCLOUD_ACCESS_TOKEN
@@ -39,6 +126,17 @@ class SoundCloudUploader:
         self._password = settings.SOUNDCLOUD_PASSWORD
         self._playwright = None
         self._browser = None
+
+    async def _activity(self, level: str, event: str, message: str, **kwargs) -> None:
+        """Best-effort activity-log emit — never breaks an upload."""
+        try:
+            from app.services import activity_log
+
+            await activity_log.log(
+                level, event, message, mix_id=self._mix_id, platform="soundcloud", **kwargs
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("activity emit failed for %s", event, exc_info=True)
 
     # ------------------------------------------------------------------
     # OAuth Token Management
@@ -94,9 +192,35 @@ class SoundCloudUploader:
                 self._access_token = data["access_token"]
                 self._refresh_token = data.get("refresh_token", self._refresh_token)
                 logger.info("SoundCloud access token refreshed")
+                await self._persist_tokens()
                 return self._access_token
             logger.warning("Token refresh failed: %s", resp.text)
+            await self._activity(
+                "warn", "sc_token_refresh_failed",
+                f"SoundCloud token refresh failed ({resp.status_code})",
+            )
             return None
+
+    async def _persist_tokens(self) -> None:
+        """Persist rotated tokens via the callback (best-effort)."""
+        if not self._on_tokens_refreshed:
+            await self._activity(
+                "info", "sc_token_refreshed",
+                "SoundCloud access token refreshed (no persister attached)",
+            )
+            return
+        try:
+            await self._on_tokens_refreshed(self._access_token, self._refresh_token)
+            await self._activity(
+                "info", "sc_token_refreshed",
+                "SoundCloud access token refreshed and persisted (refresh token rotated)",
+            )
+        except Exception as exc:
+            logger.error("Failed to persist refreshed SoundCloud tokens: %s", exc)
+            await self._activity(
+                "error", "sc_token_persist_failed",
+                f"SoundCloud token refreshed but persisting the rotated pair failed: {exc}",
+            )
 
     async def _password_grant(self) -> Optional[str]:
         """Obtain access token via password grant (resource owner credentials)."""
@@ -116,6 +240,7 @@ class SoundCloudUploader:
                 self._access_token = data["access_token"]
                 self._refresh_token = data.get("refresh_token")
                 logger.info("SoundCloud access token obtained via password grant")
+                await self._persist_tokens()
                 return self._access_token
             logger.warning("Password grant failed: %s", resp.text)
             return None
@@ -132,8 +257,14 @@ class SoundCloudUploader:
         genre: str,
         tags: List[str],
         cover_art_path: Optional[str] = None,
+        progress_cb: Optional[Callable] = None,
     ) -> str:
-        """Upload a track to SoundCloud. Returns the track permalink URL."""
+        """Upload a track to SoundCloud. Returns the track permalink URL.
+
+        ``progress_cb`` is an optional ``async (percent, detail)`` callable —
+        it receives transcode progress ("transcoding 42%") and then upload
+        progress ("1.2 GB / 2.9 GB") while the multipart body streams out.
+        """
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
@@ -142,6 +273,7 @@ class SoundCloudUploader:
             try:
                 return await self._api_upload(
                     audio_path, title, description, genre, tags, cover_art_path,
+                    progress_cb=progress_cb,
                 )
             except Exception as exc:
                 logger.warning("API upload failed, falling back to browser: %s", exc)
@@ -159,9 +291,122 @@ class SoundCloudUploader:
         genre: str,
         tags: List[str],
         cover_art_path: Optional[str],
+        progress_cb: Optional[Callable] = None,
     ) -> str:
         """Upload via the official SoundCloud API."""
         token = await self._ensure_access_token()
+
+        transcoded: Optional[str] = None
+        if os.path.getsize(audio_path) > API_MAX_UPLOAD_BYTES:
+            transcoded = await self._transcode_for_api(audio_path, progress_cb=progress_cb)
+            audio_path = transcoded
+        try:
+            return await self._api_upload_inner(
+                audio_path, title, description, genre, tags, cover_art_path, token,
+                progress_cb=progress_cb,
+            )
+        finally:
+            if transcoded:
+                try:
+                    os.unlink(transcoded)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _source_duration_seconds(audio_path: str) -> float:
+        """Best-effort duration of the source file (for transcode percent)."""
+        try:
+            from mutagen import File as MutagenFile
+
+            mf = MutagenFile(audio_path)
+            if mf is not None and mf.info is not None:
+                return float(mf.info.length or 0.0)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return 0.0
+
+    async def _transcode_for_api(
+        self, audio_path: str, progress_cb: Optional[Callable] = None
+    ) -> str:
+        """Transcode an oversized master to 320kbps MP3 for the API upload.
+
+        Progress is parsed from ffmpeg ``-progress pipe:1`` output
+        (out_time vs source duration) and reported as "transcoding N%".
+        """
+        import tempfile
+
+        out = os.path.join(
+            tempfile.gettempdir(),
+            os.path.splitext(os.path.basename(audio_path))[0] + ".sc-upload.mp3",
+        )
+        source_size = os.path.getsize(audio_path)
+        logger.info(
+            "Audio too large for SoundCloud API (%.0f MB); transcoding to %s MP3",
+            source_size / 1048576, TRANSCODE_BITRATE,
+        )
+        await self._activity(
+            "info", "sc_transcode_started",
+            f"Transcoding {os.path.basename(audio_path)} "
+            f"({format_bytes(source_size)}) to {TRANSCODE_BITRATE} MP3 for the SoundCloud API",
+            filename=os.path.basename(audio_path),
+        )
+        duration = self._source_duration_seconds(audio_path)
+
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", audio_path,
+            "-codec:a", "libmp3lame", "-b:a", TRANSCODE_BITRATE,
+            "-map_metadata", "0", "-id3v2_version", "3",
+            "-nostats", "-progress", "pipe:1",
+            out,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        async def _drain_stderr() -> bytes:
+            return await proc.stderr.read()
+
+        stderr_task = asyncio.create_task(_drain_stderr())
+
+        # Stream ffmpeg's key=value progress lines as they arrive.
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            pct = parse_ffmpeg_progress_line(line.decode(errors="replace"), duration)
+            if pct is not None and progress_cb:
+                try:
+                    await progress_cb(pct, f"transcoding {pct}%")
+                except Exception:  # pragma: no cover - progress must never break IO
+                    pass
+
+        await proc.wait()
+        stderr = await stderr_task
+        if proc.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError(
+                f"ffmpeg transcode failed (rc={proc.returncode}): "
+                f"{(stderr or b'')[-400:].decode(errors='replace')}"
+            )
+        out_size = os.path.getsize(out)
+        logger.info("Transcoded to %s (%.0f MB)", out, out_size / 1048576)
+        await self._activity(
+            "info", "sc_transcode_finished",
+            f"Transcode finished: {format_bytes(source_size)} → {format_bytes(out_size)} MP3",
+            filename=os.path.basename(out),
+            context={"source_bytes": source_size, "output_bytes": out_size},
+        )
+        return out
+
+    async def _api_upload_inner(
+        self,
+        audio_path: str,
+        title: str,
+        description: str,
+        genre: str,
+        tags: List[str],
+        cover_art_path: Optional[str],
+        token: str,
+        progress_cb: Optional[Callable] = None,
+    ) -> str:
 
         # Format tags: space-separated, multi-word tags in quotes
         formatted_tags = []
@@ -172,19 +417,40 @@ class SoundCloudUploader:
                 formatted_tags.append(tag)
         tag_list = " ".join(formatted_tags)
 
-        # Build multipart upload
+        # Build multipart upload (oversized masters were already transcoded)
         file_size = os.path.getsize(audio_path)
-        if file_size > 500 * 1024 * 1024:  # 500MB API limit
-            raise ValueError(f"File too large for API upload ({file_size / 1024 / 1024:.0f}MB > 500MB)")
 
         logger.info("Uploading to SoundCloud API: '%s' (%d MB)", title, file_size // (1024 * 1024))
+
+        # Wrap the audio file in a counting reader so bytes-on-the-wire drive
+        # live progress ("1.2 GB / 2.9 GB"). The reader's callback is sync;
+        # bridge to the async progress_cb via a fire-and-forget task, locally
+        # throttled to ~1/s (the orchestrator throttles again downstream).
+        audio_file: Any = open(audio_path, "rb")
+        if progress_cb is not None:
+            loop = asyncio.get_running_loop()
+            throttle = {"last": 0.0}
+
+            def _on_bytes(sent: int, total: int) -> None:
+                now = time.monotonic()
+                if sent < total and (now - throttle["last"]) < 1.0:
+                    return
+                throttle["last"] = now
+                pct = int(sent * 100 / total) if total else None
+                detail = f"{format_bytes(sent)} / {format_bytes(total)}"
+                try:
+                    loop.create_task(progress_cb(pct, detail))
+                except Exception:  # pragma: no cover - progress must never break IO
+                    pass
+
+            audio_file = CountingReader(audio_file, file_size, _on_bytes)
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(UPLOAD_TIMEOUT, connect=30)) as client:
             # Prepare multipart files and data
             files: Dict[str, Any] = {
                 "track[asset_data]": (
                     os.path.basename(audio_path),
-                    open(audio_path, "rb"),
+                    audio_file,
                     "audio/flac" if audio_path.endswith(".flac") else "audio/mpeg",
                 ),
             }
@@ -509,6 +775,11 @@ class SoundCloudUploader:
                 )
 
         logger.info("Updated SoundCloud description for track %s (%s)", track_id, track_url)
+        await self._activity(
+            "info", "description_updated",
+            f"SoundCloud description updated: {track_url}",
+            context={"track_id": track_id},
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -548,6 +819,107 @@ class SoundCloudUploader:
 
         logger.warning("SoundCloud verification failed for %s", track_url)
         return False
+
+    # ==================================================================
+    # Catalog listing / editing APIs (Stage C — back-catalog management)
+    # ==================================================================
+    # Additive section: enumerate the authed user's full track list and push
+    # targeted edits to already-published tracks. Raw API resources are
+    # returned as-is; normalization lives in services/catalog_sync.py.
+
+    async def list_all_tracks(self) -> List[Dict[str, Any]]:
+        """Return every track owned by the authed user (raw track resources).
+
+        GET /me/tracks with linked_partitioning=1&limit=200, following
+        ``next_href`` until exhausted.
+        """
+        token = await self._ensure_access_token()
+        tracks: List[Dict[str, Any]] = []
+        url: Optional[str] = f"{SOUNDCLOUD_API_BASE}/me/tracks"
+        params: Optional[Dict[str, Any]] = {"linked_partitioning": 1, "limit": 200}
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            while url:
+                resp = await client.get(
+                    url,
+                    params=params,
+                    headers={
+                        "Authorization": f"OAuth {token}",
+                        "Accept": "application/json",
+                    },
+                )
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"SoundCloud track listing failed ({resp.status_code}): {resp.text}"
+                    )
+                data = resp.json()
+                if isinstance(data, dict):
+                    tracks.extend(data.get("collection", []))
+                    url = data.get("next_href")
+                else:  # non-partitioned plain-list response
+                    tracks.extend(data)
+                    url = None
+                params = None  # next_href already carries the query string
+        return tracks
+
+    async def update_track_fields(
+        self,
+        track_id: str,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        artwork_path: Optional[str] = None,
+    ) -> None:
+        """Update only the given fields via ``PUT /tracks/:id``.
+
+        Tags are formatted the same way as at upload time (space-separated,
+        multi-word tags quoted). Artwork goes up as ``track[artwork_data]``
+        multipart. Raises on any failure — the apply worker records the error.
+        """
+        token = await self._ensure_access_token()
+
+        data: Dict[str, Any] = {}
+        if title is not None:
+            data["track[title]"] = title
+        if description is not None:
+            data["track[description]"] = description
+        if tags is not None:
+            formatted = [f'"{t}"' if " " in t else t for t in tags[:30]]
+            data["track[tag_list]"] = " ".join(formatted)
+
+        files: Dict[str, Any] = {}
+        if artwork_path:
+            if not os.path.exists(artwork_path):
+                raise FileNotFoundError(f"Artwork not found: {artwork_path}")
+            files["track[artwork_data]"] = (
+                os.path.basename(artwork_path),
+                open(artwork_path, "rb"),
+                "image/jpeg" if artwork_path.endswith(".jpg") else "image/png",
+            )
+
+        if not data and not files:
+            return
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.put(
+                    f"{SOUNDCLOUD_API_BASE}/tracks/{track_id}",
+                    headers={
+                        "Authorization": f"OAuth {token}",
+                        "Accept": "application/json",
+                    },
+                    data=data,
+                    files=files or None,
+                )
+                if resp.status_code not in (200, 201):
+                    raise RuntimeError(
+                        f"SoundCloud track update failed ({resp.status_code}): {resp.text}"
+                    )
+        finally:
+            for _, val in files.items():
+                if hasattr(val[1], "close"):
+                    val[1].close()
+        logger.info("Updated SoundCloud track %s fields: %s", track_id, sorted(data))
 
     # ------------------------------------------------------------------
     # Cleanup

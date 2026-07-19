@@ -47,6 +47,14 @@ export default function MixCard({ mix }: { mix: Mix }) {
         <div className="absolute top-3 right-3">
           <StatusBadge status={mix.pipeline_status} />
         </div>
+        {/* Imported chip (back-catalog rows have no pipeline) */}
+        {mix.source === 'imported' && (
+          <div className="absolute top-3 left-3">
+            <span className="text-[10px] px-2 py-0.5 rounded-full font-mono uppercase tracking-wider text-accent border border-accent/40 bg-accent/10">
+              imported
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Content */}

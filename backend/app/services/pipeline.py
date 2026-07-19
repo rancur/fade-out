@@ -1,13 +1,15 @@
 """Pipeline orchestrator -- state-machine that drives each mix through all steps."""
 
 import asyncio
+import inspect
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -44,6 +46,13 @@ class StepStatus(str, Enum):
     SKIPPED = "skipped"
     WAITING = "waiting"
     PAUSED = "paused"
+    INTERRUPTED = "interrupted"  # was "running" when the app restarted
+
+
+# report_progress throttles: WS emit at most once per second per (mix, step);
+# the DB row (the recovery path) is written at most every 5 seconds.
+PROGRESS_EMIT_INTERVAL = 1.0
+PROGRESS_DB_INTERVAL = 5.0
 
 
 StepHandler = Callable[[str, AsyncSession], Coroutine[Any, Any, Optional[dict]]]
@@ -60,6 +69,10 @@ class PipelineOrchestrator:
         self._event_listeners: List[Callable] = []
         self._semaphore = asyncio.Semaphore(self._max_concurrent)
         self._video_poll_tasks: Dict[str, asyncio.Task] = {}
+        # Live progress throttle state per (mix_id, step_name)
+        self._progress_last_emit: Dict[Tuple[str, str], float] = {}
+        self._progress_last_db: Dict[Tuple[str, str], float] = {}
+        self._progress_last_percent: Dict[Tuple[str, str], int] = {}
 
     # ------------------------------------------------------------------
     # Registration
@@ -81,13 +94,142 @@ class PipelineOrchestrator:
     # ------------------------------------------------------------------
 
     async def _emit(self, event_type: str, mix_id: str, data: Optional[dict] = None) -> None:
+        data = data or {}
+        await self._activity_from_event(event_type, mix_id, data)
         for listener in self._event_listeners:
             try:
-                result = listener(event_type, mix_id, data or {})
+                result = listener(event_type, mix_id, data)
                 if asyncio.iscoroutine(result):
                     await result
             except Exception:
                 logger.exception("Event listener error for %s", event_type)
+
+    async def _activity_from_event(
+        self, event_type: str, mix_id: str, data: dict
+    ) -> None:
+        """Mirror an orchestrator event into the persistent activity log."""
+        try:
+            from app.services import activity_log
+
+            stage = data.get("step")
+            if event_type == "pipeline_started":
+                await activity_log.info("pipeline_started", "Pipeline started", mix_id=mix_id)
+            elif event_type == "step_completed":
+                elapsed = data.get("elapsed_seconds")
+                msg = f"Step {stage} completed"
+                if elapsed is not None:
+                    msg += f" in {elapsed:.1f}s"
+                await activity_log.info("step_completed", msg, mix_id=mix_id, stage=stage)
+            elif event_type == "draft_ready":
+                await activity_log.info(
+                    "draft_paused",
+                    "DRAFT_MODE: pipeline paused for review before any upload",
+                    mix_id=mix_id,
+                )
+            elif event_type == "upload_complete":
+                await activity_log.info(
+                    "upload_complete", "Pipeline completed — all uploads done", mix_id=mix_id
+                )
+            elif event_type == "error":
+                await activity_log.error(
+                    "pipeline_error",
+                    f"Pipeline error at step {stage}: {data.get('error', 'failed')}",
+                    mix_id=mix_id,
+                    stage=stage,
+                    context={"retryable": True, **{k: v for k, v in data.items() if k != "step"}},
+                )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("activity mirror failed for %s", event_type, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Live step progress
+    # ------------------------------------------------------------------
+
+    async def report_progress(
+        self,
+        mix_id: str,
+        step_name: str,
+        percent: Optional[int],
+        detail: Optional[str] = None,
+    ) -> None:
+        """Report live progress for a running step. Never raises.
+
+        Throttled per (mix_id, step): the ``step_progress`` WS event is
+        emitted at most once per second (a terminal 100% always goes out),
+        and the PipelineStep DB row is updated at most every 5 seconds. The
+        WS stream is the live path; the DB row is the recovery path.
+        Crossing a 25/50/75/100% milestone also writes an activity entry so
+        the feed alone can explain a long upload.
+        """
+        try:
+            key = (mix_id, step_name)
+            now = time.monotonic()
+            pct = None
+            if percent is not None:
+                pct = max(0, min(100, int(percent)))
+
+            # Milestone activity entries (25/50/75/100), checked before the
+            # emit throttle so a crossing is never silently swallowed.
+            if pct is not None:
+                last_pct = self._progress_last_percent.get(key, -1)
+                if pct // 25 > last_pct // 25 and pct >= 25:
+                    milestone = (pct // 25) * 25
+                    try:
+                        from app.services import activity_log
+
+                        msg = f"Step {step_name} {milestone}%"
+                        if detail:
+                            msg += f" ({detail})"
+                        await activity_log.info(
+                            "progress_milestone", msg, mix_id=mix_id, stage=step_name,
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                self._progress_last_percent[key] = pct
+
+            # WS emit throttle: >=1/sec, but a terminal 100% always emits.
+            last_emit = self._progress_last_emit.get(key, 0.0)
+            is_final = pct is not None and pct >= 100
+            if (now - last_emit) >= PROGRESS_EMIT_INTERVAL or is_final:
+                self._progress_last_emit[key] = now
+                await self._emit("step_progress", mix_id, {
+                    "step": step_name, "progress": pct, "detail": detail,
+                })
+
+            # DB write throttle: at most every 5s (own short session).
+            last_db = self._progress_last_db.get(key, 0.0)
+            if (now - last_db) >= PROGRESS_DB_INTERVAL or is_final:
+                self._progress_last_db[key] = now
+                try:
+                    async with async_session_factory() as session:
+                        await session.execute(
+                            update(PipelineStep)
+                            .where(
+                                PipelineStep.mix_id == mix_id,
+                                PipelineStep.step_name == step_name,
+                            )
+                            .values(progress=pct, progress_detail=detail)
+                        )
+                        await session.commit()
+                except Exception:
+                    logger.debug(
+                        "progress DB update failed for %s/%s", mix_id, step_name,
+                        exc_info=True,
+                    )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("report_progress failed for %s/%s", mix_id, step_name, exc_info=True)
+
+    def _clear_progress_state(self, mix_id: str, step_name: str) -> None:
+        key = (mix_id, step_name)
+        self._progress_last_emit.pop(key, None)
+        self._progress_last_db.pop(key, None)
+        self._progress_last_percent.pop(key, None)
+
+    def _make_progress_cb(self, mix_id: str, step_name: str) -> Callable:
+        async def progress_cb(percent: Optional[int], detail: Optional[str] = None) -> None:
+            await self.report_progress(mix_id, step_name, percent, detail)
+
+        return progress_cb
 
     # ------------------------------------------------------------------
     # Pause / Resume
@@ -246,12 +388,29 @@ class PipelineOrchestrator:
                 "Executing step %s for mix %s (attempt %d/%d)",
                 step_name, mix_id, attempt, MAX_RETRIES,
             )
+            try:
+                from app.services import activity_log
+
+                await activity_log.info(
+                    "step_started",
+                    f"Step {step_name} started"
+                    + (f" (retry {attempt}/{MAX_RETRIES})" if attempt > 1 else ""),
+                    mix_id=mix_id,
+                    stage=step_name,
+                    context={"attempt": attempt},
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
             started_at = datetime.now(timezone.utc)
             await self._set_mix_status(mix_id, "running", step_name)
+            await self._record_step(
+                mix_id, step_name, StepStatus.RUNNING,
+                started_at=started_at, retry_count=attempt - 1,
+            )
 
             try:
                 async with async_session_factory() as session:
-                    output = await handler(mix_id, session)
+                    output = await self._call_handler(handler, mix_id, session, step_name)
                     await session.commit()
 
                 elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
@@ -259,6 +418,7 @@ class PipelineOrchestrator:
                     mix_id, step_name, StepStatus.COMPLETED,
                     started_at=started_at, output=output, retry_count=attempt - 1,
                 )
+                self._clear_progress_state(mix_id, step_name)
                 await self._emit("step_completed", mix_id, {
                     "step": step_name, "elapsed_seconds": elapsed,
                 })
@@ -291,6 +451,19 @@ class PipelineOrchestrator:
                 if attempt < MAX_RETRIES:
                     backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
                     logger.info("Retrying step %s in %ds", step_name, backoff)
+                    try:
+                        from app.services import activity_log
+
+                        await activity_log.warn(
+                            "step_retry",
+                            f"Step {step_name} failed (attempt {attempt}/{MAX_RETRIES}): "
+                            f"{exc}. Retrying in {backoff}s.",
+                            mix_id=mix_id,
+                            stage=step_name,
+                            context={"attempt": attempt, "backoff_seconds": backoff},
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        pass
                     await asyncio.sleep(backoff)
                 else:
                     await self._record_step(
@@ -304,6 +477,29 @@ class PipelineOrchestrator:
                     return False
 
         return False
+
+    async def _call_handler(
+        self, handler: StepHandler, mix_id: str, session: AsyncSession, step_name: str
+    ) -> Optional[dict]:
+        """Invoke a handler, passing a progress callback when it accepts one.
+
+        Handlers opt in by accepting a ``progress_cb`` keyword (or ``**kwargs``);
+        untouched two-argument handlers keep working unchanged.
+        """
+        accepts_progress = False
+        try:
+            params = inspect.signature(handler).parameters
+            accepts_progress = "progress_cb" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (TypeError, ValueError):  # pragma: no cover - exotic callables
+            accepts_progress = False
+
+        if accepts_progress:
+            return await handler(
+                mix_id, session, progress_cb=self._make_progress_cb(mix_id, step_name)
+            )
+        return await handler(mix_id, session)
 
     async def _wait_for_video(self, mix_id: str, max_checks: int = 48) -> bool:
         """Poll for video file availability (default: check every 5min up to 4 hours)."""
@@ -331,20 +527,54 @@ class PipelineOrchestrator:
         error: Optional[str] = None,
         retry_count: int = 0,
     ) -> None:
+        """Upsert the (mix_id, step_name) step row — one row per step per mix.
+
+        Historically each recording inserted a NEW row, so mixes accumulated
+        an initial set of eternally-"pending" rows plus one row per attempt
+        (18 rows for a 9-step pipeline, observed in production). The latest
+        attempt now wins in place.
+        """
+        completed_at = datetime.now(timezone.utc) if status in (
+            StepStatus.COMPLETED, StepStatus.FAILED, StepStatus.SKIPPED
+        ) else None
+
         async with async_session_factory() as session:
-            step = PipelineStep(
-                mix_id=mix_id,
-                step_name=step_name,
-                status=status.value,
-                started_at=started_at or datetime.now(timezone.utc),
-                completed_at=datetime.now(timezone.utc) if status in (
-                    StepStatus.COMPLETED, StepStatus.FAILED, StepStatus.SKIPPED
-                ) else None,
-                output_json=output,
-                error=error,
-                retry_count=retry_count,
-            )
-            session.add(step)
+            existing = (
+                await session.execute(
+                    select(PipelineStep)
+                    .where(
+                        PipelineStep.mix_id == mix_id,
+                        PipelineStep.step_name == step_name,
+                    )
+                    .order_by(PipelineStep.id.desc())
+                )
+            ).scalars().first()
+
+            if existing is not None:
+                existing.status = status.value
+                existing.started_at = started_at or existing.started_at or datetime.now(timezone.utc)
+                existing.completed_at = completed_at
+                existing.output_json = output
+                existing.error = error
+                existing.retry_count = retry_count
+                if status is StepStatus.COMPLETED:
+                    existing.progress = 100
+                    existing.progress_detail = None
+                elif status is StepStatus.RUNNING and retry_count == 0:
+                    existing.progress = None
+                    existing.progress_detail = None
+            else:
+                session.add(PipelineStep(
+                    mix_id=mix_id,
+                    step_name=step_name,
+                    status=status.value,
+                    started_at=started_at or datetime.now(timezone.utc),
+                    completed_at=completed_at,
+                    output_json=output,
+                    error=error,
+                    retry_count=retry_count,
+                    progress=100 if status is StepStatus.COMPLETED else None,
+                ))
             await session.commit()
 
     async def _set_mix_status(
@@ -390,6 +620,62 @@ class PipelineOrchestrator:
     @property
     def active_mix_ids(self) -> list[str]:
         return list(self._running_pipelines.keys())
+
+
+async def sweep_interrupted_at_boot() -> dict:
+    """Mark orphaned in-flight work as interrupted after a restart.
+
+    At boot no orchestrator tasks exist, so any PipelineStep still "running"
+    and any Mix still pipeline_status "running" was cut off mid-flight by the
+    previous shutdown. Steps become "interrupted"; mixes become "failed" with
+    pipeline_error "interrupted by restart" so the retry endpoints can pick
+    them back up.
+    """
+    swept = {"steps": 0, "mixes": 0}
+    try:
+        async with async_session_factory() as session:
+            steps = (
+                await session.execute(
+                    select(PipelineStep).where(PipelineStep.status == StepStatus.RUNNING.value)
+                )
+            ).scalars().all()
+            for step in steps:
+                step.status = StepStatus.INTERRUPTED.value
+                step.progress_detail = None
+            swept["steps"] = len(steps)
+
+            mixes = (
+                await session.execute(
+                    select(Mix).where(Mix.pipeline_status == "running")
+                )
+            ).scalars().all()
+            for mix in mixes:
+                mix.pipeline_status = "failed"
+                mix.pipeline_error = "interrupted by restart"
+            swept["mixes"] = len(mixes)
+
+            await session.commit()
+
+        if swept["steps"] or swept["mixes"]:
+            logger.warning(
+                "Startup sweep: %d running step(s) marked interrupted, "
+                "%d running mix(es) marked failed (interrupted by restart)",
+                swept["steps"], swept["mixes"],
+            )
+            try:
+                from app.services import activity_log
+
+                await activity_log.warn(
+                    "interrupted_sweep",
+                    f"Startup sweep: {swept['steps']} in-flight step(s) marked interrupted, "
+                    f"{swept['mixes']} running mix(es) marked failed after restart",
+                    context=swept,
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Startup interrupted-sweep failed")
+    return swept
 
 
 class _VideoNotReady(Exception):

@@ -34,9 +34,12 @@ def test_revision_chain_is_linear():
     rev_ids = {r.revision for r in revs}
     assert "0001_initial_schema" in rev_ids
     assert "0002_add_mixcloud_url" in rev_ids
+    assert "0003_add_activity_events" in rev_ids
+    assert "0004_step_progress_and_dedupe" in rev_ids
+    assert "0005_add_catalog_and_proposals" in rev_ids
 
     heads = script.get_heads()
-    assert heads == ["0002_add_mixcloud_url"]
+    assert heads == ["0005_add_catalog_and_proposals"]
 
     base = script.get_base()
     assert base == "0001_initial_schema"
@@ -46,7 +49,8 @@ def test_upgrade_head_builds_schema_with_mixcloud_url():
     from alembic import command
     from sqlalchemy import create_engine, inspect
 
-    tmp = os.path.join(tempfile.gettempdir(), "fadeout_migration_test.db")
+    # PID-suffixed so concurrent pytest runs never share a migration scratch DB.
+    tmp = os.path.join(tempfile.gettempdir(), f"fadeout_migration_test_{os.getpid()}.db")
     if os.path.exists(tmp):
         os.remove(tmp)
 
@@ -62,7 +66,138 @@ def test_upgrade_head_builds_schema_with_mixcloud_url():
 
         mix_cols = {c["name"] for c in insp.get_columns("mixes")}
         assert "mixcloud_url" in mix_cols  # added by 0002
+
+        step_cols = {c["name"] for c in insp.get_columns("pipeline_steps")}
+        assert {"progress", "progress_detail"}.issubset(step_cols)  # added by 0004
+
+        # added by 0005
+        assert {"source", "youtube_video_id", "soundcloud_track_id", "title_locked"}.issubset(mix_cols)
+        assert "mix_proposals" in tables
+        proposal_cols = {c["name"] for c in insp.get_columns("mix_proposals")}
+        assert {
+            "id", "mix_id", "platform", "field", "current_value", "proposed_value",
+            "status", "created_by", "error", "created_at", "updated_at", "applied_at",
+        }.issubset(proposal_cols)
         sync_engine.dispose()
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def test_0005_backfills_platform_ids_from_urls():
+    """Rows that predate 0005 get youtube_video_id/soundcloud_track_id parsed
+    from their stored URLs during the upgrade."""
+    from alembic import command
+    from sqlalchemy import create_engine, text
+
+    tmp = os.path.join(tempfile.gettempdir(), f"fadeout_migration_backfill_test_{os.getpid()}.db")
+    if os.path.exists(tmp):
+        os.remove(tmp)
+
+    url = f"sqlite+aiosqlite:///{tmp}"
+    cfg = _config(db_url=url)
+    try:
+        command.upgrade(cfg, "0003_add_activity_events")
+
+        sync_engine = create_engine(f"sqlite:///{tmp}")
+        with sync_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO mixes (id, title, youtube_url, soundcloud_url) VALUES "
+                    "('m1', 'Both URLs', 'https://www.youtube.com/watch?v=abc123DEF45', "
+                    " 'https://api.soundcloud.com/tracks/987654321'), "
+                    "('m2', 'Short YT + permalink SC', 'https://youtu.be/xyz789ABC12', "
+                    " 'https://soundcloud.com/thewillsee/some-mix'), "
+                    "('m3', 'No URLs', NULL, NULL)"
+                )
+            )
+
+        command.upgrade(cfg, "head")
+
+        with sync_engine.connect() as conn:
+            rows = {
+                r[0]: (r[1], r[2], r[3], r[4])
+                for r in conn.execute(
+                    text(
+                        "SELECT id, youtube_video_id, soundcloud_track_id, source, title_locked "
+                        "FROM mixes"
+                    )
+                )
+            }
+        assert rows["m1"][0] == "abc123DEF45"
+        assert rows["m1"][1] == "987654321"
+        assert rows["m2"][0] == "xyz789ABC12"
+        assert rows["m2"][1] is None  # permalink carries no numeric id
+        assert rows["m3"][0] is None and rows["m3"][1] is None
+        # server defaults applied to pre-existing rows
+        assert all(v[2] == "pipeline" for v in rows.values())
+        assert all(not v[3] for v in rows.values())
+        sync_engine.dispose()
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def test_migration_0004_dedupes_duplicate_step_rows():
+    """0004 keeps, per (mix_id, step_name), the row with the most recent
+    non-null started_at (highest id as tiebreak) and deletes the rest —
+    cleaning up the production duplicate-rows bug (initial pending rows +
+    one row per orchestrator attempt)."""
+    import sqlite3
+
+    from alembic import command
+
+    # PID-suffixed so concurrent pytest runs never share a migration scratch DB.
+    tmp = os.path.join(tempfile.gettempdir(), f"fadeout_migration_dedupe_test_{os.getpid()}.db")
+    if os.path.exists(tmp):
+        os.remove(tmp)
+
+    url = f"sqlite+aiosqlite:///{tmp}"
+    cfg = _config(db_url=url)
+    try:
+        command.upgrade(cfg, "0003_add_activity_events")
+
+        conn = sqlite3.connect(tmp)
+        conn.executemany(
+            "INSERT INTO pipeline_steps (mix_id, step_name, status, started_at, retry_count)"
+            " VALUES (?, ?, ?, ?, 0)",
+            [
+                # analyze: eternally-pending initial row + two real attempts
+                ("m1", "analyze", "pending", None),
+                ("m1", "analyze", "failed", "2026-07-17 09:00:00"),
+                ("m1", "analyze", "completed", "2026-07-18 10:00:00"),
+                # detect: pending row + one attempt
+                ("m1", "detect", "pending", None),
+                ("m1", "detect", "completed", "2026-07-18 09:55:00"),
+                # upload: two pending rows, no attempt yet (highest id wins)
+                ("m1", "upload_soundcloud", "pending", None),
+                ("m1", "upload_soundcloud", "pending", None),
+                # other mix untouched
+                ("m2", "analyze", "completed", "2026-07-16 12:00:00"),
+            ],
+        )
+        conn.commit()
+        keeper_upload_id = conn.execute(
+            "SELECT MAX(id) FROM pipeline_steps"
+            " WHERE mix_id='m1' AND step_name='upload_soundcloud'"
+        ).fetchone()[0]
+        conn.close()
+
+        command.upgrade(cfg, "head")
+
+        conn = sqlite3.connect(tmp)
+        rows = conn.execute(
+            "SELECT mix_id, step_name, status, id FROM pipeline_steps"
+            " ORDER BY mix_id, step_name"
+        ).fetchall()
+        conn.close()
+
+        by_key = {(r[0], r[1]): r for r in rows}
+        assert len(rows) == 4  # one per (mix_id, step_name)
+        assert by_key[("m1", "analyze")][2] == "completed"  # latest started_at wins
+        assert by_key[("m1", "detect")][2] == "completed"
+        assert by_key[("m1", "upload_soundcloud")][3] == keeper_upload_id
+        assert by_key[("m2", "analyze")][2] == "completed"
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)

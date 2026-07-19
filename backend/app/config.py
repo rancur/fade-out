@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     # --- File Watching ---
     WATCH_AUDIO_PATH: str = "/watch/audio"
     WATCH_VIDEO_PATH: str = "/watch/video"
+    # When False (default) the watcher ignores files already present at startup
+    # and only ingests files created/modified while it is running. The watch
+    # folders permanently hold a large back-catalog (existing sets + every raw
+    # Twitch recording); sweeping them on every start would stampede the
+    # pipeline and re-hash hundreds of GB. Set True only for an empty/dedicated
+    # inbox folder where re-scanning offline arrivals is actually wanted.
+    WATCH_INGEST_EXISTING_ON_START: bool = False
     OUTPUT_THUMBNAILS_PATH: str = "/output/thumbnails"
     OUTPUT_COVER_ART_PATH: str = "/output/cover-art"
     DJCTL_CUE_PATH: str = "/watch/djctl-cue"
@@ -56,6 +63,10 @@ class Settings(BaseSettings):
     YOUTUBE_REFRESH_TOKEN: str = ""  # OAuth refresh token (required for uploads)
     YOUTUBE_CHANNEL_ID: str = ""
     YOUTUBE_DEFAULT_PLAYLIST_PREFIX: str = "Will See"
+    # Daily YouTube Data API quota budget reserved for catalog apply writes.
+    # Each write (videos.update / thumbnails.set / playlistItems.*) costs ~50
+    # units; the true daily cap is 10k, so 8k leaves headroom for uploads.
+    YOUTUBE_DAILY_QUOTA_BUDGET: int = 8000
 
     # --- Mixcloud ---
     # Mixcloud is an optional third publishing target that mirrors the
@@ -83,6 +94,13 @@ class Settings(BaseSettings):
     NOTIFICATION_EMAIL_SMTP_PASSWORD: str = ""
     NOTIFICATION_EMAIL_TO: str = ""
     NOTIFICATION_WEBHOOK_URLS: str = ""  # comma-separated
+
+    # --- Activity log retention ---
+    # A nightly task prunes activity_events older than the retention window or
+    # beyond the row cap (whichever bites first), keeping the feed queryable
+    # without letting the table grow without bound.
+    ACTIVITY_RETENTION_DAYS: int = 90
+    ACTIVITY_MAX_ROWS: int = 50_000
 
     # --- Auto-Upgrade ---
     GITHUB_REPO: str = "rancur/fade-out"
@@ -121,10 +139,12 @@ class Settings(BaseSettings):
     # --- Cross-linking ---
     # When True, the cross_link step pushes reciprocal links to the LIVE
     # platform descriptions (YouTube videos.update + SoundCloud PUT /tracks/:id)
-    # using the existing OAuth tokens -- no new credentials required. Left OFF by
-    # default so a published description is never mutated without an explicit
-    # opt-in; the code path is fully implemented and gated on this flag.
-    CROSS_LINK_PUSH_ENABLED: bool = False
+    # using the existing OAuth tokens -- no new credentials required. ON by
+    # default: with it off the cross-links only ever landed in the DB and the
+    # published descriptions never carried them (observed live). Every push is
+    # best-effort and can never fail the pipeline's final step; set to False to
+    # opt out of mutating published descriptions.
+    CROSS_LINK_PUSH_ENABLED: bool = True
 
     # --- Track-detection merge ---
     # Gap-filling detections (Shazam/AudD) scoring strictly below this confidence
@@ -140,6 +160,33 @@ class Settings(BaseSettings):
     FILE_STABLE_SECONDS: int = 120
     AUDIO_SAMPLE_INTERVAL_SECONDS: int = 75  # sample every 75s (denser = better track recall)
     MAX_CONCURRENT_PIPELINES: int = 2
+
+    # --- Partial-file safety ---
+    # A file is only ingested once its size has stopped changing (see
+    # FILE_STABLE_SECONDS) AND it clears this floor. The floor rejects the
+    # 0-byte / stray-file class outright: a real recorded set is always well
+    # over a megabyte, so anything smaller is a half-written or junk drop.
+    MIN_FILE_SIZE_BYTES: int = 1_048_576  # 1 MB
+    # Number of consecutive size-stable polls required before ingest. Combined
+    # with the time window this guards against a slow SMB copy that briefly
+    # pauses mid-write from being mistaken for a finished file.
+    STABILITY_CONFIRMATIONS: int = 2
+
+    # --- Out-of-order pairing ---
+    # A lone audio-only or video-only drop waits in a PENDING state for its
+    # date-matched sibling this long before the coordinator gives up waiting.
+    # Video for a 3-hour set can take far longer to copy over SMB than the
+    # audio, so this defaults generous. On expiry an audio-only drop still runs
+    # (SoundCloud-only is a valid outcome); a video-only drop is logged as
+    # unpaired/expired and never run (audio is mandatory).
+    PAIRING_WAIT_SECONDS: int = 7200  # 2 hours
+    PAIRING_SWEEP_INTERVAL_SECONDS: int = 30
+
+    # --- Disk safety ---
+    # Ingest is refused (and surfaced in the activity log + health endpoint)
+    # when free space on the output volume drops below this, so a multi-GB set
+    # never half-processes into a full disk.
+    MIN_FREE_DISK_GB: float = 5.0
 
     @field_validator("NOTIFICATION_WEBHOOK_URLS", mode="before")
     @classmethod

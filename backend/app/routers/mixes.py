@@ -41,6 +41,8 @@ class PipelineStepOut(BaseModel):
     error: Optional[str] = None
     retry_count: int = 0
     output_json: Optional[dict] = None
+    progress: Optional[int] = None
+    progress_detail: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -49,6 +51,10 @@ class PipelineStepOut(BaseModel):
 class MixOut(BaseModel):
     id: str
     title: str
+    source: Optional[str] = "pipeline"
+    youtube_video_id: Optional[str] = None
+    soundcloud_track_id: Optional[str] = None
+    title_locked: Optional[bool] = False
     audio_file_path: Optional[str] = None
     video_file_path: Optional[str] = None
     duration_seconds: Optional[float] = None
@@ -277,15 +283,15 @@ async def retry_mix(mix_id: str, db: AsyncSession = Depends(get_db)):
     mix = result.scalar_one_or_none()
     if not mix:
         raise HTTPException(status_code=404, detail="Mix not found")
-    if mix.pipeline_status != "failed":
+    if mix.pipeline_status not in ("failed", "interrupted"):
         raise HTTPException(
             status_code=400,
             detail=f"Mix is not in failed status (current: {mix.pipeline_status})",
         )
 
-    # Find the failed step and reset it
+    # Find the failed/interrupted step(s) and reset them
     for step in mix.steps:
-        if step.status == "failed":
+        if step.status in ("failed", "interrupted"):
             step.status = "pending"
             step.error = None
             step.retry_count += 1
@@ -325,15 +331,58 @@ async def retry_step(mix_id: str, step_name: str, db: AsyncSession = Depends(get
     target_step.error = None
     target_step.retry_count += 1
 
-    if mix.pipeline_status == "failed":
+    if mix.pipeline_status in ("failed", "interrupted"):
         mix.pipeline_status = "pending"
         mix.pipeline_error = None
 
     await db.flush()
     await db.refresh(mix)
+    out = MixOut.model_validate(mix)
 
-    # Retry the specific step and continue from there
+    # Commit BEFORE the orchestrator runs: _execute_step writes from its own
+    # session, and this request's open write txn would self-deadlock sqlite
+    # (30s busy-wait, then "database is locked"). Run the step in the
+    # background — a multi-GB upload cannot live inside an HTTP request.
+    await db.commit()
+
+    import asyncio
+
     orch = _get_orchestrator()
-    await orch.retry_step(mix.id, step_name)
+    asyncio.create_task(orch.retry_step(mix.id, step_name))
 
+    return out
+
+
+@router.post("/{mix_id}/reread-tracklist", response_model=MixOut, status_code=202)
+async def reread_tracklist(mix_id: str, db: AsyncSession = Depends(get_db)):
+    """Re-detect the tracklist and patch YT/SC descriptions in place.
+
+    Runs analyze + generate_description again, then updates the platform
+    descriptions via their APIs — no re-upload. Analysis takes minutes, so
+    the work runs in the background.
+    """
+    result = await db.execute(select(Mix).where(Mix.id == mix_id))
+    mix = result.scalar_one_or_none()
+    if not mix:
+        raise HTTPException(status_code=404, detail="Mix not found")
+    if not mix.audio_file_path or not os.path.exists(mix.audio_file_path):
+        raise HTTPException(status_code=400, detail="Audio file missing")
+
+    import asyncio
+    import logging
+
+    from app.database import async_session_factory
+    from app.services.handlers import handle_reread_tracklist
+
+    async def _run() -> None:
+        try:
+            async with async_session_factory() as session:
+                await handle_reread_tracklist(mix_id, session)
+                await session.commit()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "reread-tracklist failed for %s", mix_id
+            )
+
+    asyncio.create_task(_run())
     return MixOut.model_validate(mix)
