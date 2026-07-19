@@ -71,22 +71,39 @@ _RE_TRACK = re.compile(r'^\s*TRACK\s+(\d+)\s+AUDIO', re.MULTILINE)
 _RE_INDEX = re.compile(r'^\s*INDEX\s+01\s+(\d+):(\d+):(\d+)', re.MULTILINE)
 
 
-def parse_cue_file(cue_path: str) -> List[CueTrack]:
-    """Parse a standard CUE sheet and return a list of tracks."""
+def parse_cue_sessions(cue_path: str) -> List[List[CueTrack]]:
+    """Parse a CUE sheet into recording sessions.
+
+    DJCTL appends a fresh PERFORMER/TITLE/FILE header block each time the
+    recorder restarts (e.g. after a crash), so one .cue file can hold several
+    sessions whose track timestamps each restart at 00:00. Treating them as
+    one flat list produces timestamps that rewind mid-list — sessions must be
+    kept separate and the caller picks the one that fits the audio.
+    """
     with open(cue_path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
 
+    sessions: List[List[CueTrack]] = []
     tracks: List[CueTrack] = []
-
-    # Split by TRACK directives to parse each block
-    # We'll use a different approach: iterate line-by-line tracking state
     current_track_num: Optional[int] = None
     current_title: Optional[str] = None
     current_performer: Optional[str] = None
     global_performer: Optional[str] = None
 
+    def _close_session() -> None:
+        nonlocal tracks
+        if tracks:
+            sessions.append(tracks)
+            tracks = []
+
     for line in content.splitlines():
         line_stripped = line.strip()
+
+        # A FILE directive after collected tracks = recorder restarted
+        if line_stripped.upper().startswith("FILE") and tracks:
+            _close_session()
+            current_track_num = None
+            continue
 
         # Global performer (before any TRACK)
         pm = _RE_PERFORMER.match(line_stripped)
@@ -121,26 +138,98 @@ def parse_cue_file(cue_path: str) -> List[CueTrack]:
                 mm = int(im.group(1))
                 ss = int(im.group(2))
                 ff = int(im.group(3))
-                tracks.append(CueTrack(
+                track = CueTrack(
                     number=current_track_num,
                     title=current_title or f"Track {current_track_num}",
                     artist=current_performer or global_performer or ID_LABEL,
                     index_mm=mm,
                     index_ss=ss,
                     index_ff=ff,
-                ))
+                )
+                # Timestamp rewind without a FILE header = session restart too
+                if tracks and track.timestamp_seconds < tracks[-1].timestamp_seconds:
+                    _close_session()
+                tracks.append(track)
                 current_track_num = None
                 continue
 
+    _close_session()
+    logger.info(
+        "Parsed %d session(s) (%s tracks) from CUE file %s",
+        len(sessions), "/".join(str(len(s)) for s in sessions) or "0", cue_path,
+    )
+    return sessions
+
+
+def parse_cue_file(cue_path: str) -> List[CueTrack]:
+    """Parse a standard CUE sheet and return a flat list of tracks.
+
+    Backward-compatible wrapper around :func:`parse_cue_sessions` — callers
+    that know the mix duration should prefer :func:`select_cue_tracks`.
+    """
+    tracks = [t for session in parse_cue_sessions(cue_path) for t in session]
     logger.info("Parsed %d tracks from CUE file %s", len(tracks), cue_path)
     return tracks
 
 
-def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> Optional[str]:
-    """Find a CUE sheet matching an audio file by date proximity.
+def select_cue_tracks(
+    cue_path: str,
+    duration_seconds: Optional[float],
+    min_coverage: float = 0.5,
+    slack_seconds: float = 90.0,
+) -> Optional[List[CueTrack]]:
+    """Pick the CUE session that actually matches the recorded audio.
 
-    CUE filenames contain date like djctl-2025-12-05.cue.
-    Audio files are matched by their modification date.
+    A session is valid when its timestamps fit inside [0, duration+slack] and
+    its span covers at least ``min_coverage`` of the mix — otherwise a CUE
+    from an unrelated (e.g. much shorter) session would inject a bogus
+    tracklist. Returns None when no session qualifies; the caller should then
+    fall back to fingerprint-only detection.
+    """
+    sessions = parse_cue_sessions(cue_path)
+    if not sessions:
+        return None
+    if not duration_seconds or duration_seconds <= 0:
+        # No duration to validate against — use the longest session
+        return max(sessions, key=lambda s: s[-1].timestamp_seconds if s else 0.0)
+
+    best: Optional[List[CueTrack]] = None
+    for session in sessions:
+        if not session:
+            continue
+        span = session[-1].timestamp_seconds
+        if span > duration_seconds + slack_seconds:
+            logger.info(
+                "CUE session rejected (%d tracks): span %.0fs exceeds mix duration %.0fs",
+                len(session), span, duration_seconds,
+            )
+            continue
+        if span < duration_seconds * min_coverage:
+            logger.info(
+                "CUE session rejected (%d tracks): span %.0fs covers <%d%% of %.0fs mix",
+                len(session), span, int(min_coverage * 100), duration_seconds,
+            )
+            continue
+        if best is None or span > best[-1].timestamp_seconds:
+            best = session
+
+    if best:
+        logger.info(
+            "Selected CUE session with %d tracks (span %.0fs) from %s",
+            len(best), best[-1].timestamp_seconds, cue_path,
+        )
+    return best
+
+
+def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> Optional[str]:
+    """Find a CUE sheet whose filename date matches the audio's recording date.
+
+    The recording date comes from the audio FILENAME (e.g.
+    will-see-...-2026-07-15.flac). File mtime is NOT a recording date — it
+    shifts whenever a mix is copied or re-encoded, which used to match a CUE
+    from whatever set was played most recently and inject a bogus tracklist.
+    mtime is only consulted when the filename carries no date at all, and even
+    then only an exact same-day CUE is accepted.
     """
     cue_dir = cue_directory or settings.DJCTL_CUE_PATH
     if not os.path.isdir(cue_dir):
@@ -149,10 +238,6 @@ def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> 
 
     date_pattern = re.compile(r'(\d{4}-\d{2}-\d{2})')
 
-    # Prefer a date embedded in the audio FILENAME over the file mtime. mtime
-    # shifts when a mix is copied, re-encoded, or moved between hosts, which
-    # silently breaks the (much more accurate) CUE-based tracklist and forces
-    # the Shazam fallback. The recording date in the name is stable.
     audio_date = None
     fname_match = date_pattern.search(os.path.basename(audio_path))
     if fname_match:
@@ -163,11 +248,13 @@ def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> 
     if audio_date is None:
         audio_mtime = os.path.getmtime(audio_path)
         audio_date = datetime.fromtimestamp(audio_mtime).date()
+        logger.warning(
+            "Audio filename has no date, falling back to mtime date %s for %s "
+            "(unreliable — consider dating the filename)",
+            audio_date, audio_path,
+        )
 
-    best_match: Optional[str] = None
-    best_delta: int = 999
-
-    for fname in os.listdir(cue_dir):
+    for fname in sorted(os.listdir(cue_dir)):
         if not fname.lower().endswith(".cue"):
             continue
         m = date_pattern.search(fname)
@@ -177,19 +264,12 @@ def find_cue_for_audio(audio_path: str, cue_directory: Optional[str] = None) -> 
             cue_date = datetime.strptime(m.group(1), "%Y-%m-%d").date()
         except ValueError:
             continue
+        if cue_date == audio_date:
+            match = os.path.join(cue_dir, fname)
+            logger.info("Matched CUE %s to audio %s (exact date)", match, audio_path)
+            return match
 
-        delta = abs((audio_date - cue_date).days)
-        if delta < best_delta:
-            best_delta = delta
-            best_match = os.path.join(cue_dir, fname)
-
-    # Allow up to 2 days of slack: a set recorded past midnight, or a CUE
-    # exported the morning after, should still match its recording.
-    if best_match and best_delta <= 2:
-        logger.info("Matched CUE %s to audio %s (delta=%d days)", best_match, audio_path, best_delta)
-        return best_match
-
-    logger.debug("No CUE match found for %s (best delta=%d)", audio_path, best_delta)
+    logger.info("No same-date CUE found for %s (date %s)", audio_path, audio_date)
     return None
 
 
