@@ -48,7 +48,8 @@ def test_upgrade_head_builds_schema_with_mixcloud_url():
     from alembic import command
     from sqlalchemy import create_engine, inspect
 
-    tmp = os.path.join(tempfile.gettempdir(), "fadeout_migration_test.db")
+    # PID-suffixed so concurrent pytest runs never share a migration scratch DB.
+    tmp = os.path.join(tempfile.gettempdir(), f"fadeout_migration_test_{os.getpid()}.db")
     if os.path.exists(tmp):
         os.remove(tmp)
 
@@ -82,7 +83,8 @@ def test_migration_0004_dedupes_duplicate_step_rows():
 
     from alembic import command
 
-    tmp = os.path.join(tempfile.gettempdir(), "fadeout_migration_dedupe_test.db")
+    # PID-suffixed so concurrent pytest runs never share a migration scratch DB.
+    tmp = os.path.join(tempfile.gettempdir(), f"fadeout_migration_dedupe_test_{os.getpid()}.db")
     if os.path.exists(tmp):
         os.remove(tmp)
 
