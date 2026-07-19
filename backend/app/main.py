@@ -124,10 +124,12 @@ async def lifespan(app: FastAPI):
     await notifier.stop()
 
 
+APP_VERSION = "2.0.0"
+
 app = FastAPI(
     title="Fade-Out",
     description="DJ mix upload automation tool",
-    version="0.1.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -159,7 +161,7 @@ app.include_router(ws.router)
 @app.get("/api/health")
 async def health_check():
     """Return service health status."""
-    return {"status": "ok", "version": "0.1.0"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 # --- Static Files & SPA Fallback ---
