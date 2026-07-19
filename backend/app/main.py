@@ -124,7 +124,7 @@ async def lifespan(app: FastAPI):
     await notifier.stop()
 
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 app = FastAPI(
     title="Fade-Out",
