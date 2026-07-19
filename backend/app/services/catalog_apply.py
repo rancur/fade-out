@@ -3,10 +3,15 @@
 Consumes ``approved`` :class:`MixProposal` rows sequentially (oldest first) and
 pushes each to the platform APIs:
 
-* YouTube — ``videos.update`` (snippet fetched first, only the target field
+* YouTube — ``videos.update`` (snippet fetched first, only the target fields
   mutated; title<=100 / description<=5000), ``thumbnails.set`` for thumbnail
   proposals (proposed_value is a file path), ``playlistItems`` insert/delete
-  for playlist membership changes.
+  for playlist membership changes. All snippet-mutating proposals
+  (title/description/tags) for the same video are batched into ONE
+  ``videos.update`` call: the API's read-modify-write is eventually
+  consistent, so sequential per-field updates can fetch a stale snippet and
+  silently revert the previous write (observed live 2026-07-19 — 28 of ~62
+  field updates reverted).
 * SoundCloud — ``PUT /tracks/:id`` with ``track[title]`` /
   ``track[description]`` / ``track[tag_list]``, artwork via
   ``track[artwork_data]`` multipart.
@@ -38,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 YT_WRITE_COST = 50
 QUOTA_KEY = "catalog_yt_quota"
+
+# Fields that live in the YouTube video snippet and are written via the
+# read-modify-write ``videos.update`` flow. These MUST be batched per video.
+YT_SNIPPET_FIELDS = ("title", "description", "tags")
 
 
 # Factory hooks (monkeypatchable in tests).
@@ -78,6 +87,76 @@ def _yt_cost(proposal: MixProposal) -> int:
         ops = len(value.get("add", []) or []) + len(value.get("remove", []) or [])
         return YT_WRITE_COST * max(ops, 1)
     return YT_WRITE_COST
+
+
+def _group_apply_units(
+    proposals: List[MixProposal],
+) -> List[tuple[str, List[MixProposal]]]:
+    """Group approved proposals into apply units.
+
+    Returns ``("yt_snippet", [proposals...])`` units — every YouTube
+    snippet-mutating proposal (title/description/tags) for the same mix,
+    applied via a SINGLE ``videos.update`` call — and ``("single", [p])``
+    units for everything else (thumbnail, playlist, SoundCloud-only), which
+    keep the existing one-proposal-at-a-time path. Unit order follows the
+    first constituent proposal, so overall ordering stays oldest-first.
+    """
+    units: List[tuple[str, List[MixProposal]]] = []
+    snippet_units: Dict[str, List[MixProposal]] = {}
+    for proposal in proposals:
+        if (
+            proposal.field in YT_SNIPPET_FIELDS
+            and "youtube" in _proposal_platforms(proposal)
+        ):
+            unit = snippet_units.get(proposal.mix_id)
+            if unit is None:
+                unit = []
+                snippet_units[proposal.mix_id] = unit
+                units.append(("yt_snippet", unit))
+            unit.append(proposal)
+        else:
+            units.append(("single", [proposal]))
+    return units
+
+
+def _unit_yt_cost(kind: str, unit: List[MixProposal]) -> int:
+    """YouTube quota units one apply unit will consume."""
+    if kind == "yt_snippet":
+        return YT_WRITE_COST  # one videos.update for the whole unit
+    return _yt_cost(unit[0])
+
+
+async def _apply_yt_snippet_batch(
+    uploader: YouTubeUploader, unit: List[MixProposal], mix: Mix
+) -> None:
+    """Apply all snippet-field proposals for one video in ONE videos.update.
+
+    YouTube's update flow is read-modify-write over an eventually consistent
+    API: a second sequential call can fetch a pre-first-update snippet and
+    silently revert the first write. Batching every snippet field into a
+    single call removes the second read entirely.
+    """
+    if not mix.youtube_video_id:
+        raise RuntimeError("Mix has no youtube_video_id")
+
+    fields: Dict[str, Any] = {}
+    for proposal in unit:
+        if proposal.field == "title":
+            fields["title"] = proposal.proposed_value
+        elif proposal.field == "description":
+            fields["description"] = proposal.proposed_value
+        elif proposal.field == "tags":
+            fields["tags"] = _decode_structured(proposal.proposed_value) or []
+
+    await uploader.update_video_fields(mix.youtube_video_id, **fields)
+
+    for proposal in unit:
+        if proposal.field == "title":
+            mix.title_youtube = proposal.proposed_value
+        elif proposal.field == "description":
+            mix.description_youtube = proposal.proposed_value
+        elif proposal.field == "tags":
+            mix.tags = fields["tags"]
 
 
 async def _apply_to_youtube(
@@ -167,6 +246,18 @@ async def run_apply() -> Dict[str, Any]:
         yt_uploader: Optional[YouTubeUploader] = None
         sc_uploader: Optional[SoundCloudUploader] = None
 
+        def _yt() -> YouTubeUploader:
+            nonlocal yt_uploader
+            if yt_uploader is None:
+                yt_uploader = get_youtube_uploader(sj)
+            return yt_uploader
+
+        def _sc() -> SoundCloudUploader:
+            nonlocal sc_uploader
+            if sc_uploader is None:
+                sc_uploader = get_soundcloud_uploader(sj, _persist_sc_tokens)
+            return sc_uploader
+
         result = await session.execute(
             select(MixProposal)
             .where(MixProposal.status == "approved")
@@ -174,8 +265,8 @@ async def run_apply() -> Dict[str, Any]:
         )
         proposals = list(result.scalars().all())
 
-        for proposal in proposals:
-            cost = _yt_cost(proposal)
+        for kind, unit in _group_apply_units(proposals):
+            cost = _unit_yt_cost(kind, unit)
             if cost and used + cost > budget:
                 remaining = [p for p in proposals if p.status == "approved"]
                 summary["paused"] = True
@@ -191,50 +282,79 @@ async def run_apply() -> Dict[str, Any]:
                 break
 
             mix = (
-                await session.execute(select(Mix).where(Mix.id == proposal.mix_id))
+                await session.execute(select(Mix).where(Mix.id == unit[0].mix_id))
             ).scalar_one_or_none()
             if mix is None:
-                proposal.status = "failed"
-                proposal.error = "Mix no longer exists"
-                summary["failed"] += 1
+                for proposal in unit:
+                    proposal.status = "failed"
+                    proposal.error = "Mix no longer exists"
+                    summary["failed"] += 1
                 await session.commit()
                 continue
 
-            proposal.status = "applying"
+            for proposal in unit:
+                proposal.status = "applying"
             await session.commit()
 
             # A YouTube write consumes quota whether or not it succeeds.
             used += cost
-            try:
-                for platform in _proposal_platforms(proposal):
-                    if platform == "youtube":
-                        if yt_uploader is None:
-                            yt_uploader = get_youtube_uploader(sj)
-                        await _apply_to_youtube(yt_uploader, proposal, mix)
-                    else:
-                        if sc_uploader is None:
-                            sc_uploader = get_soundcloud_uploader(
-                                sj, _persist_sc_tokens
-                            )
-                        await _apply_to_soundcloud(sc_uploader, proposal, mix)
-                proposal.status = "applied"
-                proposal.applied_at = datetime.now(timezone.utc)
-                proposal.error = None
-                summary["applied"] += 1
-            except Exception as exc:
-                logger.exception(
-                    "Failed to apply proposal %s (%s/%s)",
-                    proposal.id, proposal.platform, proposal.field,
-                )
-                proposal.status = "failed"
-                proposal.error = str(exc)[:2000]
-                summary["failed"] += 1
-                await activity_log.error(
-                    "catalog_apply",
-                    f"Proposal {proposal.field} for mix {proposal.mix_id} failed: {exc}",
-                    mix_id=proposal.mix_id,
-                    platform=proposal.platform,
-                )
+
+            if kind == "yt_snippet":
+                # ONE videos.update for every snippet field of this video —
+                # sequential calls raced YouTube's eventual consistency and
+                # silently reverted earlier writes. The unit succeeds or fails
+                # as a whole for its YouTube side.
+                try:
+                    await _apply_yt_snippet_batch(_yt(), unit, mix)
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to apply batched snippet proposals %s for mix %s",
+                        [p.field for p in unit], unit[0].mix_id,
+                    )
+                    for proposal in unit:
+                        proposal.status = "failed"
+                        proposal.error = str(exc)[:2000]
+                        summary["failed"] += 1
+                    await activity_log.error(
+                        "catalog_apply",
+                        (
+                            f"Batched YouTube update "
+                            f"({', '.join(p.field for p in unit)}) for mix "
+                            f"{unit[0].mix_id} failed: {exc}"
+                        ),
+                        mix_id=unit[0].mix_id,
+                        platform="youtube",
+                    )
+                    await session.commit()
+                    continue
+
+            for proposal in unit:
+                try:
+                    for platform in _proposal_platforms(proposal):
+                        if platform == "youtube":
+                            if kind == "yt_snippet":
+                                continue  # applied in the batched call above
+                            await _apply_to_youtube(_yt(), proposal, mix)
+                        else:
+                            await _apply_to_soundcloud(_sc(), proposal, mix)
+                    proposal.status = "applied"
+                    proposal.applied_at = datetime.now(timezone.utc)
+                    proposal.error = None
+                    summary["applied"] += 1
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to apply proposal %s (%s/%s)",
+                        proposal.id, proposal.platform, proposal.field,
+                    )
+                    proposal.status = "failed"
+                    proposal.error = str(exc)[:2000]
+                    summary["failed"] += 1
+                    await activity_log.error(
+                        "catalog_apply",
+                        f"Proposal {proposal.field} for mix {proposal.mix_id} failed: {exc}",
+                        mix_id=proposal.mix_id,
+                        platform=proposal.platform,
+                    )
             await session.commit()
 
         # Persist quota usage.
