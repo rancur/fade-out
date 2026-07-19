@@ -4,6 +4,7 @@ import clsx from 'clsx'
 import { useLiveEvents, useWsConnected } from '../api/hooks'
 import {
   LayoutDashboard,
+  Library,
   Music2,
   Palette,
   Settings,
@@ -19,6 +20,7 @@ import {
 const nav = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/mixes', icon: Music2, label: 'Mixes' },
+  { to: '/catalog', icon: Library, label: 'Catalog' },
   { to: '/activity', icon: Activity, label: 'Activity' },
   { to: '/brand', icon: Palette, label: 'Brand' },
   { to: '/settings', icon: Settings, label: 'Settings' },
