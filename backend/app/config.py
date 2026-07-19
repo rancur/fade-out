@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     YOUTUBE_REFRESH_TOKEN: str = ""  # OAuth refresh token (required for uploads)
     YOUTUBE_CHANNEL_ID: str = ""
     YOUTUBE_DEFAULT_PLAYLIST_PREFIX: str = "Will See"
+    # Daily YouTube Data API quota budget reserved for catalog apply writes.
+    # Each write (videos.update / thumbnails.set / playlistItems.*) costs ~50
+    # units; the true daily cap is 10k, so 8k leaves headroom for uploads.
+    YOUTUBE_DAILY_QUOTA_BUDGET: int = 8000
 
     # --- Mixcloud ---
     # Mixcloud is an optional third publishing target that mirrors the
