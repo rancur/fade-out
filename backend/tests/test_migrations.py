@@ -34,9 +34,10 @@ def test_revision_chain_is_linear():
     rev_ids = {r.revision for r in revs}
     assert "0001_initial_schema" in rev_ids
     assert "0002_add_mixcloud_url" in rev_ids
+    assert "0003_add_activity_events" in rev_ids
 
     heads = script.get_heads()
-    assert heads == ["0002_add_mixcloud_url"]
+    assert heads == ["0003_add_activity_events"]
 
     base = script.get_base()
     assert base == "0001_initial_schema"

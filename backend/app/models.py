@@ -1,5 +1,6 @@
 """SQLAlchemy ORM models for Fade-Out."""
 
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -122,6 +123,30 @@ class Notification(Base):
     created_at = Column(DateTime, default=func.now())
 
     mix = relationship("Mix", back_populates="notifications")
+
+
+class ActivityEvent(Base):
+    """Persistent, append-only running log of pipeline + system events.
+
+    Every meaningful thing the app does (a file detected or skipped, a mix
+    created, each pipeline stage starting/finishing, upload attempts and their
+    result per platform, auth/connect events, and every error) is written here
+    so the history survives restarts and can be surfaced live in the UI sidebar
+    and via GET /api/activity.
+    """
+
+    __tablename__ = "activity_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    level = Column(String, default="info", index=True)  # info, warn, error
+    event = Column(String, index=True)  # short machine key, e.g. file_detected
+    message = Column(Text)  # short human-readable message
+    mix_id = Column(String, ForeignKey("mixes.id", ondelete="SET NULL"), nullable=True, index=True)
+    filename = Column(String, nullable=True)
+    platform = Column(String, nullable=True)  # soundcloud, youtube, mixcloud
+    stage = Column(String, nullable=True)  # pipeline step name
+    context = Column(JSON, nullable=True)  # arbitrary structured detail
 
 
 class AppSettings(Base):
