@@ -94,6 +94,29 @@ def _title_from_filename(audio_path: str) -> str:
     return stem.strip().title()
 
 
+def _ensure_tracklist_section(sc_desc: str, tracklist: list) -> str:
+    """Guarantee the SoundCloud description carries a "Tracklist:" section.
+
+    The LLM sometimes weaves track names into prose and skips the actual
+    tracklist section entirely (observed live). The tracklist is the product —
+    guarantee it, inserted before the brand-links block when present.
+    """
+    if not tracklist or "Tracklist:" in sc_desc:
+        return sc_desc
+    lines = "\n".join(
+        f"{t.get('timestamp_formatted', '?')} {t.get('artist', '?')} - {t.get('title', '?')}"
+        for t in tracklist
+    )
+    block = f"Tracklist:\n{lines}"
+    marker = "\nTwitch: https://"
+    if marker in sc_desc:
+        sc_desc = sc_desc.replace(marker, f"\n{block}\n{marker}", 1)
+    else:
+        sc_desc = f"{sc_desc}\n\n{block}"
+    logger.info("Appended missing tracklist section to SoundCloud description")
+    return sc_desc
+
+
 async def _detect_video_offset(
     video_path: str, flac_tracklist: list, analyzer
 ) -> float:
@@ -355,6 +378,10 @@ async def handle_generate_description(
         vibes=vibes,
         tracklist=tracklist,
     )
+
+    # The LLM sometimes weaves track names into prose and skips the actual
+    # tracklist section. The tracklist is the product — guarantee it.
+    sc_desc = _ensure_tracklist_section(sc_desc, tracklist)
 
     mix.description_soundcloud = sc_desc
     mix.description_youtube = yt_desc
@@ -752,9 +779,10 @@ async def handle_cross_link(
             ", ".join(updated),
         )
 
-    # 2. Optionally push the updated descriptions to the LIVE platforms. Gated
-    # behind CROSS_LINK_PUSH_ENABLED so a published description is never mutated
-    # without an explicit opt-in. Each push is best-effort: a failure is logged
+    # 2. Push the updated descriptions to the LIVE platforms (on by default;
+    # CROSS_LINK_PUSH_ENABLED=false opts out). Without the push the
+    # cross-links only ever landed in the DB and the published descriptions
+    # never carried them. Each push is best-effort: a failure is logged loudly
     # but never fails the pipeline's final step. Uses existing OAuth tokens.
     if settings.CROSS_LINK_PUSH_ENABLED:
         app_settings = await _get_app_settings(session)
@@ -769,7 +797,7 @@ async def handle_cross_link(
                 await yt_uploader.update_description(video_id, mix.description_youtube)
                 pushed.append("youtube")
             except Exception as exc:
-                logger.warning("Cross-link YouTube push failed for mix %s: %s", mix_id, exc)
+                logger.error("Cross-link YouTube push failed for mix %s: %s", mix_id, exc)
 
         if mix.description_soundcloud:
             try:
@@ -782,7 +810,7 @@ async def handle_cross_link(
                 await sc_uploader.update_description(sc_url, mix.description_soundcloud)
                 pushed.append("soundcloud")
             except Exception as exc:
-                logger.warning("Cross-link SoundCloud push failed for mix %s: %s", mix_id, exc)
+                logger.error("Cross-link SoundCloud push failed for mix %s: %s", mix_id, exc)
 
         if mc_url and mix.description_soundcloud:
             try:
@@ -792,7 +820,7 @@ async def handle_cross_link(
                 await mc_uploader.update_description(mc_url, mix.description_soundcloud)
                 pushed.append("mixcloud")
             except Exception as exc:
-                logger.warning("Cross-link Mixcloud push failed for mix %s: %s", mix_id, exc)
+                logger.error("Cross-link Mixcloud push failed for mix %s: %s", mix_id, exc)
 
         if pushed:
             logger.info("Cross-link pushed to live platforms for mix %s: %s", mix_id, ", ".join(pushed))
@@ -834,9 +862,21 @@ async def handle_reread_tracklist(mix_id: str, session: AsyncSession) -> Optiona
     analyze_result = await handle_analyze(mix_id, session)
     await handle_generate_description(mix_id, session)
 
-    # Keep the already-published titles stable
+    # Keep the already-published titles stable — including inside the
+    # regenerated description prose, which references the transient
+    # creative title the generator just invented.
+    transient_title = mix.title
     if prev_title and prev_title != "Untitled":
         mix.title = prev_title
+        if transient_title and transient_title != prev_title:
+            if mix.description_soundcloud:
+                mix.description_soundcloud = mix.description_soundcloud.replace(
+                    transient_title, prev_title
+                )
+            if mix.description_youtube:
+                mix.description_youtube = mix.description_youtube.replace(
+                    transient_title, prev_title
+                )
     if prev_yt_title:
         mix.title_youtube = prev_yt_title
 
