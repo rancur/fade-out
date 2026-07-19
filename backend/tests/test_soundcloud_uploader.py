@@ -138,3 +138,46 @@ class TestTokenRotationPersistence:
         up = _uploader()
         assert await up._refresh_access_token() == "new-access"
         assert up._refresh_token == "new-refresh"
+
+
+class TestUploadSizeCap:
+    """SoundCloud's documented per-track limit is 4GB — not the old 500MB
+    self-imposed cap, which bounced a 2.9GB FLAC into the flaky browser path."""
+
+    def _uploader_with_token(self):
+        return SoundCloudUploader(
+            db_settings_json={
+                "soundcloud_client_id": "cid",
+                "soundcloud_client_secret": "csecret",
+                "soundcloud_access_token": "at",
+            }
+        )
+
+    async def test_2_9gb_flac_goes_through_api(self, tmp_path, monkeypatch):
+        f = tmp_path / "mix.flac"
+        f.write_bytes(b"x")
+        monkeypatch.setattr(
+            sc_mod.os.path, "getsize", lambda p: int(2.9 * 1024 ** 3)
+        )
+        FakeAsyncClient.get_response = FakeResp(200)  # /me token check
+        FakeAsyncClient.post_response = FakeResp(
+            201,
+            json_data={"permalink_url": "https://soundcloud.com/willsee/big-mix", "id": 1},
+        )
+        up = self._uploader_with_token()
+        url = await up._api_upload(str(f), "Big Mix", "desc", "House", ["house"], None)
+        assert url == "https://soundcloud.com/willsee/big-mix"
+
+    async def test_above_4gb_raises(self, tmp_path, monkeypatch):
+        f = tmp_path / "mix.flac"
+        f.write_bytes(b"x")
+        monkeypatch.setattr(sc_mod.os.path, "getsize", lambda p: 5 * 1024 ** 3)
+        FakeAsyncClient.get_response = FakeResp(200)
+        up = self._uploader_with_token()
+        with pytest.raises(ValueError):
+            await up._api_upload(str(f), "Huge Mix", "desc", "House", ["house"], None)
+
+    def test_upload_constants(self):
+        assert sc_mod.MAX_UPLOAD_BYTES == 4 * 1024 * 1024 * 1024
+        # Multi-GB FLACs on home upstream need well over the old 10 minutes.
+        assert sc_mod.UPLOAD_TIMEOUT == 3600

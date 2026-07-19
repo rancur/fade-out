@@ -23,7 +23,11 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-UPLOAD_TIMEOUT = 600  # 10 minutes for large FLAC files
+UPLOAD_TIMEOUT = 3600  # multi-GB FLACs on home upstream need well over 10 min
+
+# SoundCloud's documented per-track upload cap. Files beyond this are rejected
+# server-side, so there is no point attempting the API with them.
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
 
 
 class SoundCloudUploader:
@@ -194,8 +198,10 @@ class SoundCloudUploader:
 
         # Build multipart upload
         file_size = os.path.getsize(audio_path)
-        if file_size > 500 * 1024 * 1024:  # 500MB API limit
-            raise ValueError(f"File too large for API upload ({file_size / 1024 / 1024:.0f}MB > 500MB)")
+        if file_size > MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"File too large for SoundCloud ({file_size / 1024 / 1024:.0f}MB > 4GB)"
+            )
 
         logger.info("Uploading to SoundCloud API: '%s' (%d MB)", title, file_size // (1024 * 1024))
 
