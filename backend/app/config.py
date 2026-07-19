@@ -129,6 +129,13 @@ class Settings(BaseSettings):
         "Shop: https://shop.thewillsee.com"
     )
 
+    # --- Thumbnail design system ---
+    # Press Start 2P (OFL) is bundled in the repo at backend/assets/fonts and
+    # baked into the image by the Dockerfile. Falls back to /data/fonts (an
+    # operator-mounted copy) and then the repo-relative bundled file when the
+    # configured path is missing (see thumbnail_design._font_path).
+    PIXEL_FONT_PATH: str = "/usr/share/fonts/truetype/pressstart2p/PressStart2P-Regular.ttf"
+
     # --- Public URL (required for OAuth callbacks with Google/SoundCloud) ---
     PUBLIC_URL: str = ""  # e.g. https://fadeout.example.com — must be a real domain for Google OAuth
 
