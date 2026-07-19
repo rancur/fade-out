@@ -331,12 +331,20 @@ async def retry_step(mix_id: str, step_name: str, db: AsyncSession = Depends(get
 
     await db.flush()
     await db.refresh(mix)
+    out = MixOut.model_validate(mix)
 
-    # Retry the specific step and continue from there
+    # Commit BEFORE the orchestrator runs: _execute_step writes from its own
+    # session, and this request's open write txn would self-deadlock sqlite
+    # (30s busy-wait, then "database is locked"). Run the step in the
+    # background — a multi-GB upload cannot live inside an HTTP request.
+    await db.commit()
+
+    import asyncio
+
     orch = _get_orchestrator()
-    await orch.retry_step(mix.id, step_name)
+    asyncio.create_task(orch.retry_step(mix.id, step_name))
 
-    return MixOut.model_validate(mix)
+    return out
 
 
 @router.post("/{mix_id}/reread-tracklist", response_model=MixOut, status_code=202)

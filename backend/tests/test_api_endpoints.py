@@ -112,6 +112,38 @@ class TestMixStateTransitions:
         resp = await client.post(f"/api/mixes/{mix_id}/retry-step/not_a_step")
         assert resp.status_code == 404
 
+    async def test_retry_step_returns_before_step_completes(self, client, monkeypatch):
+        # The endpoint must commit its own txn and run the step in the
+        # background: awaiting the orchestrator inline self-deadlocked sqlite
+        # (the request held an uncommitted write txn while _execute_step wrote
+        # from its own session) and pinned multi-GB uploads inside the request.
+        import asyncio
+
+        from app.main import orchestrator
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = {}
+
+        async def slow_retry(mix_id, step_name):
+            calls["args"] = (mix_id, step_name)
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(orchestrator, "retry_step", slow_retry)
+
+        created = (await client.post("/api/mixes", json={"title": "Fresh"})).json()
+        mix_id = created["id"]
+
+        resp = await client.post(f"/api/mixes/{mix_id}/retry-step/analyze")
+        # Responds while the (still-running) step is blocked on `release`.
+        assert resp.status_code == 200
+        assert resp.json()["id"] == mix_id
+
+        await asyncio.wait_for(started.wait(), timeout=5)
+        assert calls["args"] == (mix_id, "analyze")
+        release.set()
+
 
 class TestRereadTracklist:
     async def test_404_unknown_mix(self, client):
