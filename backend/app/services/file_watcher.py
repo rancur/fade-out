@@ -20,6 +20,17 @@ AUDIO_EXTENSIONS = {".flac"}
 VIDEO_EXTENSIONS = {".mkv"}
 HASH_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB for dedup hash
 
+# Minimum size for a file to be considered a real recording. A genuine mix is
+# always hundreds of MB to several GB; anything below this floor is an empty or
+# truncated artifact -- a stray ``touch``, an interrupted SMB copy, or a
+# name-normalized phantom sitting next to the real drop -- and must never be
+# ingested. Such a file goes "stable" instantly (its size never changes) and
+# would otherwise spin up a full pipeline on non-audio. The source itself is
+# never modified: the watch folder is bind-mounted read-only, and ingest only
+# ever opens the source for reading. This guard is purely about not acting on a
+# garbage/empty file.
+MIN_AUDIO_FILE_BYTES = 1024 * 1024  # 1 MB floor
+
 
 STATUS_PROCESSING = "processing"
 STATUS_DONE = "done"
@@ -286,6 +297,25 @@ class FileWatcherService:
             tracker.update(path)
 
             if not tracker.is_stable(path):
+                continue
+
+            # Source-safety / garbage guard: never ingest an empty or
+            # implausibly small audio file. A 0-byte or truncated drop goes
+            # "stable" immediately (its size never grows) and would otherwise
+            # kick off a full pipeline run on non-audio. We only read the source
+            # here; the file itself is never modified.
+            try:
+                size = os.path.getsize(path)
+            except OSError as exc:
+                logger.warning("Cannot stat %s: %s", path, exc)
+                tracker.remove(path)
+                continue
+            if size < MIN_AUDIO_FILE_BYTES:
+                logger.warning(
+                    "Skipping empty/undersized %s file (%d bytes < %d floor): %s",
+                    file_type, size, MIN_AUDIO_FILE_BYTES, path,
+                )
+                tracker.remove(path)
                 continue
 
             # File is stable -- check dedup
