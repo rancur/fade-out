@@ -99,10 +99,11 @@ class TestCheckTrackerDispatch:
     async def test_success_marks_done_and_dedupes(self, tmp_path):
         service = _make_service(tmp_path)
         f = tmp_path / "mix.flac"
-        f.write_bytes(b"audio-bytes")
+        f.write_bytes(b"a" * 2_000_000)  # >= 1 MB floor
 
         tracker = _StabilityTracker(0)
         tracker.update(str(f))
+        tracker.update(str(f))  # 2nd observation satisfies STABILITY_CONFIRMATIONS
 
         calls = []
 
@@ -117,6 +118,7 @@ class TestCheckTrackerDispatch:
 
         # A re-detected identical file is skipped (not processed twice).
         tracker.update(str(f))
+        tracker.update(str(f))
         await service._check_tracker(tracker, "audio", cb)
         assert calls == [str(f)]
         service._seen_db.close()
@@ -124,10 +126,11 @@ class TestCheckTrackerDispatch:
     async def test_callback_failure_clears_state_for_retry(self, tmp_path):
         service = _make_service(tmp_path)
         f = tmp_path / "mix.flac"
-        f.write_bytes(b"audio-bytes")
+        f.write_bytes(b"a" * 2_000_000)  # >= 1 MB floor
         file_hash = _compute_file_hash(str(f))
 
         tracker = _StabilityTracker(0)
+        tracker.update(str(f))
         tracker.update(str(f))
 
         async def boom(_path):
@@ -143,6 +146,7 @@ class TestCheckTrackerDispatch:
         async def cb(path):
             ok.append(path)
 
+        tracker.update(str(f))
         tracker.update(str(f))
         await service._check_tracker(tracker, "audio", cb)
         assert ok == [str(f)]
