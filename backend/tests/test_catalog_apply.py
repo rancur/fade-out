@@ -193,6 +193,103 @@ class TestApplyBasics:
         assert p.status == "failed" and "no longer exists" in p.error
 
 
+class TestSnippetBatching:
+    """Snippet fields for one video must land in ONE videos.update call.
+
+    YouTube's read-modify-write update is eventually consistent: a second
+    sequential update fetched a pre-first-update snippet and silently
+    reverted the first write (live incident 2026-07-19: 28 of ~62 field
+    updates reverted).
+    """
+
+    async def test_title_and_description_one_update_call(
+        self, prepared_db, fake_uploaders
+    ):
+        yt, sc = fake_uploaders
+        mix_id = await _make_mix()
+        pid_title = await _make_proposal(mix_id, "youtube", "title", "Batched Title")
+        pid_desc = await _make_proposal(
+            mix_id, "youtube", "description", "Batched desc"
+        )
+
+        summary = await run_apply()
+        assert summary == {"applied": 2, "failed": 0, "queued": 0, "paused": False}
+
+        # EXACTLY ONE videos.update, carrying both values.
+        updates = [c for c in yt.calls if c[0] == "update_video_fields"]
+        assert len(updates) == 1
+        name, args, kwargs = updates[0]
+        assert args == ("vid00000001",)
+        assert kwargs["title"] == "Batched Title"
+        assert kwargs["description"] == "Batched desc"
+
+        for pid in (pid_title, pid_desc):
+            p = await _get_proposal(pid)
+            assert p.status == "applied"
+            assert p.applied_at is not None and p.error is None
+
+        mix = await _get_mix(mix_id)
+        assert mix.title_youtube == "Batched Title"
+        assert mix.description_youtube == "Batched desc"
+
+        # One API write = one quota unit charge.
+        assert (await _get_quota())["used"] == 50
+
+    async def test_batched_update_failure_fails_all_grouped(
+        self, prepared_db, fake_uploaders
+    ):
+        yt, sc = fake_uploaders
+        yt.fail_on = ("update_video_fields",)
+        mix_id = await _make_mix()
+        pid_title = await _make_proposal(mix_id, "youtube", "title", "nope")
+        pid_desc = await _make_proposal(mix_id, "youtube", "description", "nope")
+
+        summary = await run_apply()
+        assert summary["applied"] == 0 and summary["failed"] == 2
+
+        p_title = await _get_proposal(pid_title)
+        p_desc = await _get_proposal(pid_desc)
+        assert p_title.status == "failed" and p_desc.status == "failed"
+        assert "yt update_video_fields exploded" in p_title.error
+        assert p_title.error == p_desc.error  # same error on every grouped one
+
+    async def test_both_platform_title_batches_with_yt_description(
+        self, prepared_db, fake_uploaders
+    ):
+        yt, sc = fake_uploaders
+        mix_id = await _make_mix()
+        await _make_proposal(mix_id, "both", "title", "Everywhere Title")
+        await _make_proposal(mix_id, "youtube", "description", "YT only desc")
+
+        summary = await run_apply()
+        assert summary["applied"] == 2 and summary["failed"] == 0
+
+        updates = [c for c in yt.calls if c[0] == "update_video_fields"]
+        assert len(updates) == 1
+        assert updates[0][2]["title"] == "Everywhere Title"
+        assert updates[0][2]["description"] == "YT only desc"
+        # SoundCloud side of the "both" proposal still goes out.
+        assert sc.calls == [
+            ("update_track_fields", "900",
+             {"title": "Everywhere Title", "description": None, "tags": None,
+              "artwork_path": None})
+        ]
+
+    async def test_different_mixes_are_not_batched(self, prepared_db, fake_uploaders):
+        yt, sc = fake_uploaders
+        mix_a = await _make_mix(id="mx-a", youtube_video_id="vidA")
+        mix_b = await _make_mix(id="mx-b", youtube_video_id="vidB")
+        await _make_proposal(mix_a, "youtube", "title", "A")
+        await _make_proposal(mix_b, "youtube", "title", "B")
+
+        summary = await run_apply()
+        assert summary["applied"] == 2
+
+        updates = [c for c in yt.calls if c[0] == "update_video_fields"]
+        assert len(updates) == 2
+        assert {c[1][0] for c in updates} == {"vidA", "vidB"}
+
+
 class TestApplyFailures:
     async def test_platform_error_captured_and_run_continues(
         self, prepared_db, fake_uploaders
@@ -226,11 +323,11 @@ class TestQuotaBudget:
         self, prepared_db, fake_uploaders, monkeypatch
     ):
         monkeypatch.setattr(settings, "YOUTUBE_DAILY_QUOTA_BUDGET", 100)
-        mix_id = await _make_mix()
-        pids = [
-            await _make_proposal(mix_id, "youtube", "title", f"t{i}")
-            for i in range(3)
-        ]
+        # Distinct mixes: same-mix snippet proposals batch into one call now.
+        pids = []
+        for i in range(3):
+            mix_id = await _make_mix(id=f"mx-{i}", youtube_video_id=f"vid0000000{i}")
+            pids.append(await _make_proposal(mix_id, "youtube", "title", f"t{i}"))
 
         summary = await run_apply()
         assert summary["applied"] == 2
