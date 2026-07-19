@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     # --- File Watching ---
     WATCH_AUDIO_PATH: str = "/watch/audio"
     WATCH_VIDEO_PATH: str = "/watch/video"
+    # When False (default) the watcher ignores files already present at startup
+    # and only ingests files created/modified while it is running. The watch
+    # folders permanently hold a large back-catalog (existing sets + every raw
+    # Twitch recording); sweeping them on every start would stampede the
+    # pipeline and re-hash hundreds of GB. Set True only for an empty/dedicated
+    # inbox folder where re-scanning offline arrivals is actually wanted.
+    WATCH_INGEST_EXISTING_ON_START: bool = False
     OUTPUT_THUMBNAILS_PATH: str = "/output/thumbnails"
     OUTPUT_COVER_ART_PATH: str = "/output/cover-art"
     DJCTL_CUE_PATH: str = "/watch/djctl-cue"
