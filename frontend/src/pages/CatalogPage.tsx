@@ -27,14 +27,17 @@ import {
   useCatalogBackfillStatus,
   useCatalogImprove,
   useCatalogMixes,
+  useCatalogPlaylistsStatus,
   useCatalogSyncStatus,
   useLockTitle,
   useProposals,
   useStartCatalogBackfill,
   useStartCatalogSync,
+  useStartOrganizePlaylists,
   type ActivityItem,
   type CatalogBackfillSummary,
   type CatalogMix,
+  type CatalogPlaylistsSummary,
   type CatalogSort,
   type CatalogSyncSummary,
 } from '@/api/hooks'
@@ -73,6 +76,16 @@ function backfillSummaryText(s: CatalogBackfillSummary): string {
     `Backfill ${s.status}: ${s.processed ?? 0}/${s.matched ?? 0} matched mixes analyzed, ` +
     `${s.tracks_found ?? 0} tracks found, ${s.proposals_created ?? 0} proposals approved, ` +
     `${s.unmatched_mixes?.length ?? 0} mixes without local audio`
+  )
+}
+
+function playlistsSummaryText(s: CatalogPlaylistsSummary): string {
+  const created = (s.youtube?.created_playlists ?? 0) + (s.soundcloud?.created_playlists ?? 0)
+  const queued = s.youtube?.queued ?? 0
+  return (
+    `Playlists ${s.status}: ${s.youtube?.placed ?? 0} YT + ${s.soundcloud?.placed ?? 0} SC placements, ` +
+    `${created} playlists created` +
+    (queued > 0 ? `, ${queued} queued on quota` : '')
   )
 }
 
@@ -252,19 +265,24 @@ export default function CatalogPage() {
   const improve = useCatalogImprove()
   const backfillStatus = useCatalogBackfillStatus()
   const startBackfill = useStartCatalogBackfill()
+  const playlistsStatus = useCatalogPlaylistsStatus()
+  const startPlaylists = useStartOrganizePlaylists()
   const draftProposals = useProposals({ status: 'draft', limit: 1 })
 
   const running = syncStatus.data?.running ?? false
   const backfillRunning = backfillStatus.data?.running ?? false
+  const playlistsRunning = playlistsStatus.data?.running ?? false
 
-  // Live progress lines from WS catalog_sync / catalog_backfill activity events
+  // Live progress lines from WS catalog_* activity events
   const [liveStatus, setLiveStatus] = useState<string | null>(null)
   const [backfillLive, setBackfillLive] = useState<string | null>(null)
+  const [playlistsLive, setPlaylistsLive] = useState<string | null>(null)
   useEffect(() => {
     return wsManager.subscribe('activity', (msg: WsMessage) => {
       const item = msg.data as unknown as ActivityItem
       if (item?.event === 'catalog_sync' && item.message) setLiveStatus(item.message)
       if (item?.event === 'catalog_backfill' && item.message) setBackfillLive(item.message)
+      if (item?.event === 'catalog_playlists' && item.message) setPlaylistsLive(item.message)
     })
   }, [])
 
@@ -300,12 +318,29 @@ export default function CatalogPage() {
     backfillWasRunning.current = backfillRunning
   }, [backfillRunning, backfillStatus.data, qc])
 
+  // Toast the summary when a running playlist organization finishes
+  const playlistsWasRunning = useRef(false)
+  useEffect(() => {
+    if (playlistsWasRunning.current && !playlistsRunning) {
+      const last = playlistsStatus.data?.last_playlists
+      if (last) {
+        const fn = last.status === 'ok' ? toast.success : toast.warning
+        fn(playlistsSummaryText(last))
+        if (last.errors?.length) last.errors.forEach((e) => toast.error(e))
+      }
+      setPlaylistsLive(null)
+      qc.invalidateQueries({ queryKey: ['catalog'] })
+    }
+    playlistsWasRunning.current = playlistsRunning
+  }, [playlistsRunning, playlistsStatus.data, qc])
+
   const mixes = data?.items ?? []
   const total = data?.total ?? 0
   const totalPages = Math.ceil(total / PAGE_SIZE)
   const openCount = draftProposals.data?.total ?? 0
   const lastSync = syncStatus.data?.last_sync
   const lastBackfill = backfillStatus.data?.last_backfill
+  const lastPlaylists = playlistsStatus.data?.last_playlists
 
   return (
     <div className="space-y-6">
@@ -374,6 +409,29 @@ export default function CatalogPage() {
 
           <button
             onClick={() =>
+              startPlaylists.mutate('all', {
+                onSuccess: (res) => {
+                  if (res.status === 'already_running')
+                    toast.info('Playlist organization is already running')
+                  else toast.success('Playlist organization started')
+                },
+                onError: () => toast.error('Failed to start playlist organization'),
+              })
+            }
+            disabled={playlistsRunning || startPlaylists.isPending}
+            title="Sort every mix into a series or genre playlist on YouTube + SoundCloud (Will See Wednesdays, Second Saturdays, genre buckets). Existing playlists are reused; YouTube writes respect the daily quota budget."
+            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-gold/10 text-gold border border-gold/30 text-xs font-mono uppercase tracking-wider hover:bg-gold/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+          >
+            {playlistsRunning ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <ListMusic className="w-4 h-4" />
+            )}
+            {playlistsRunning ? 'Organizing…' : 'Organize playlists'}
+          </button>
+
+          <button
+            onClick={() =>
               improve.mutate('all_generic', {
                 onSuccess: (res) => {
                   if (res.status === 'already_running') toast.info('AI improve is already running')
@@ -427,6 +485,24 @@ export default function CatalogPage() {
           {lastBackfill.finished_at && (
             <span className="ml-auto shrink-0 text-gray-600">
               {format(new Date(lastBackfill.finished_at), 'MMM d, HH:mm')}
+            </span>
+          )}
+        </div>
+      ) : null}
+
+      {/* Playlist organization status line */}
+      {playlistsRunning ? (
+        <div className="flex items-center gap-2 bg-surface-light border border-gold/20 rounded-lg px-4 py-2.5 text-xs font-mono text-gray-300">
+          <Loader2 className="w-3.5 h-3.5 text-gold animate-spin shrink-0" />
+          <span className="truncate">{playlistsLive ?? 'Playlist organization running…'}</span>
+        </div>
+      ) : lastPlaylists ? (
+        <div className="flex items-center gap-2 bg-surface-light border border-white/5 rounded-lg px-4 py-2.5 text-xs font-mono text-gray-500">
+          <ListMusic className="w-3.5 h-3.5 text-gold/60 shrink-0" />
+          <span className="truncate">{playlistsSummaryText(lastPlaylists)}</span>
+          {lastPlaylists.finished_at && (
+            <span className="ml-auto shrink-0 text-gray-600">
+              {format(new Date(lastPlaylists.finished_at), 'MMM d, HH:mm')}
             </span>
           )}
         </div>
