@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     # --- File Watching ---
     WATCH_AUDIO_PATH: str = "/watch/audio"
     WATCH_VIDEO_PATH: str = "/watch/video"
+    # When False (default) the watcher ignores files already present at startup
+    # and only ingests files created/modified while it is running. The watch
+    # folders permanently hold a large back-catalog (existing sets + every raw
+    # Twitch recording); sweeping them on every start would stampede the
+    # pipeline and re-hash hundreds of GB. Set True only for an empty/dedicated
+    # inbox folder where re-scanning offline arrivals is actually wanted.
+    WATCH_INGEST_EXISTING_ON_START: bool = False
     OUTPUT_THUMBNAILS_PATH: str = "/output/thumbnails"
     OUTPUT_COVER_ART_PATH: str = "/output/cover-art"
     DJCTL_CUE_PATH: str = "/watch/djctl-cue"
@@ -140,6 +147,33 @@ class Settings(BaseSettings):
     FILE_STABLE_SECONDS: int = 120
     AUDIO_SAMPLE_INTERVAL_SECONDS: int = 75  # sample every 75s (denser = better track recall)
     MAX_CONCURRENT_PIPELINES: int = 2
+
+    # --- Partial-file safety ---
+    # A file is only ingested once its size has stopped changing (see
+    # FILE_STABLE_SECONDS) AND it clears this floor. The floor rejects the
+    # 0-byte / stray-file class outright: a real recorded set is always well
+    # over a megabyte, so anything smaller is a half-written or junk drop.
+    MIN_FILE_SIZE_BYTES: int = 1_048_576  # 1 MB
+    # Number of consecutive size-stable polls required before ingest. Combined
+    # with the time window this guards against a slow SMB copy that briefly
+    # pauses mid-write from being mistaken for a finished file.
+    STABILITY_CONFIRMATIONS: int = 2
+
+    # --- Out-of-order pairing ---
+    # A lone audio-only or video-only drop waits in a PENDING state for its
+    # date-matched sibling this long before the coordinator gives up waiting.
+    # Video for a 3-hour set can take far longer to copy over SMB than the
+    # audio, so this defaults generous. On expiry an audio-only drop still runs
+    # (SoundCloud-only is a valid outcome); a video-only drop is logged as
+    # unpaired/expired and never run (audio is mandatory).
+    PAIRING_WAIT_SECONDS: int = 7200  # 2 hours
+    PAIRING_SWEEP_INTERVAL_SECONDS: int = 30
+
+    # --- Disk safety ---
+    # Ingest is refused (and surfaced in the activity log + health endpoint)
+    # when free space on the output volume drops below this, so a multi-GB set
+    # never half-processes into a full disk.
+    MIN_FREE_DISK_GB: float = 5.0
 
     @field_validator("NOTIFICATION_WEBHOOK_URLS", mode="before")
     @classmethod

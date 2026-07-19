@@ -99,10 +99,11 @@ class TestCheckTrackerDispatch:
     async def test_success_marks_done_and_dedupes(self, tmp_path):
         service = _make_service(tmp_path)
         f = tmp_path / "mix.flac"
-        f.write_bytes(b"audio-bytes")
+        f.write_bytes(b"a" * 2_000_000)  # >= 1 MB floor
 
         tracker = _StabilityTracker(0)
         tracker.update(str(f))
+        tracker.update(str(f))  # 2nd observation satisfies STABILITY_CONFIRMATIONS
 
         calls = []
 
@@ -117,6 +118,7 @@ class TestCheckTrackerDispatch:
 
         # A re-detected identical file is skipped (not processed twice).
         tracker.update(str(f))
+        tracker.update(str(f))
         await service._check_tracker(tracker, "audio", cb)
         assert calls == [str(f)]
         service._seen_db.close()
@@ -124,10 +126,11 @@ class TestCheckTrackerDispatch:
     async def test_callback_failure_clears_state_for_retry(self, tmp_path):
         service = _make_service(tmp_path)
         f = tmp_path / "mix.flac"
-        f.write_bytes(b"audio-bytes")
+        f.write_bytes(b"a" * 2_000_000)  # >= 1 MB floor
         file_hash = _compute_file_hash(str(f))
 
         tracker = _StabilityTracker(0)
+        tracker.update(str(f))
         tracker.update(str(f))
 
         async def boom(_path):
@@ -144,7 +147,48 @@ class TestCheckTrackerDispatch:
             ok.append(path)
 
         tracker.update(str(f))
+        tracker.update(str(f))
         await service._check_tracker(tracker, "audio", cb)
         assert ok == [str(f)]
         assert service._seen_db.is_done(file_hash) is True
         service._seen_db.close()
+
+
+class TestScanExistingGate:
+    async def test_scan_skips_existing_by_default(self, tmp_path, monkeypatch):
+        from app.services.file_watcher import FileWatcherService
+
+        audio = tmp_path / "audio"
+        audio.mkdir()
+        (audio / "old.flac").write_bytes(b"x")
+
+        seen = []
+
+        async def _noop(_p):
+            seen.append(_p)
+
+        svc = FileWatcherService(on_audio_file=_noop, on_video_file=_noop,
+                                 audio_path=str(audio), video_path=str(tmp_path / "video"))
+        monkeypatch.setattr("app.services.file_watcher.settings.WATCH_INGEST_EXISTING_ON_START", False)
+        await svc._scan_existing()
+        # Nothing tracked -> nothing will be dispatched.
+        assert svc._audio_tracker.tracked_paths == []
+        svc._seen_db.close()
+
+    async def test_scan_tracks_existing_when_enabled(self, tmp_path, monkeypatch):
+        from app.services.file_watcher import FileWatcherService
+
+        audio = tmp_path / "audio"
+        video = tmp_path / "video"
+        audio.mkdir(); video.mkdir()
+        (audio / "old.flac").write_bytes(b"x")
+
+        async def _noop(_p):
+            return None
+
+        svc = FileWatcherService(on_audio_file=_noop, on_video_file=_noop,
+                                 audio_path=str(audio), video_path=str(video))
+        monkeypatch.setattr("app.services.file_watcher.settings.WATCH_INGEST_EXISTING_ON_START", True)
+        await svc._scan_existing()
+        assert str(audio / "old.flac") in svc._audio_tracker.tracked_paths
+        svc._seen_db.close()

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import clsx from 'clsx'
+import ActivityPanel from './ActivityPanel'
 import {
   LayoutDashboard,
   Music2,
@@ -96,6 +97,9 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       <main className="flex-1 overflow-y-auto cyber-grid">
         <div className="p-6 max-w-7xl mx-auto animate-fade-in">{children}</div>
       </main>
+
+      {/* Live activity log sidebar */}
+      <ActivityPanel />
     </div>
   )
 }
