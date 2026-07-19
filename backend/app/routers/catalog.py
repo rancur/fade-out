@@ -32,6 +32,7 @@ OPEN_STATUSES = ("draft", "approved", "applying")
 _sync_task: Optional[asyncio.Task] = None
 _apply_task: Optional[asyncio.Task] = None
 _improve_task: Optional[asyncio.Task] = None
+_backfill_task: Optional[asyncio.Task] = None
 
 
 def _spawn(name: str, coro) -> asyncio.Task:
@@ -127,6 +128,10 @@ class ImproveBody(BaseModel):
     mix_ids: Optional[Any] = None  # list of ids | "all_generic" | omitted
 
 
+class BackfillBody(BaseModel):
+    mix_ids: Optional[List[str]] = None  # subset of mix ids, or omitted for all
+
+
 # --- Helpers ---
 
 
@@ -213,6 +218,51 @@ async def sync_status(db: AsyncSession = Depends(get_db)):
         "running": bool(_sync_task and not _sync_task.done()),
         "last_sync": last,
     }
+
+
+# --- Tracklist backfill ---
+
+
+@router.post("/backfill-tracklists", status_code=202)
+async def trigger_backfill(body: Optional[BackfillBody] = None):
+    """Kick off a background tracklist backfill (no-op if one is running).
+
+    Matches local audio files to imported mixes missing tracklists, analyzes
+    each match sequentially, and drafts APPROVED description proposals — the
+    apply worker is not auto-run.
+    """
+    global _backfill_task
+    from app.services.catalog_backfill import run_backfill
+
+    if _backfill_task and not _backfill_task.done():
+        return {"status": "already_running"}
+    _backfill_task = _spawn("backfill", run_backfill(body.mix_ids if body else None))
+    return {"status": "started"}
+
+
+@router.get("/backfill-status")
+async def backfill_status(db: AsyncSession = Depends(get_db)):
+    """Whether a backfill is running + the last completed run's summary."""
+    from app.services.catalog_backfill import LAST_BACKFILL_KEY
+
+    result = await db.execute(select(AppSettings).where(AppSettings.id == 1))
+    row = result.scalar_one_or_none()
+    last = ((row.settings_json or {}).get(LAST_BACKFILL_KEY)) if row else None
+    return {
+        "running": bool(_backfill_task and not _backfill_task.done()),
+        "last_backfill": last,
+    }
+
+
+@router.post("/backfill-cancel")
+async def cancel_backfill():
+    """Ask the running backfill to stop after the mix it is currently on."""
+    from app.services.catalog_backfill import request_cancel
+
+    if not (_backfill_task and not _backfill_task.done()):
+        return {"status": "not_running"}
+    await request_cancel()
+    return {"status": "cancelling"}
 
 
 # --- Unified mix list ---
