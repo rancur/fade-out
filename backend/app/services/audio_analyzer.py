@@ -67,17 +67,9 @@ class AnalysisResult:
         }
 
 
-# Genre inference from spectral features
-_GENRE_HINTS: Dict[str, Dict[str, Tuple[float, float]]] = {
-    # genre -> feature_name -> (low, high) expected range
-    "drum and bass": {"bpm": (160, 180), "centroid_mean": (2000, 5000)},
-    "house": {"bpm": (118, 132), "centroid_mean": (1500, 4000)},
-    "techno": {"bpm": (125, 150), "centroid_mean": (1000, 3500)},
-    "trance": {"bpm": (128, 145), "centroid_mean": (2000, 5000)},
-    "dubstep": {"bpm": (135, 145), "centroid_mean": (500, 3000)},
-    "ambient": {"bpm": (60, 100), "centroid_mean": (500, 2000)},
-    "breakbeat": {"bpm": (120, 150), "centroid_mean": (1500, 4500)},
-}
+# Genre inference from spectral features lives in ``genre_utils.GENRE_HINTS``
+# (kept there, dep-free, alongside the per-segment classifier so it is unit
+# testable without importing librosa/soundfile/shazamio).
 
 _VIBE_FROM_ENERGY: List[Tuple[str, float, float]] = [
     ("chill", 0.0, 0.25),
@@ -429,42 +421,21 @@ class AudioAnalyzer:
         centroids: List[float],
         tracklist: List[TrackHit],
     ) -> List[str]:
-        """Infer genres from BPM + spectral features + track metadata."""
-        if not bpms:
-            return ["electronic"]
+        """Infer genres from PER-SEGMENT features + track metadata.
 
-        avg_bpm = float(np.mean(bpms))
-        avg_centroid = float(np.mean(centroids)) if centroids else 2000.0
+        Delegates to ``genre_utils.classify_genres_from_segments`` which tallies
+        the arg-max genre of every sampled segment (folding half/double-tempo
+        first) instead of scoring one global ``mean(bpms)``. Averaging a
+        multi-genre set previously landed a half-tempo DnB mix (~87 BPM) inside
+        house's 118-132 band and mislabelled the whole set. Word-boundary
+        keyword matches from identified tracks win precedence over spectral
+        guesses, and genres come back ordered by prevalence so ``genres[0]`` is
+        truly the primary genre.
+        """
+        from app.services.genre_utils import classify_genres_from_segments
 
-        scores: Dict[str, float] = {}
-        for genre, ranges in _GENRE_HINTS.items():
-            score = 0.0
-            bpm_lo, bpm_hi = ranges["bpm"]
-            if bpm_lo <= avg_bpm <= bpm_hi:
-                score += 2.0
-            elif abs(avg_bpm - (bpm_lo + bpm_hi) / 2) < 20:
-                score += 0.5
-
-            cent_lo, cent_hi = ranges["centroid_mean"]
-            if cent_lo <= avg_centroid <= cent_hi:
-                score += 1.0
-
-            scores[genre] = score
-
-        # Boost genres mentioned in Shazam track metadata. Word-boundary matching
-        # (see genre_utils.keyword_matches) avoids over-crediting e.g. "drum and
-        # bass" for titles that merely contain "bass" inside a longer word.
-        from app.services.genre_utils import keyword_boosts
-
-        for track in tracklist:
-            combined = f"{track.title} {track.artist}"
-            for genre, boost in keyword_boosts(combined).items():
-                scores[genre] = scores.get(genre, 0) + boost
-
-        # Return top genres with score > 0
-        sorted_genres = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-        result = [g for g, s in sorted_genres if s > 0][:4]
-        return result if result else ["electronic"]
+        track_texts = [f"{t.title} {t.artist}" for t in tracklist]
+        return classify_genres_from_segments(bpms, centroids, track_texts)
 
     def _classify_vibes(self, energy_points: List[Dict[str, Any]]) -> List[str]:
         """Classify overall vibes from energy profile."""
