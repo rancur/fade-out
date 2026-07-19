@@ -392,6 +392,9 @@ async def handle_generate_art(
         session=session,
         mix_id=mix_id,
         brand_settings=brand,
+        video_file_path=mix.video_file_path,
+        energy_profile=mix.energy_profile or [],
+        duration_seconds=mix.duration_seconds or 0.0,
     )
 
     mix.cover_art_path = cover_result

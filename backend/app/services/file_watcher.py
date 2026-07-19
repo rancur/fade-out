@@ -20,6 +20,17 @@ AUDIO_EXTENSIONS = {".flac", ".wav"}
 VIDEO_EXTENSIONS = {".mkv"}
 HASH_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB for dedup hash
 
+# Minimum size for a file to be considered a real recording. A genuine mix is
+# always hundreds of MB to several GB; anything below this floor is an empty or
+# truncated artifact -- a stray ``touch``, an interrupted SMB copy, or a
+# name-normalized phantom sitting next to the real drop -- and must never be
+# ingested. Such a file goes "stable" instantly (its size never changes) and
+# would otherwise spin up a full pipeline on non-audio. The source itself is
+# never modified: the watch folder is bind-mounted read-only, and ingest only
+# ever opens the source for reading. This guard is purely about not acting on a
+# garbage/empty file.
+MIN_AUDIO_FILE_BYTES = 1024 * 1024  # 1 MB floor
+
 
 async def _safe_activity(level: str, event: str, message: str, **kwargs) -> None:
     """Emit an activity-log entry without ever letting a logging failure break
