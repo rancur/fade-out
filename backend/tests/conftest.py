@@ -8,9 +8,11 @@ production ``/data`` volume (and never needs it to be writable).
 import os
 import tempfile
 
+# The filename is per-process: a shared name collides when two checkouts run
+# their suites concurrently (each recreates the table with its own schema).
 os.environ.setdefault(
     "DATABASE_URL",
-    f"sqlite:///{os.path.join(tempfile.gettempdir(), 'fadeout_test.db')}",
+    f"sqlite:///{os.path.join(tempfile.gettempdir(), f'fadeout_test_{os.getpid()}.db')}",
 )
 
 import httpx
