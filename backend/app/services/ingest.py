@@ -17,10 +17,23 @@ starting a duplicate run.
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
+
+# Matches an ISO-style date token (YYYY-MM-DD) anywhere in a filename. Used as a
+# robustness fallback so a DJ does not have to hand-match audio/video filenames:
+# a mix recorded on a given date pairs with the video from the same date even if
+# the human-readable names differ (e.g. "Twitch DJs ... (2026-07-15).flac" pairs
+# with "will-see-...-2026-07-15.mkv").
+_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def _extract_date(name: str) -> Optional[str]:
+    m = _DATE_RE.search(name)
+    return m.group(1) if m else None
 
 from app.config import settings
 from app.database import async_session_factory
@@ -46,14 +59,14 @@ class IngestCoordinator:
         await self._ingest(path, "video")
 
     async def _ingest(self, path: str, kind: str) -> None:
-        stem = Path(path).stem
+        trigger_name = Path(path).name
 
         if kind == "audio":
             audio: Optional[str] = path
-            video = self._find_sibling(settings.WATCH_VIDEO_PATH, stem, VIDEO_EXTENSIONS)
+            video = self._find_sibling(settings.WATCH_VIDEO_PATH, trigger_name, VIDEO_EXTENSIONS)
         else:
             video = path
-            audio = self._find_sibling(settings.WATCH_AUDIO_PATH, stem, AUDIO_EXTENSIONS)
+            audio = self._find_sibling(settings.WATCH_AUDIO_PATH, trigger_name, AUDIO_EXTENSIONS)
 
         # Audio is mandatory -- detect/analyze cannot run without it. A video
         # that has no matching audio yet simply waits for its audio sibling.
@@ -63,6 +76,13 @@ class IngestCoordinator:
                 path,
             )
             return
+
+        # Key the dedup guard (and the mix title) on the *audio* stem, not the
+        # triggering file's stem. When audio and video have different names but
+        # pair via the date fallback, both the audio- and video-triggered
+        # callbacks resolve to the same audio, so keying on the audio stem
+        # prevents a duplicate mix being created from the second callback.
+        stem = Path(audio).stem
 
         async with self._lock:
             if stem in self._ingested_stems:
@@ -80,16 +100,57 @@ class IngestCoordinator:
             logger.exception("Ingest failed for stem %r (audio=%s video=%s)", stem, audio, video)
             raise
 
-    @staticmethod
-    def _find_sibling(directory: str, stem: str, extensions: set[str]) -> Optional[str]:
-        """Return a file in *directory* whose stem matches, else None."""
+    @classmethod
+    def _find_sibling(cls, directory: str, source_name: str, extensions: set[str]) -> Optional[str]:
+        """Find the file in *directory* that pairs with *source_name*.
+
+        Pairing strategy, most-specific first:
+          1. Exact stem match (``2026-07-15 Set.flac`` <-> ``2026-07-15 Set.mkv``).
+          2. Date fallback: a file whose name contains the same ``YYYY-MM-DD``
+             token as *source_name*. This lets a DJ drop differently-named audio
+             and video for the same recording date without hand-matching stems.
+             If several files share the date, the most recently modified wins
+             (and a warning is logged) so an old back-catalog file never
+             shadows the fresh drop.
+        Returns an absolute path, or ``None`` if nothing pairs.
+        """
         if not directory or not os.path.isdir(directory):
             return None
+
+        source_stem = Path(source_name).stem
+        candidates: list[str] = []
         for fname in os.listdir(directory):
             p = Path(fname)
-            if p.stem == stem and p.suffix.lower() in extensions:
+            if p.suffix.lower() not in extensions:
+                continue
+            # 1. Exact stem match short-circuits -- preserves prior behavior.
+            if p.stem == source_stem:
                 return os.path.join(directory, fname)
-        return None
+            candidates.append(fname)
+
+        # 2. Date fallback.
+        source_date = _extract_date(source_name)
+        if not source_date:
+            return None
+        dated = [
+            os.path.join(directory, f)
+            for f in candidates
+            if _extract_date(f) == source_date
+        ]
+        if not dated:
+            return None
+        if len(dated) > 1:
+            dated.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            logger.warning(
+                "Ingest: %d files in %s match date %s for %r; pairing newest (%s).",
+                len(dated), directory, source_date, source_name, os.path.basename(dated[0]),
+            )
+        else:
+            logger.info(
+                "Ingest: paired %r with %s via date fallback (%s).",
+                source_name, os.path.basename(dated[0]), source_date,
+            )
+        return dated[0]
 
     async def _create_and_start(self, stem: str, audio: str, video: Optional[str]) -> None:
         mix_id = str(uuid4())
