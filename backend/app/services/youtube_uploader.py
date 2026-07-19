@@ -577,6 +577,58 @@ class YouTubeUploader:
                 break
         return playlists
 
+    async def create_playlist(
+        self, title: str, description: str = "", privacy: str = "public"
+    ) -> str:
+        """Create a playlist and return its id (raises on failure).
+
+        Costs 50 quota units — callers budget it like any other catalog write.
+        """
+        import asyncio
+
+        youtube = self._get_service()
+        resp = await asyncio.to_thread(
+            youtube.playlists()
+            .insert(
+                part="snippet,status",
+                body={
+                    "snippet": {"title": title, "description": description},
+                    "status": {"privacyStatus": privacy},
+                },
+            )
+            .execute
+        )
+        playlist_id = resp["id"]
+        logger.info("Created playlist: %s (%s)", title, playlist_id)
+        return playlist_id
+
+    async def list_playlist_video_ids(self, playlist_id: str) -> List[str]:
+        """Video ids currently in a playlist (paginated; cheap 1-unit reads)."""
+        import asyncio
+
+        youtube = self._get_service()
+        video_ids: List[str] = []
+        page_token: Optional[str] = None
+        while True:
+            resp = await asyncio.to_thread(
+                youtube.playlistItems()
+                .list(
+                    part="contentDetails",
+                    playlistId=playlist_id,
+                    maxResults=50,
+                    pageToken=page_token,
+                )
+                .execute
+            )
+            for item in resp.get("items", []):
+                vid = item.get("contentDetails", {}).get("videoId")
+                if vid:
+                    video_ids.append(vid)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return video_ids
+
     async def add_video_to_playlist(self, playlist_id: str, video_id: str) -> None:
         """Insert a video into a playlist (raises on failure)."""
         import asyncio

@@ -57,6 +57,12 @@ RUN playwright install chromium --with-deps
 # Copy backend source
 COPY backend/ ./
 
+# Bake the brand pixel font (Press Start 2P, OFL — bundled in the repo) into
+# the system font path the app's PIXEL_FONT_PATH default points at.
+RUN mkdir -p /usr/share/fonts/truetype/pressstart2p \
+    && cp assets/fonts/PressStart2P-Regular.ttf /usr/share/fonts/truetype/pressstart2p/ \
+    && cp assets/fonts/OFL.txt /usr/share/fonts/truetype/pressstart2p/
+
 # Copy frontend build from stage 1
 COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
 

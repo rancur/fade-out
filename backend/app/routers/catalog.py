@@ -33,6 +33,8 @@ _sync_task: Optional[asyncio.Task] = None
 _apply_task: Optional[asyncio.Task] = None
 _improve_task: Optional[asyncio.Task] = None
 _backfill_task: Optional[asyncio.Task] = None
+_regen_thumbs_task: Optional[asyncio.Task] = None
+_playlists_task: Optional[asyncio.Task] = None
 
 
 def _spawn(name: str, coro) -> asyncio.Task:
@@ -130,6 +132,14 @@ class ImproveBody(BaseModel):
 
 class BackfillBody(BaseModel):
     mix_ids: Optional[List[str]] = None  # subset of mix ids, or omitted for all
+
+
+class RegenThumbsBody(BaseModel):
+    mix_ids: Any = None  # list of ids | "all" | "raid-trains"
+
+
+class OrganizePlaylistsBody(BaseModel):
+    mix_ids: Optional[Any] = None  # list of ids | "all" | omitted
 
 
 # --- Helpers ---
@@ -263,6 +273,92 @@ async def cancel_backfill():
         return {"status": "not_running"}
     await request_cancel()
     return {"status": "cancelling"}
+
+
+# --- Brand thumbnail regeneration ---
+
+
+@router.post("/regen-thumbnails", status_code=202)
+async def trigger_regen_thumbnails(body: RegenThumbsBody):
+    """Regenerate brand-design thumbnails/covers in the background.
+
+    ``mix_ids`` is a list of mix ids, ``"all"`` (every cataloged mix), or
+    ``"raid-trains"`` (title-matched raid trains). Renders land in the
+    ``/output`` art paths and become APPROVED thumbnail proposals — the apply
+    worker pushes them (not auto-run). Single-flight.
+    """
+    global _regen_thumbs_task
+    from app.services.catalog_thumbnails import run_regen_thumbnails
+
+    mix_ids = body.mix_ids
+    if isinstance(mix_ids, str) and mix_ids not in ("all", "raid-trains"):
+        raise HTTPException(
+            status_code=422,
+            detail="mix_ids must be a list, 'all', or 'raid-trains'",
+        )
+    if mix_ids is not None and not isinstance(mix_ids, (str, list)):
+        raise HTTPException(status_code=422, detail="mix_ids must be a list or string")
+
+    if _regen_thumbs_task and not _regen_thumbs_task.done():
+        return {"status": "already_running"}
+    _regen_thumbs_task = _spawn("regen_thumbs", run_regen_thumbnails(mix_ids))
+    return {"status": "started"}
+
+
+@router.get("/regen-thumbnails/status")
+async def regen_thumbnails_status(db: AsyncSession = Depends(get_db)):
+    """Whether a thumbnail regen is running + the last completed run's summary."""
+    from app.services.catalog_thumbnails import LAST_REGEN_THUMBS_KEY
+
+    result = await db.execute(select(AppSettings).where(AppSettings.id == 1))
+    row = result.scalar_one_or_none()
+    last = ((row.settings_json or {}).get(LAST_REGEN_THUMBS_KEY)) if row else None
+    return {
+        "running": bool(_regen_thumbs_task and not _regen_thumbs_task.done()),
+        "last_regen": last,
+    }
+
+
+# --- Playlist organization ---
+
+
+@router.post("/organize-playlists", status_code=202)
+async def trigger_organize_playlists(body: Optional[OrganizePlaylistsBody] = None):
+    """Organize cataloged mixes into YT + SC playlists in the background.
+
+    ``mix_ids`` is a list of mix ids or ``"all"`` (default). Classification is
+    series-first (Will See Wednesdays / Second Saturdays), then genre buckets;
+    missing playlists are created ("Will See | {bucket}") after fuzzy-matching
+    the existing ones. YouTube writes share the apply quota budget (pausing +
+    resuming across runs); idempotent. Single-flight.
+    """
+    global _playlists_task
+    from app.services.catalog_playlists import run_organize_playlists
+
+    mix_ids = body.mix_ids if body else None
+    if isinstance(mix_ids, str) and mix_ids != "all":
+        raise HTTPException(status_code=422, detail="mix_ids must be a list or 'all'")
+    if mix_ids is not None and not isinstance(mix_ids, (str, list)):
+        raise HTTPException(status_code=422, detail="mix_ids must be a list or 'all'")
+
+    if _playlists_task and not _playlists_task.done():
+        return {"status": "already_running"}
+    _playlists_task = _spawn("playlists", run_organize_playlists(mix_ids))
+    return {"status": "started"}
+
+
+@router.get("/organize-playlists/status")
+async def organize_playlists_status(db: AsyncSession = Depends(get_db)):
+    """Whether a playlist run is going + the last completed run's summary."""
+    from app.services.catalog_playlists import LAST_PLAYLISTS_KEY
+
+    result = await db.execute(select(AppSettings).where(AppSettings.id == 1))
+    row = result.scalar_one_or_none()
+    last = ((row.settings_json or {}).get(LAST_PLAYLISTS_KEY)) if row else None
+    return {
+        "running": bool(_playlists_task and not _playlists_task.done()),
+        "last_playlists": last,
+    }
 
 
 # --- Unified mix list ---

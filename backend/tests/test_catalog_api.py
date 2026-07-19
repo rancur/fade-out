@@ -415,3 +415,181 @@ class TestApplyImproveTriggers:
     async def test_improve_rejects_bad_scope_string(self, client):
         resp = await client.post("/api/catalog/improve", json={"mix_ids": "everything"})
         assert resp.status_code == 422
+
+
+class TestRegenThumbnailsEndpoint:
+    async def test_trigger_and_status(self, client, monkeypatch):
+        import asyncio
+
+        import app.services.catalog_thumbnails as thumbs_mod
+
+        received = {}
+
+        async def fake_run(mix_ids=None):
+            received["mix_ids"] = mix_ids
+            return {}
+
+        monkeypatch.setattr(thumbs_mod, "run_regen_thumbnails", fake_run)
+        resp = await client.post(
+            "/api/catalog/regen-thumbnails", json={"mix_ids": ["a"]}
+        )
+        assert resp.status_code == 202
+        assert resp.json()["status"] == "started"
+        await asyncio.sleep(0)
+        assert received["mix_ids"] == ["a"]
+
+        status = await client.get("/api/catalog/regen-thumbnails/status")
+        assert status.status_code == 200
+        body = status.json()
+        assert set(body) == {"running", "last_regen"}
+
+    @pytest.mark.parametrize("scope", ["all", "raid-trains"])
+    async def test_string_scopes_accepted(self, client, monkeypatch, scope):
+        import asyncio
+
+        import app.services.catalog_thumbnails as thumbs_mod
+
+        received = {}
+
+        async def fake_run(mix_ids=None):
+            received["mix_ids"] = mix_ids
+            return {}
+
+        monkeypatch.setattr(thumbs_mod, "run_regen_thumbnails", fake_run)
+        resp = await client.post(
+            "/api/catalog/regen-thumbnails", json={"mix_ids": scope}
+        )
+        assert resp.status_code == 202
+        await asyncio.sleep(0)
+        assert received["mix_ids"] == scope
+
+    async def test_bad_scope_string_rejected(self, client):
+        resp = await client.post(
+            "/api/catalog/regen-thumbnails", json={"mix_ids": "everything"}
+        )
+        assert resp.status_code == 422
+
+    async def test_single_flight(self, client, monkeypatch):
+        import asyncio
+
+        import app.services.catalog_thumbnails as thumbs_mod
+
+        release = asyncio.Event()
+
+        async def slow_run(mix_ids=None):
+            await release.wait()
+            return {}
+
+        monkeypatch.setattr(thumbs_mod, "run_regen_thumbnails", slow_run)
+        first = await client.post("/api/catalog/regen-thumbnails", json={"mix_ids": "all"})
+        assert first.json()["status"] == "started"
+        second = await client.post("/api/catalog/regen-thumbnails", json={"mix_ids": "all"})
+        assert second.json()["status"] == "already_running"
+        status = await client.get("/api/catalog/regen-thumbnails/status")
+        assert status.json()["running"] is True
+        release.set()
+        await asyncio.sleep(0)
+
+    async def test_status_reads_persisted_summary(self, client):
+        from app.database import async_session_factory
+        from app.models import AppSettings
+
+        async with async_session_factory() as session:
+            session.add(
+                AppSettings(
+                    id=1,
+                    settings_json={
+                        "catalog_last_regen_thumbs": {"status": "ok", "targeted": 3}
+                    },
+                )
+            )
+            await session.commit()
+        resp = await client.get("/api/catalog/regen-thumbnails/status")
+        assert resp.json()["last_regen"] == {"status": "ok", "targeted": 3}
+
+
+class TestOrganizePlaylistsEndpoint:
+    async def test_trigger_and_status(self, client, monkeypatch):
+        import asyncio
+
+        import app.services.catalog_playlists as pl_mod
+
+        received = {}
+
+        async def fake_run(mix_ids=None):
+            received["mix_ids"] = mix_ids
+            return {}
+
+        monkeypatch.setattr(pl_mod, "run_organize_playlists", fake_run)
+        resp = await client.post(
+            "/api/catalog/organize-playlists", json={"mix_ids": ["m1", "m2"]}
+        )
+        assert resp.status_code == 202
+        assert resp.json()["status"] == "started"
+        await asyncio.sleep(0)
+        assert received["mix_ids"] == ["m1", "m2"]
+
+        status = await client.get("/api/catalog/organize-playlists/status")
+        assert status.status_code == 200
+        assert set(status.json()) == {"running", "last_playlists"}
+
+    async def test_no_body_defaults_to_all(self, client, monkeypatch):
+        import asyncio
+
+        import app.services.catalog_playlists as pl_mod
+
+        received = {"mix_ids": "unset"}
+
+        async def fake_run(mix_ids=None):
+            received["mix_ids"] = mix_ids
+            return {}
+
+        monkeypatch.setattr(pl_mod, "run_organize_playlists", fake_run)
+        resp = await client.post("/api/catalog/organize-playlists")
+        assert resp.status_code == 202
+        await asyncio.sleep(0)
+        assert received["mix_ids"] is None
+
+    async def test_bad_scope_string_rejected(self, client):
+        resp = await client.post(
+            "/api/catalog/organize-playlists", json={"mix_ids": "some"}
+        )
+        assert resp.status_code == 422
+
+    async def test_single_flight(self, client, monkeypatch):
+        import asyncio
+
+        import app.services.catalog_playlists as pl_mod
+
+        release = asyncio.Event()
+
+        async def slow_run(mix_ids=None):
+            await release.wait()
+            return {}
+
+        monkeypatch.setattr(pl_mod, "run_organize_playlists", slow_run)
+        first = await client.post("/api/catalog/organize-playlists", json={"mix_ids": "all"})
+        assert first.json()["status"] == "started"
+        second = await client.post("/api/catalog/organize-playlists", json={"mix_ids": "all"})
+        assert second.json()["status"] == "already_running"
+        status = await client.get("/api/catalog/organize-playlists/status")
+        assert status.json()["running"] is True
+        release.set()
+        await asyncio.sleep(0)
+
+    async def test_status_reads_persisted_summary(self, client):
+        from app.database import async_session_factory
+        from app.models import AppSettings
+
+        async with async_session_factory() as session:
+            session.add(
+                AppSettings(
+                    id=1,
+                    settings_json={
+                        "catalog_last_playlists": {"status": "ok", "targeted": 7}
+                    },
+                )
+            )
+            await session.commit()
+        resp = await client.get("/api/catalog/organize-playlists/status")
+        assert resp.json()["last_playlists"] == {"status": "ok", "targeted": 7}
