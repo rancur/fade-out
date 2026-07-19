@@ -51,6 +51,10 @@ class PipelineStepOut(BaseModel):
 class MixOut(BaseModel):
     id: str
     title: str
+    source: Optional[str] = "pipeline"
+    youtube_video_id: Optional[str] = None
+    soundcloud_track_id: Optional[str] = None
+    title_locked: Optional[bool] = False
     audio_file_path: Optional[str] = None
     video_file_path: Optional[str] = None
     duration_seconds: Optional[float] = None

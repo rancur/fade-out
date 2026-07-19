@@ -29,6 +29,16 @@ class Mix(Base):
 
     id = Column(String, primary_key=True, default=_uuid)
     title = Column(String, nullable=False)
+    # Where this mix came from: "pipeline" (recorded + processed locally) or
+    # "imported" (discovered on a platform by the back-catalog sync).
+    source = Column(String, default="pipeline", nullable=False)
+    # Platform-native ids. These are the idempotency keys for catalog sync
+    # (URLs can vary in form; the ids never do).
+    youtube_video_id = Column(String, nullable=True, index=True)
+    soundcloud_track_id = Column(String, nullable=True, index=True)
+    # True for "keeper" titles (unique/creative). AI improve never proposes a
+    # title change for a locked mix; descriptions may still be proposed.
+    title_locked = Column(Boolean, default=False, nullable=False)
     audio_file_path = Column(String)
     video_file_path = Column(String)
     duration_seconds = Column(Float)
@@ -59,6 +69,37 @@ class Mix(Base):
     steps = relationship("PipelineStep", back_populates="mix", cascade="all, delete-orphan")
     ai_usages = relationship("AIUsage", back_populates="mix", cascade="all, delete-orphan")
     notifications = relationship("Notification", back_populates="mix", cascade="all, delete-orphan")
+    proposals = relationship("MixProposal", back_populates="mix", cascade="all, delete-orphan")
+
+
+class MixProposal(Base):
+    """A proposed change to one field of a published mix on one platform.
+
+    Proposals are drafted by the AI improver (``created_by="ai"``, status
+    ``draft``) or created directly by the user via the mix editor
+    (``created_by="user"``, auto-approved). The apply worker consumes
+    ``approved`` rows sequentially and pushes them to the platform APIs,
+    recording ``applied``/``failed`` (+``error``) per row so the full history
+    is kept on the proposal itself.
+    """
+
+    __tablename__ = "mix_proposals"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    mix_id = Column(String, ForeignKey("mixes.id"), nullable=False, index=True)
+    platform = Column(String, nullable=False)  # youtube | soundcloud | both
+    field = Column(String, nullable=False)  # title | description | thumbnail | playlist | tags
+    current_value = Column(Text)
+    proposed_value = Column(Text)  # JSON-encoded when structured (tags, playlist)
+    status = Column(String, default="draft", nullable=False, index=True)
+    # draft | approved | rejected | applying | applied | failed
+    created_by = Column(String, default="ai", nullable=False)  # ai | user
+    error = Column(Text)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    applied_at = Column(DateTime)
+
+    mix = relationship("Mix", back_populates="proposals")
 
 
 class PipelineStep(Base):

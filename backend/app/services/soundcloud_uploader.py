@@ -820,6 +820,107 @@ class SoundCloudUploader:
         logger.warning("SoundCloud verification failed for %s", track_url)
         return False
 
+    # ==================================================================
+    # Catalog listing / editing APIs (Stage C — back-catalog management)
+    # ==================================================================
+    # Additive section: enumerate the authed user's full track list and push
+    # targeted edits to already-published tracks. Raw API resources are
+    # returned as-is; normalization lives in services/catalog_sync.py.
+
+    async def list_all_tracks(self) -> List[Dict[str, Any]]:
+        """Return every track owned by the authed user (raw track resources).
+
+        GET /me/tracks with linked_partitioning=1&limit=200, following
+        ``next_href`` until exhausted.
+        """
+        token = await self._ensure_access_token()
+        tracks: List[Dict[str, Any]] = []
+        url: Optional[str] = f"{SOUNDCLOUD_API_BASE}/me/tracks"
+        params: Optional[Dict[str, Any]] = {"linked_partitioning": 1, "limit": 200}
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            while url:
+                resp = await client.get(
+                    url,
+                    params=params,
+                    headers={
+                        "Authorization": f"OAuth {token}",
+                        "Accept": "application/json",
+                    },
+                )
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"SoundCloud track listing failed ({resp.status_code}): {resp.text}"
+                    )
+                data = resp.json()
+                if isinstance(data, dict):
+                    tracks.extend(data.get("collection", []))
+                    url = data.get("next_href")
+                else:  # non-partitioned plain-list response
+                    tracks.extend(data)
+                    url = None
+                params = None  # next_href already carries the query string
+        return tracks
+
+    async def update_track_fields(
+        self,
+        track_id: str,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        artwork_path: Optional[str] = None,
+    ) -> None:
+        """Update only the given fields via ``PUT /tracks/:id``.
+
+        Tags are formatted the same way as at upload time (space-separated,
+        multi-word tags quoted). Artwork goes up as ``track[artwork_data]``
+        multipart. Raises on any failure — the apply worker records the error.
+        """
+        token = await self._ensure_access_token()
+
+        data: Dict[str, Any] = {}
+        if title is not None:
+            data["track[title]"] = title
+        if description is not None:
+            data["track[description]"] = description
+        if tags is not None:
+            formatted = [f'"{t}"' if " " in t else t for t in tags[:30]]
+            data["track[tag_list]"] = " ".join(formatted)
+
+        files: Dict[str, Any] = {}
+        if artwork_path:
+            if not os.path.exists(artwork_path):
+                raise FileNotFoundError(f"Artwork not found: {artwork_path}")
+            files["track[artwork_data]"] = (
+                os.path.basename(artwork_path),
+                open(artwork_path, "rb"),
+                "image/jpeg" if artwork_path.endswith(".jpg") else "image/png",
+            )
+
+        if not data and not files:
+            return
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.put(
+                    f"{SOUNDCLOUD_API_BASE}/tracks/{track_id}",
+                    headers={
+                        "Authorization": f"OAuth {token}",
+                        "Accept": "application/json",
+                    },
+                    data=data,
+                    files=files or None,
+                )
+                if resp.status_code not in (200, 201):
+                    raise RuntimeError(
+                        f"SoundCloud track update failed ({resp.status_code}): {resp.text}"
+                    )
+        finally:
+            for _, val in files.items():
+                if hasattr(val[1], "close"):
+                    val[1].close()
+        logger.info("Updated SoundCloud track %s fields: %s", track_id, sorted(data))
+
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
