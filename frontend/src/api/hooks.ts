@@ -692,6 +692,53 @@ export function useStartCatalogSync() {
   })
 }
 
+export interface CatalogBackfillSummary {
+  started_at: string
+  finished_at?: string
+  status: 'ok' | 'partial' | 'failed' | 'cancelled' | 'running' | string
+  errors: string[]
+  eligible_mixes?: number
+  audio_files?: number
+  matched?: number
+  processed?: number
+  tracks_found?: number
+  proposals_created?: number
+  failed?: number
+  cancelled?: boolean
+  unmatched_files?: number
+  unmatched_mixes?: { mix_id: string; title: string }[]
+}
+
+export interface CatalogBackfillStatus {
+  running: boolean
+  last_backfill: CatalogBackfillSummary | null
+}
+
+export function useCatalogBackfillStatus() {
+  return useQuery({
+    queryKey: ['catalog', 'backfill-status'],
+    queryFn: () =>
+      client.get<CatalogBackfillStatus>('/catalog/backfill-status').then((r) => r.data),
+    // Poll while a backfill is in flight so the UI notices completion
+    refetchInterval: (query) => (query.state.data?.running ? 2_000 : false),
+  })
+}
+
+export function useStartCatalogBackfill() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (mixIds?: string[]) =>
+      client
+        .post<{ status: 'started' | 'already_running' }>('/catalog/backfill-tracklists', {
+          mix_ids: mixIds ?? null,
+        })
+        .then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog', 'backfill-status'] })
+    },
+  })
+}
+
 export interface PlatformEdit {
   title?: string
   description?: string
