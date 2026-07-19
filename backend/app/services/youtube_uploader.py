@@ -441,3 +441,174 @@ class YouTubeUploader:
         except Exception as exc:
             logger.error("YouTube verification failed for %s: %s", video_id, exc)
             return {"status": "error", "error": str(exc), "video_id": video_id}
+
+    # ==================================================================
+    # Catalog listing / editing APIs (Stage C — back-catalog management)
+    # ==================================================================
+    # Everything below is additive: read the channel's full upload list and
+    # push targeted edits to already-published videos. Raw API resources are
+    # returned as-is; normalization lives in services/catalog_sync.py.
+
+    async def list_all_uploads(self) -> List[Dict[str, Any]]:
+        """Return every uploaded video on the authed channel (raw resources).
+
+        channels.list(mine=true) -> uploads playlist id -> playlistItems.list
+        paginated (50/page) -> videos.list batched (50/call) with
+        part=snippet,contentDetails,status.
+        """
+        import asyncio
+
+        youtube = self._get_service()
+
+        channels = await asyncio.to_thread(
+            youtube.channels().list(part="contentDetails", mine=True).execute
+        )
+        items = channels.get("items", [])
+        if not items:
+            return []
+        uploads_playlist = (
+            items[0]
+            .get("contentDetails", {})
+            .get("relatedPlaylists", {})
+            .get("uploads")
+        )
+        if not uploads_playlist:
+            return []
+
+        video_ids: List[str] = []
+        page_token: Optional[str] = None
+        while True:
+            resp = await asyncio.to_thread(
+                youtube.playlistItems()
+                .list(
+                    part="contentDetails",
+                    playlistId=uploads_playlist,
+                    maxResults=50,
+                    pageToken=page_token,
+                )
+                .execute
+            )
+            for item in resp.get("items", []):
+                vid = item.get("contentDetails", {}).get("videoId")
+                if vid:
+                    video_ids.append(vid)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+        videos: List[Dict[str, Any]] = []
+        for i in range(0, len(video_ids), 50):
+            batch = video_ids[i : i + 50]
+            resp = await asyncio.to_thread(
+                youtube.videos()
+                .list(part="snippet,contentDetails,status", id=",".join(batch))
+                .execute
+            )
+            videos.extend(resp.get("items", []))
+        return videos
+
+    async def update_video_fields(
+        self,
+        video_id: str,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+    ) -> None:
+        """Mutate only the given snippet fields via ``videos.update``.
+
+        The current snippet is fetched first so untouched fields
+        (categoryId, other metadata) survive the whole-part replacement.
+        Raises on any failure — the apply worker records the error.
+        """
+        import asyncio
+
+        youtube = self._get_service()
+        resp = await asyncio.to_thread(
+            youtube.videos().list(part="snippet", id=video_id).execute
+        )
+        items = resp.get("items", [])
+        if not items:
+            raise RuntimeError(f"YouTube video {video_id} not found for update")
+
+        snippet = items[0]["snippet"]
+        if title is not None:
+            snippet["title"] = title[:100]
+        if description is not None:
+            snippet["description"] = description[:5000]
+        if tags is not None:
+            snippet["tags"] = tags[:500]
+
+        await asyncio.to_thread(
+            youtube.videos()
+            .update(part="snippet", body={"id": video_id, "snippet": snippet})
+            .execute
+        )
+        logger.info("Updated YouTube video fields for %s", video_id)
+
+    async def set_thumbnail(self, video_id: str, thumbnail_path: str) -> None:
+        """Set a custom thumbnail, raising on failure (unlike _set_thumbnail)."""
+        import asyncio
+
+        if not os.path.exists(thumbnail_path):
+            raise FileNotFoundError(f"Thumbnail not found: {thumbnail_path}")
+        youtube = self._get_service()
+        media = MediaFileUpload(thumbnail_path, mimetype="image/jpeg")
+        await asyncio.to_thread(
+            youtube.thumbnails().set(videoId=video_id, media_body=media).execute
+        )
+        logger.info("Thumbnail set for video %s", video_id)
+
+    async def list_playlists(self) -> List[Dict[str, Any]]:
+        """Return the channel's playlists (raw resources, paginated)."""
+        import asyncio
+
+        youtube = self._get_service()
+        playlists: List[Dict[str, Any]] = []
+        page_token: Optional[str] = None
+        while True:
+            resp = await asyncio.to_thread(
+                youtube.playlists()
+                .list(part="snippet", mine=True, maxResults=50, pageToken=page_token)
+                .execute
+            )
+            playlists.extend(resp.get("items", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return playlists
+
+    async def add_video_to_playlist(self, playlist_id: str, video_id: str) -> None:
+        """Insert a video into a playlist (raises on failure)."""
+        import asyncio
+
+        youtube = self._get_service()
+        await asyncio.to_thread(
+            youtube.playlistItems()
+            .insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "playlistId": playlist_id,
+                        "resourceId": {"kind": "youtube#video", "videoId": video_id},
+                    },
+                },
+            )
+            .execute
+        )
+        logger.info("Added video %s to playlist %s", video_id, playlist_id)
+
+    async def remove_video_from_playlist(self, playlist_id: str, video_id: str) -> None:
+        """Delete a video's playlistItem rows from a playlist (raises on failure)."""
+        import asyncio
+
+        youtube = self._get_service()
+        resp = await asyncio.to_thread(
+            youtube.playlistItems()
+            .list(part="id", playlistId=playlist_id, videoId=video_id, maxResults=50)
+            .execute
+        )
+        for item in resp.get("items", []):
+            await asyncio.to_thread(
+                youtube.playlistItems().delete(id=item["id"]).execute
+            )
+        logger.info("Removed video %s from playlist %s", video_id, playlist_id)

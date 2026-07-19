@@ -19,6 +19,7 @@ from app.routers import (
     ai_usage,
     auth,
     brand,
+    catalog,
     mixes,
     notifications,
     pipeline,
@@ -142,6 +143,7 @@ app.add_middleware(
 # --- Routers ---
 app.include_router(auth.router)
 app.include_router(mixes.router)
+app.include_router(catalog.router)
 app.include_router(pipeline.router)
 app.include_router(activity.router)
 app.include_router(system.router)
