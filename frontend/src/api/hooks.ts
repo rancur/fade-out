@@ -8,6 +8,10 @@ import { wsManager, type WsMessage } from './ws'
 export interface Mix {
   id: string
   title: string
+  source?: 'pipeline' | 'imported' | string
+  youtube_video_id?: string | null
+  soundcloud_track_id?: string | null
+  title_locked?: boolean
   audio_file_path: string | null
   video_file_path: string | null
   duration_seconds: number | null
@@ -226,12 +230,18 @@ export function useLiveEvents() {
         qc.invalidateQueries({ queryKey: ['pipeline'] })
         if (msg.mix_id) qc.invalidateQueries({ queryKey: ['mixes', msg.mix_id] })
       }),
-      wsManager.subscribe('activity', () => {
+      wsManager.subscribe('activity', (msg: WsMessage) => {
         // Invalidate plain activity queries (dashboard card). The Activity page's
         // infinite query handles live events itself via its own WS subscription.
         qc.invalidateQueries({
           predicate: (q) => q.queryKey[0] === 'activity' && q.queryKey[1] !== 'infinite',
         })
+        // Catalog events (catalog_sync / catalog_apply / catalog_improve) mean
+        // mixes, proposals, or sync state changed — refresh catalog caches.
+        const ev = (msg.data as { event?: string | null } | undefined)?.event
+        if (typeof ev === 'string' && ev.startsWith('catalog')) {
+          qc.invalidateQueries({ queryKey: ['catalog'] })
+        }
       }),
     ]
     return () => unsubs.forEach((u) => u())
@@ -582,6 +592,225 @@ export function useCreateBackup() {
     mutationFn: () => client.post('/upgrade/backup'),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['backups'] })
+    },
+  })
+}
+
+// ---------- Catalog ----------
+
+export interface CatalogMix {
+  id: string
+  title: string
+  source: 'pipeline' | 'imported' | string
+  platforms: ('youtube' | 'soundcloud')[]
+  youtube_video_id: string | null
+  soundcloud_track_id: string | null
+  youtube_url: string | null
+  soundcloud_url: string | null
+  thumbnail_url: string | null
+  artwork_url: string | null
+  duration_seconds: number | null
+  youtube_published_at: string | null
+  soundcloud_published_at: string | null
+  title_locked: boolean
+  open_proposals: number
+}
+
+export interface CatalogSyncSummary {
+  started_at: string
+  finished_at?: string
+  status: 'ok' | 'partial' | 'failed' | 'running' | string
+  errors: string[]
+  youtube_items?: number
+  soundcloud_items?: number
+  matched_pairs?: number
+  ambiguous_judged?: number
+  singles?: number
+  existing_updated?: number
+  pairs_created?: number
+  singles_created?: number
+}
+
+export interface CatalogSyncStatus {
+  running: boolean
+  last_sync: CatalogSyncSummary | null
+}
+
+export type ProposalStatus = 'draft' | 'approved' | 'rejected' | 'applying' | 'applied' | 'failed'
+export type ProposalField = 'title' | 'description' | 'thumbnail' | 'playlist' | 'tags'
+export type ProposalPlatform = 'youtube' | 'soundcloud' | 'both'
+
+export interface Proposal {
+  id: string
+  mix_id: string
+  mix_title: string | null
+  platform: ProposalPlatform
+  field: ProposalField
+  current_value: string | null
+  proposed_value: string | null
+  status: ProposalStatus
+  created_by: 'ai' | 'user'
+  error: string | null
+  created_at: string | null
+  updated_at: string | null
+  applied_at: string | null
+}
+
+export interface CatalogMixesParams {
+  page?: number
+  page_size?: number
+  platform?: 'yt-only' | 'sc-only' | 'both'
+  source?: string
+  q?: string
+}
+
+export function useCatalogMixes(params?: CatalogMixesParams) {
+  return useQuery({
+    queryKey: ['catalog', 'mixes', params],
+    queryFn: () =>
+      client.get<Paginated<CatalogMix>>('/catalog/mixes', { params }).then((r) => r.data),
+  })
+}
+
+export function useCatalogSyncStatus() {
+  return useQuery({
+    queryKey: ['catalog', 'sync-status'],
+    queryFn: () => client.get<CatalogSyncStatus>('/catalog/sync/status').then((r) => r.data),
+    // Poll while a sync is in flight so the UI notices completion
+    refetchInterval: (query) => (query.state.data?.running ? 2_000 : false),
+  })
+}
+
+export function useStartCatalogSync() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      client.post<{ status: 'started' | 'already_running' }>('/catalog/sync').then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog', 'sync-status'] })
+    },
+  })
+}
+
+export interface PlatformEdit {
+  title?: string
+  description?: string
+  tags?: string[]
+}
+
+export interface CatalogMixEditBody {
+  youtube?: PlatformEdit
+  soundcloud?: PlatformEdit
+  apply?: boolean
+}
+
+export function useEditCatalogMix(mixId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: CatalogMixEditBody) =>
+      client
+        .put<{ proposals: Proposal[]; applying: boolean }>(`/catalog/mixes/${mixId}`, body)
+        .then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog'] })
+      qc.invalidateQueries({ queryKey: ['mixes', mixId] })
+    },
+  })
+}
+
+export function useLockTitle(mixId: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (locked: boolean) =>
+      client
+        .post<{ id: string; title_locked: boolean }>(`/catalog/mixes/${mixId}/lock-title`, { locked })
+        .then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog'] })
+      qc.invalidateQueries({ queryKey: ['mixes', mixId] })
+    },
+  })
+}
+
+export interface ProposalCreateBody {
+  platform: ProposalPlatform
+  field: ProposalField
+  proposed_value: string
+  current_value?: string | null
+  status?: 'draft' | 'approved'
+}
+
+export function useCreateProposal() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ mixId, ...body }: ProposalCreateBody & { mixId: string }) =>
+      client.post<Proposal>(`/catalog/mixes/${mixId}/proposals`, body).then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog'] })
+    },
+  })
+}
+
+export interface ProposalsParams {
+  status?: string
+  mix_id?: string
+  limit?: number
+  offset?: number
+}
+
+export function useProposals(params?: ProposalsParams) {
+  return useQuery({
+    queryKey: ['catalog', 'proposals', params],
+    queryFn: () =>
+      client
+        .get<{ items: Proposal[]; total: number }>('/catalog/proposals', { params })
+        .then((r) => r.data),
+  })
+}
+
+export function useProposalAction() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'approve' | 'reject' }) =>
+      client.post<Proposal>(`/catalog/proposals/${id}/${action}`).then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog'] })
+    },
+  })
+}
+
+export function useApproveBulk() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (ids: string[]) =>
+      client
+        .post<{ approved: number; applying: boolean }>('/catalog/proposals/approve-bulk', { ids })
+        .then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog'] })
+    },
+  })
+}
+
+export function useCatalogApply() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => client.post<{ status: string }>('/catalog/apply').then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog'] })
+    },
+  })
+}
+
+export function useCatalogImprove() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (mixIds?: string[] | 'all_generic') =>
+      client
+        .post<{ status: string }>('/catalog/improve', { mix_ids: mixIds ?? 'all_generic' })
+        .then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog'] })
     },
   })
 }
