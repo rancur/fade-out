@@ -129,6 +129,73 @@ class TestCatalogMixList:
         assert listing["items"][0]["open_proposals"] == 2  # 2 drafts remain open
 
 
+class TestCatalogSorting:
+    async def _seed(self):
+        """Three mixes whose platform-publish order differs from insert order.
+
+        latest publish dates: mid-2025-05 / early-2025-03 (created_at fallback,
+        no metadata) / new-2025-07.
+        """
+        from datetime import datetime
+
+        await _make_mix(
+            id="mid", title="Bravo Mix", duration_seconds=1800.0,
+            created_at=datetime(2025, 6, 20, 12, 0, 0),
+            metadata_json={
+                "catalog": {
+                    "youtube": {"published_at": "2025-01-01T00:00:00+00:00"},
+                    "soundcloud": {"published_at": "2025-05-01T00:00:00+00:00"},
+                }
+            },
+        )
+        await _make_mix(
+            id="early", title="alpha mix", duration_seconds=7200.0,
+            created_at=datetime(2025, 3, 1, 12, 0, 0),
+            metadata_json=None,  # no platform dates -> falls back to created_at
+        )
+        await _make_mix(
+            id="new", title="Charlie Mix", duration_seconds=None,
+            created_at=datetime(2025, 1, 5, 12, 0, 0),  # created early, published late
+            metadata_json={
+                "catalog": {"youtube": {"published_at": "2025-07-01T00:00:00+00:00"}}
+            },
+        )
+
+    async def _ids(self, client, **params):
+        resp = await client.get("/api/catalog/mixes", params=params)
+        assert resp.status_code == 200
+        return [i["id"] for i in resp.json()["items"]]
+
+    async def test_default_is_newest_by_platform_publish_date(self, client):
+        await self._seed()
+        assert await self._ids(client) == ["new", "mid", "early"]
+        assert await self._ids(client, sort="newest") == ["new", "mid", "early"]
+
+    async def test_oldest(self, client):
+        await self._seed()
+        assert await self._ids(client, sort="oldest") == ["early", "mid", "new"]
+
+    async def test_title_is_case_insensitive(self, client):
+        await self._seed()
+        assert await self._ids(client, sort="title") == ["early", "mid", "new"]
+
+    async def test_duration_longest_first_nulls_last(self, client):
+        await self._seed()
+        assert await self._ids(client, sort="duration") == ["early", "mid", "new"]
+
+    async def test_sort_applies_before_pagination(self, client):
+        await self._seed()
+        page1 = await self._ids(client, sort="newest", page=1, page_size=1)
+        page2 = await self._ids(client, sort="newest", page=2, page_size=1)
+        assert page1 == ["new"]
+        assert page2 == ["mid"]
+        assert page1 != page2
+
+    async def test_invalid_sort_is_422(self, client):
+        resp = await client.get("/api/catalog/mixes", params={"sort": "sideways"})
+        assert resp.status_code == 422
+
+
 class TestProposalLifecycle:
     async def test_create_defaults_to_draft(self, client):
         mix_id = await _make_mix()

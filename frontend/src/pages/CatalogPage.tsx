@@ -18,6 +18,7 @@ import {
   Music,
   RefreshCw,
   Search,
+  SortDesc,
   Sparkles,
   Unlock,
 } from 'lucide-react'
@@ -30,6 +31,7 @@ import {
   useStartCatalogSync,
   type ActivityItem,
   type CatalogMix,
+  type CatalogSort,
   type CatalogSyncSummary,
 } from '@/api/hooks'
 import { wsManager, type WsMessage } from '@/api/ws'
@@ -38,6 +40,12 @@ import { useQueryClient } from '@tanstack/react-query'
 const PAGE_SIZE = 12
 const PLATFORM_FILTERS = ['all', 'yt-only', 'sc-only', 'both'] as const
 const SOURCE_FILTERS = ['all', 'pipeline', 'imported'] as const
+const SORT_OPTIONS: { value: CatalogSort; label: string }[] = [
+  { value: 'newest', label: 'Newest' },
+  { value: 'oldest', label: 'Oldest' },
+  { value: 'title', label: 'Title' },
+  { value: 'duration', label: 'Duration' },
+]
 
 function formatDuration(seconds: number): string {
   const total = Math.round(seconds)
@@ -204,6 +212,7 @@ export default function CatalogPage() {
   const qc = useQueryClient()
   const [platform, setPlatform] = useState<(typeof PLATFORM_FILTERS)[number]>('all')
   const [source, setSource] = useState<(typeof SOURCE_FILTERS)[number]>('all')
+  const [sort, setSort] = useState<CatalogSort>('newest')
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [page, setPage] = useState(1)
@@ -223,6 +232,7 @@ export default function CatalogPage() {
     platform: platform === 'all' ? undefined : platform,
     source: source === 'all' ? undefined : source,
     q: debouncedSearch.trim() || undefined,
+    sort,
   })
 
   const syncStatus = useCatalogSyncStatus()
@@ -373,6 +383,24 @@ export default function CatalogPage() {
             </option>
           ))}
         </select>
+        <div className="relative">
+          <SortDesc className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
+          <select
+            aria-label="Sort catalog"
+            value={sort}
+            onChange={(e) => {
+              setSort(e.target.value as CatalogSort)
+              setPage(1)
+            }}
+            className="pl-10 pr-8 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-none font-mono"
+          >
+            {SORT_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {/* Platform filters */}

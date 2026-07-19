@@ -2,7 +2,7 @@
 
 import os
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -126,6 +126,7 @@ async def list_mixes(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     status: Optional[str] = Query(None, description="Filter by pipeline_status"),
+    sort: Literal["newest", "oldest", "title"] = Query("newest"),
     db: AsyncSession = Depends(get_db),
 ):
     """List all mixes with pagination and optional status filter."""
@@ -139,7 +140,13 @@ async def list_mixes(
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
 
-    query = query.order_by(Mix.created_at.desc())
+    # Sort before LIMIT/OFFSET; id tie-break keeps pagination stable.
+    if sort == "oldest":
+        query = query.order_by(Mix.created_at.asc(), Mix.id.asc())
+    elif sort == "title":
+        query = query.order_by(sa_func.lower(Mix.title).asc(), Mix.id.asc())
+    else:  # newest (default)
+        query = query.order_by(Mix.created_at.desc(), Mix.id.asc())
     query = query.offset((page - 1) * page_size).limit(page_size)
     result = await db.execute(query)
     rows = result.scalars().all()
