@@ -13,7 +13,9 @@ from app.config import settings
 from app.database import init_db
 from app.logging_config import configure_logging
 from app.routers import ai_usage, auth, brand, mixes, notifications, pipeline, settings as settings_router, upgrade, ws
+from app.services.file_watcher import FileWatcherService
 from app.services.handlers import register_all_handlers
+from app.services.ingest import IngestCoordinator
 from app.services.pipeline import PipelineOrchestrator
 
 logger = logging.getLogger("fadeout")
@@ -42,9 +44,25 @@ async def lifespan(app: FastAPI):
     # Stream live pipeline events to any connected WebSocket clients.
     orchestrator.on_event(ws.manager.broadcast_event)
 
+    # Start the file watcher so dropped audio/video files auto-ingest into the
+    # pipeline. Without this the watcher service is never instantiated and
+    # nothing is ever picked up from the watch folders.
+    coordinator = IngestCoordinator(orchestrator)
+    file_watcher = FileWatcherService(
+        on_audio_file=coordinator.ingest_audio,
+        on_video_file=coordinator.ingest_video,
+    )
+    await file_watcher.start()
+    logger.info(
+        "File watcher started (audio=%s video=%s).",
+        settings.WATCH_AUDIO_PATH,
+        settings.WATCH_VIDEO_PATH,
+    )
+
     logger.info("Fade-Out is running.")
     yield
     logger.info("Fade-Out shutting down.")
+    await file_watcher.stop()
 
 
 app = FastAPI(
