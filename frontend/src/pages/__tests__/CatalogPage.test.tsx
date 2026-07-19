@@ -108,6 +108,25 @@ describe('CatalogPage', () => {
     expect(queueLink.textContent).toContain('5')
   })
 
+  it('defaults to newest and refetches with the sort param on change', async () => {
+    renderPage()
+
+    await screen.findByText('Friday Night Warehouse Set')
+    expect(client.get).toHaveBeenCalledWith('/catalog/mixes', {
+      params: expect.objectContaining({ sort: 'newest' }),
+    })
+
+    fireEvent.change(screen.getByLabelText('Sort catalog'), {
+      target: { value: 'duration' },
+    })
+
+    await waitFor(() => {
+      expect(client.get).toHaveBeenCalledWith('/catalog/mixes', {
+        params: expect.objectContaining({ sort: 'duration', page: 1 }),
+      })
+    })
+  })
+
   it('starts a sync via POST /catalog/sync', async () => {
     renderPage()
 

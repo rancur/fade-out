@@ -145,6 +145,54 @@ class TestMixStateTransitions:
         release.set()
 
 
+class TestMixesSorting:
+    async def _seed(self):
+        from datetime import datetime
+
+        from app.database import async_session_factory
+        from app.models import Mix
+
+        rows = [
+            ("m-old", "Zulu Set", datetime(2025, 1, 1, 12, 0, 0)),
+            ("m-mid", "alpha set", datetime(2025, 2, 1, 12, 0, 0)),
+            ("m-new", "Mango Set", datetime(2025, 3, 1, 12, 0, 0)),
+        ]
+        async with async_session_factory() as session:
+            for mix_id, title, created in rows:
+                session.add(
+                    Mix(id=mix_id, title=title, created_at=created,
+                        pipeline_status="uploaded")
+                )
+            await session.commit()
+
+    async def _ids(self, client, **params):
+        resp = await client.get("/api/mixes", params=params)
+        assert resp.status_code == 200
+        return [i["id"] for i in resp.json()["items"]]
+
+    async def test_default_is_newest_created_first(self, client):
+        await self._seed()
+        assert await self._ids(client) == ["m-new", "m-mid", "m-old"]
+        assert await self._ids(client, sort="newest") == ["m-new", "m-mid", "m-old"]
+
+    async def test_oldest_and_title(self, client):
+        await self._seed()
+        assert await self._ids(client, sort="oldest") == ["m-old", "m-mid", "m-new"]
+        # case-insensitive title sort: alpha < Mango < Zulu
+        assert await self._ids(client, sort="title") == ["m-mid", "m-new", "m-old"]
+
+    async def test_sort_applies_before_pagination(self, client):
+        await self._seed()
+        page1 = await self._ids(client, sort="newest", page=1, page_size=2)
+        page2 = await self._ids(client, sort="newest", page=2, page_size=2)
+        assert page1 == ["m-new", "m-mid"]
+        assert page2 == ["m-old"]
+
+    async def test_invalid_sort_is_422(self, client):
+        resp = await client.get("/api/mixes", params={"sort": "sideways"})
+        assert resp.status_code == 422
+
+
 class TestRereadTracklist:
     async def test_404_unknown_mix(self, client):
         resp = await client.post("/api/mixes/does-not-exist/reread-tracklist")

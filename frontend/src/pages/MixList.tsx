@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Search, Filter, SortDesc, ChevronLeft, ChevronRight } from 'lucide-react'
-import { useMixes } from '@/api/hooks'
+import { useMixes, type MixSort } from '@/api/hooks'
 import MixCard from '@/components/MixCard'
 import clsx from 'clsx'
 
@@ -11,28 +11,24 @@ export default function MixList() {
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState('all')
   const [page, setPage] = useState(1)
-  const [sort, setSort] = useState<'newest' | 'oldest' | 'title'>('newest')
+  const [sort, setSort] = useState<MixSort>('newest')
 
   const { data, isLoading } = useMixes({
     status: status === 'all' ? undefined : status,
     page,
     page_size: PAGE_SIZE,
+    sort,
   })
 
   const mixes = data?.items ?? []
   const total = data?.total ?? 0
   const totalPages = Math.ceil(total / PAGE_SIZE)
 
-  // Client-side search filter (API doesn't support search param)
-  const filtered = search
+  // Client-side search filter (API doesn't support search param); sorting is
+  // server-side so it holds across the whole library, not just this page.
+  const sorted = search
     ? mixes.filter((m) => m.title.toLowerCase().includes(search.toLowerCase()))
     : mixes
-
-  const sorted = [...filtered].sort((a, b) => {
-    if (sort === 'oldest') return new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-    if (sort === 'title') return a.title.localeCompare(b.title)
-    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-  })
 
   return (
     <div className="space-y-6">
@@ -63,8 +59,12 @@ export default function MixList() {
         <div className="relative">
           <SortDesc className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
           <select
+            aria-label="Sort mixes"
             value={sort}
-            onChange={(e) => setSort(e.target.value as typeof sort)}
+            onChange={(e) => {
+              setSort(e.target.value as typeof sort)
+              setPage(1)
+            }}
             className="pl-10 pr-8 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-none font-mono"
           >
             <option value="newest">Newest</option>
