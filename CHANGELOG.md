@@ -1,5 +1,45 @@
 # Changelog
 
+## v2.1.0 — 2026-07-19
+
+The discoverability release.
+
+### Branded thumbnail design system
+- Will-approved template baked into the app: warm Sonoran-desert palette,
+  hand-illustrated psychedelic focal subject with the Will See eye motif,
+  Press Start 2P pixel-font hook text (≤3 words), accent bar, WILL SEE tag.
+- 12 genre motifs (DnB cyber coyote, dubstep sandstone totem, house
+  sunflower-eye, trance planet-eye oasis, EDM ember phoenix, trap, deep house,
+  tech house, techno, garage, organic, open format) — every mix gets unique
+  on-brand art; pixel font ships in the Docker image.
+- `POST /api/catalog/regen-thumbnails` regenerates catalog art at scale.
+
+### Cross-platform playlist grouping
+- Series- and genre-aware buckets (Will See Wednesdays, Second Saturdays,
+  DnB & Jungle, Dubstep & Bass, House, Trance, Techno, EDM & Big Room,
+  Garage & Breaks, Melodic & Progressive, Open Format), fuzzy-matched against
+  existing YouTube playlists before creating new "Will See | …" ones;
+  SoundCloud playlist create/append support.
+- `POST /api/catalog/organize-playlists`, quota-budgeted, idempotent,
+  per-bucket error isolation, title-keyword genre fallback.
+
+### Tracklist backfill
+- `POST /api/catalog/backfill-tracklists`: matches local audio to imported
+  back-catalog mixes (filename date/title/duration), runs full CUE+Shazam
+  analysis, and queues platform description updates with real tracklists.
+
+### Metadata quality
+- Title diversity: anti-repetition prompt (used-title context, banned
+  overused words, structure variation) + similarity guard with retry.
+- Series-aware refresh keeps series identity in titles while adding
+  discoverability hooks; per-platform search-tag drafting (YT ≤20, SC ≤30).
+- Sorting on catalog + mixes lists (newest first by default).
+
+### Fixes
+- YouTube snippet updates batched per video (stale-snippet revert race).
+- Malformed YouTube playlist ids skipped instead of aborting the run;
+  SoundCloud playlist bodies sent as documented JSON (form-encoded retry).
+
 ## v2.0.0 — 2026-07-19
 
 The observability + mix-management release. Consolidates PRs #13, #14, #15 and adds
