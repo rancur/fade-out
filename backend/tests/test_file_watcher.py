@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from app.services.file_watcher import (
+    MIN_AUDIO_FILE_BYTES,
     STATUS_DONE,
     STATUS_PROCESSING,
     FileWatcherService,
@@ -12,6 +13,9 @@ from app.services.file_watcher import (
     _SeenFilesDB,
     _StabilityTracker,
 )
+
+# Real audio comfortably clears the size floor; use it for dispatch fixtures.
+_VALID_AUDIO = b"\0" * (MIN_AUDIO_FILE_BYTES + 16)
 
 
 class TestSeenFilesDB:
@@ -192,3 +196,33 @@ class TestScanExistingGate:
         await svc._scan_existing()
         assert str(audio / "old.flac") in svc._audio_tracker.tracked_paths
         svc._seen_db.close()
+
+    async def test_empty_or_undersized_file_is_never_dispatched(self, tmp_path):
+        """A 0-byte / truncated drop must be skipped, not ingested.
+
+        A stray ``touch`` or interrupted copy leaves an empty file that goes
+        size-stable instantly; ingesting it would spin up a pipeline on
+        non-audio. The guard drops it without ever invoking the callback.
+        """
+        service = _make_service(tmp_path)
+
+        empty = tmp_path / "phantom.flac"
+        empty.write_bytes(b"")
+        tiny = tmp_path / "partial.flac"
+        tiny.write_bytes(b"x" * 1024)  # 1 KB, well under the floor
+
+        tracker = _StabilityTracker(0)
+        calls = []
+
+        async def cb(path):
+            calls.append(path)
+
+        for p in (empty, tiny):
+            tracker.update(str(p))
+            await service._check_tracker(tracker, "audio", cb)
+
+        assert calls == []  # neither was dispatched
+        # And nothing was recorded as processed/done for them.
+        assert service._seen_db.is_done(_compute_file_hash(str(empty))) is False
+        assert service._seen_db.is_done(_compute_file_hash(str(tiny))) is False
+        service._seen_db.close()
