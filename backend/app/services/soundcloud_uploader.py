@@ -29,8 +29,17 @@ UPLOAD_TIMEOUT = 600  # 10 minutes for large FLAC files
 class SoundCloudUploader:
     """Upload mixes to SoundCloud via API (preferred) or browser automation (fallback)."""
 
-    def __init__(self, db_settings_json: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        db_settings_json: Optional[Dict[str, Any]] = None,
+        on_tokens_refreshed: Optional[Any] = None,
+    ) -> None:
+        # on_tokens_refreshed: async callback (access_token, refresh_token) invoked
+        # after a successful refresh/grant. SoundCloud ROTATES refresh tokens on
+        # every use, so the new pair must be persisted or the next refresh gets
+        # invalid_grant and the upload falls into the flaky browser path.
         sj = db_settings_json or {}
+        self._on_tokens_refreshed = on_tokens_refreshed
         self._client_id = sj.get("soundcloud_client_id") or settings.SOUNDCLOUD_CLIENT_ID
         self._client_secret = sj.get("soundcloud_client_secret") or settings.SOUNDCLOUD_CLIENT_SECRET
         self._access_token: Optional[str] = sj.get("soundcloud_access_token") or settings.SOUNDCLOUD_ACCESS_TOKEN
@@ -94,9 +103,19 @@ class SoundCloudUploader:
                 self._access_token = data["access_token"]
                 self._refresh_token = data.get("refresh_token", self._refresh_token)
                 logger.info("SoundCloud access token refreshed")
+                await self._persist_tokens()
                 return self._access_token
             logger.warning("Token refresh failed: %s", resp.text)
             return None
+
+    async def _persist_tokens(self) -> None:
+        """Persist rotated tokens via the callback (best-effort)."""
+        if not self._on_tokens_refreshed:
+            return
+        try:
+            await self._on_tokens_refreshed(self._access_token, self._refresh_token)
+        except Exception as exc:
+            logger.error("Failed to persist refreshed SoundCloud tokens: %s", exc)
 
     async def _password_grant(self) -> Optional[str]:
         """Obtain access token via password grant (resource owner credentials)."""
@@ -116,6 +135,7 @@ class SoundCloudUploader:
                 self._access_token = data["access_token"]
                 self._refresh_token = data.get("refresh_token")
                 logger.info("SoundCloud access token obtained via password grant")
+                await self._persist_tokens()
                 return self._access_token
             logger.warning("Password grant failed: %s", resp.text)
             return None
