@@ -7,6 +7,8 @@ token on every refresh — the uploader must hand the new pair to the
 next refresh fails with invalid_grant.
 """
 
+import os
+
 import pytest
 
 import app.services.soundcloud_uploader as sc_mod
@@ -140,9 +142,10 @@ class TestTokenRotationPersistence:
         assert up._refresh_token == "new-refresh"
 
 
-class TestUploadSizeCap:
-    """SoundCloud's documented per-track limit is 4GB — not the old 500MB
-    self-imposed cap, which bounced a 2.9GB FLAC into the flaky browser path."""
+class TestOversizedUploadTranscode:
+    """api.soundcloud.com/tracks 413s on large bodies (observed live at 2.9GB
+    despite the web uploader's documented 4GB cap). Masters over the API cap
+    are transcoded to 320kbps MP3 (ffmpeg) before the API upload."""
 
     def _uploader_with_token(self):
         return SoundCloudUploader(
@@ -153,31 +156,108 @@ class TestUploadSizeCap:
             }
         )
 
-    async def test_2_9gb_flac_goes_through_api(self, tmp_path, monkeypatch):
-        f = tmp_path / "mix.flac"
-        f.write_bytes(b"x")
+    def _patch_getsize(self, monkeypatch, flac_size):
+        # Oversized source; anything else (the transcoded .mp3) reads small.
         monkeypatch.setattr(
-            sc_mod.os.path, "getsize", lambda p: int(2.9 * 1024 ** 3)
+            sc_mod.os.path,
+            "getsize",
+            lambda p: flac_size if str(p).endswith(".flac") else 1234,
         )
+
+    async def test_oversized_flac_is_transcoded_uploaded_and_cleaned_up(
+        self, tmp_path, monkeypatch
+    ):
+        f = tmp_path / "big-mix.flac"
+        f.write_bytes(b"x")
+        self._patch_getsize(monkeypatch, int(2.9 * 1024 ** 3))
+
+        captured = {}
+
+        async def fake_exec(*args, **kwargs):
+            out_path = args[-1]
+            with open(out_path, "wb") as fh:
+                fh.write(b"mp3data")
+            captured["cmd"] = args
+
+            class Proc:
+                returncode = 0
+
+                async def communicate(self):
+                    return (b"", b"")
+
+            return Proc()
+
+        monkeypatch.setattr(sc_mod.asyncio, "create_subprocess_exec", fake_exec)
         FakeAsyncClient.get_response = FakeResp(200)  # /me token check
         FakeAsyncClient.post_response = FakeResp(
             201,
             json_data={"permalink_url": "https://soundcloud.com/willsee/big-mix", "id": 1},
         )
+
         up = self._uploader_with_token()
         url = await up._api_upload(str(f), "Big Mix", "desc", "House", ["house"], None)
-        assert url == "https://soundcloud.com/willsee/big-mix"
 
-    async def test_above_4gb_raises(self, tmp_path, monkeypatch):
-        f = tmp_path / "mix.flac"
+        assert url == "https://soundcloud.com/willsee/big-mix"
+        # ffmpeg invoked with the 320k libmp3lame + metadata-preserving args.
+        cmd = captured["cmd"]
+        assert cmd[0] == "ffmpeg"
+        assert "libmp3lame" in cmd
+        assert sc_mod.TRANSCODE_BITRATE in cmd
+        assert "-map_metadata" in cmd
+        # The MP3 (not the FLAC) was uploaded, with the right content type...
+        name, _fh, content_type = FakeAsyncClient.last_post["files"]["track[asset_data]"]
+        assert name.endswith(".sc-upload.mp3")
+        assert content_type == "audio/mpeg"
+        # ...and the temp file was unlinked afterwards.
+        assert not os.path.exists(cmd[-1])
+
+    async def test_transcode_failure_raises_with_stderr(self, tmp_path, monkeypatch):
+        f = tmp_path / "big-mix.flac"
         f.write_bytes(b"x")
-        monkeypatch.setattr(sc_mod.os.path, "getsize", lambda p: 5 * 1024 ** 3)
+        self._patch_getsize(monkeypatch, int(2.9 * 1024 ** 3))
+
+        async def fake_exec(*args, **kwargs):
+            class Proc:
+                returncode = 1
+
+                async def communicate(self):
+                    return (b"", b"boom: no such codec")
+
+            return Proc()
+
+        monkeypatch.setattr(sc_mod.asyncio, "create_subprocess_exec", fake_exec)
         FakeAsyncClient.get_response = FakeResp(200)
+
         up = self._uploader_with_token()
-        with pytest.raises(ValueError):
-            await up._api_upload(str(f), "Huge Mix", "desc", "House", ["house"], None)
+        with pytest.raises(RuntimeError) as exc_info:
+            await up._api_upload(str(f), "Big Mix", "desc", "House", ["house"], None)
+        assert "no such codec" in str(exc_info.value)
+
+    async def test_small_file_skips_transcode(self, tmp_path, monkeypatch):
+        f = tmp_path / "small-mix.flac"
+        f.write_bytes(b"x")
+        monkeypatch.setattr(sc_mod.os.path, "getsize", lambda p: 1000)
+
+        async def fail_exec(*args, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError("transcode must not run for files under the cap")
+
+        monkeypatch.setattr(sc_mod.asyncio, "create_subprocess_exec", fail_exec)
+        FakeAsyncClient.get_response = FakeResp(200)
+        FakeAsyncClient.post_response = FakeResp(
+            201,
+            json_data={"permalink_url": "https://soundcloud.com/willsee/small-mix", "id": 2},
+        )
+
+        up = self._uploader_with_token()
+        url = await up._api_upload(str(f), "Small Mix", "desc", "House", ["house"], None)
+
+        assert url == "https://soundcloud.com/willsee/small-mix"
+        name, _fh, content_type = FakeAsyncClient.last_post["files"]["track[asset_data]"]
+        assert name.endswith(".flac")
+        assert content_type == "audio/flac"
 
     def test_upload_constants(self):
-        assert sc_mod.MAX_UPLOAD_BYTES == 4 * 1024 * 1024 * 1024
-        # Multi-GB FLACs on home upstream need well over the old 10 minutes.
+        # The public API's earned-knowledge cap (413 above this), not the web
+        # uploader's 4GB. Timeout stays 1h for large uploads on home upstream.
+        assert sc_mod.API_MAX_UPLOAD_BYTES == 450 * 1024 * 1024
         assert sc_mod.UPLOAD_TIMEOUT == 3600
