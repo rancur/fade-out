@@ -7,10 +7,14 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.services.catalog_improve import (
+    OVERUSED_TITLE_WORDS,
     build_platform_description,
     classify_title_heuristic,
+    draft_improvement_llm,
+    draft_with_diversity_guard,
     extract_tracklist_block,
     run_improve,
+    title_diversity_problem,
 )
 
 
@@ -170,6 +174,88 @@ async def _mix(mid):
         ).scalar_one()
 
 
+def _transient_mix():
+    """A Mix instance that never touches the DB (draft prompt unit tests)."""
+    from app.models import Mix
+
+    return Mix(
+        id="unit-mix", title="Raid Train 2024-05-01", genres=["techno"],
+        duration_seconds=3600.0, description_youtube="Old text.",
+    )
+
+
+class TestTitleDiversityProblem:
+    @pytest.mark.parametrize("word", OVERUSED_TITLE_WORDS)
+    def test_banned_words_flagged_any_casing(self, word):
+        assert title_diversity_problem(f"Neon {word.title()} Nights", []) is not None
+
+    def test_banned_word_requires_word_boundary(self):
+        # "sonically" contains "sonic" but is not the banned word itself
+        assert title_diversity_problem("Sonically Yours", []) is None
+
+    def test_similar_title_flagged(self):
+        used = ["Desert Frequencies After Dark"]
+        assert title_diversity_problem("Desert Frequencies After Dark!", used)
+        assert title_diversity_problem("Completely Unrelated Banger", used) is None
+
+
+class TestDraftPromptDiversity:
+    async def test_prompt_includes_banned_words_and_used_titles(self):
+        gen = FakeGenerator()
+        draft = await draft_improvement_llm(
+            _transient_mix(), gen, None,
+            used_titles=["Neon Cactus After Dark", "Four Decks and a Prayer"],
+        )
+        assert draft is not None
+        prompt = gen.calls[0]
+        assert "BANNED WORDS" in prompt
+        for word in OVERUSED_TITLE_WORDS:
+            assert word in prompt
+        assert "- Neon Cactus After Dark" in prompt
+        assert "- Four Decks and a Prayer" in prompt
+        assert "vary the title structure" in prompt.lower()
+
+    async def test_prompt_caps_used_titles_at_40_most_recent(self):
+        gen = FakeGenerator()
+        await draft_improvement_llm(
+            _transient_mix(), gen, None,
+            used_titles=[f"Filler Title Number {i}" for i in range(100)],
+        )
+        prompt = gen.calls[0]
+        assert "Filler Title Number 99" in prompt   # recent tail kept
+        assert "Filler Title Number 59" not in prompt  # older ones dropped
+
+
+class TestDiversityGuard:
+    async def test_retry_on_duplicate_then_unique(self):
+        titles = iter(["Desert Frequencies After Dark", "Freight Train Techno"])
+
+        class Seq(FakeGenerator):
+            async def _create_completion(self, prompt, max_tokens, temperature):
+                self.calls.append(prompt)
+                return FakeResponse(), json.dumps(
+                    {"title": next(titles), "description": "Body."}
+                )
+
+        gen = Seq()
+        draft = await draft_with_diversity_guard(
+            _transient_mix(), gen, None,
+            used_titles=["Desert Frequencies After Dark"],
+        )
+        assert draft["title"] == "Freight Train Techno"
+        assert len(gen.calls) == 2
+        assert "WAS REJECTED" in gen.calls[1]
+        assert "too similar" in gen.calls[1].lower()
+
+    async def test_no_retry_when_first_draft_is_fine(self):
+        gen = FakeGenerator()
+        draft = await draft_with_diversity_guard(
+            _transient_mix(), gen, None, used_titles=["Something Else Entirely"]
+        )
+        assert draft["title"] == "Peak-Time Techno Rampage"
+        assert len(gen.calls) == 1
+
+
 class TestRunImprove:
     async def test_generic_mix_gets_title_and_description_drafts(
         self, prepared_db, fake_llm
@@ -255,6 +341,100 @@ class TestRunImprove:
         assert summary["keepers_locked"] == 1
         assert summary["proposals_drafted"] == 0
         assert (await _mix(mix_id)).title_locked is True
+
+    async def test_used_titles_and_accumulator_thread_across_mixes(
+        self, prepared_db, monkeypatch
+    ):
+        """The 2nd mix's draft prompt lists the 1st mix's fresh title (and DB
+        proposal titles); a duplicate draft triggers the guard's retry."""
+        import app.services.description_generator as dg
+
+        titles = iter(
+            ["Midnight Freight Elevator",
+             "Midnight Freight Elevator",  # duplicate -> guard retries
+             "Bassline Border Crossing"]
+        )
+
+        class SeqGenerator(FakeGenerator):
+            async def _create_completion(self, prompt, max_tokens, temperature):
+                self.calls.append(prompt)
+                if "triaging DJ mix titles" in prompt:
+                    return FakeResponse(), json.dumps(
+                        [{"n": 1, "class": "generic"}]
+                    )
+                return FakeResponse(), json.dumps(
+                    {"title": next(titles), "description": "Body."}
+                )
+
+        FakeGenerator.instances = []
+        monkeypatch.setattr(dg, "DescriptionGenerator", SeqGenerator)
+
+        first = await _make_mix(title="Raid Train 2024-05-01")
+        await _make_mix(title="Twitch VOD 22")
+        # An applied AI title proposal already in the DB must count as used.
+        from app.database import async_session_factory
+        from app.models import MixProposal
+
+        async with async_session_factory() as session:
+            session.add(
+                MixProposal(
+                    mix_id=first, platform="both", field="title",
+                    proposed_value="Cactus Bloom Sundown", status="applied",
+                    created_by="ai",
+                )
+            )
+            await session.commit()
+
+        summary = await run_improve("all_generic")
+        assert summary["proposals_drafted"] == 6  # 3 per mix
+
+        proposals = await _proposals()
+        drafted = {
+            p.proposed_value for p in proposals
+            if p.field == "title" and p.status == "draft"
+        }
+        assert drafted == {"Midnight Freight Elevator", "Bassline Border Crossing"}
+
+        draft_prompts = [
+            c for g in FakeGenerator.instances for c in g.calls if "triaging" not in c
+        ]
+        assert len(draft_prompts) == 3  # draft + duplicate retry + draft
+        # Every draft prompt carries the applied proposal title from the DB.
+        assert all("Cactus Bloom Sundown" in p for p in draft_prompts)
+        # The run's first accepted title reached the later prompts.
+        assert "Midnight Freight Elevator" in draft_prompts[-1]
+        # The retry prompt carries the "be different" addendum.
+        assert any("WAS REJECTED" in p for p in draft_prompts)
+
+    async def test_guard_warns_when_retry_is_still_bad(
+        self, prepared_db, monkeypatch
+    ):
+        import app.services.description_generator as dg
+
+        class StubbornGenerator(FakeGenerator):
+            async def _create_completion(self, prompt, max_tokens, temperature):
+                self.calls.append(prompt)
+                if "triaging DJ mix titles" in prompt:
+                    return FakeResponse(), json.dumps([{"n": 1, "class": "generic"}])
+                return FakeResponse(), json.dumps(
+                    {"title": "Sonic Odyssey", "description": "Body."}
+                )
+
+        FakeGenerator.instances = []
+        monkeypatch.setattr(dg, "DescriptionGenerator", StubbornGenerator)
+        await _make_mix()
+        summary = await run_improve("all_generic")
+
+        # Kept despite the banned words, but with an activity warning.
+        assert summary["proposals_drafted"] == 3
+        titles = {p.proposed_value for p in await _proposals() if p.field == "title"}
+        assert titles == {"Sonic Odyssey"}
+
+        from app.services import activity_log
+
+        items, _ = await activity_log.query(event="catalog_improve", level="warn")
+        assert len(items) == 1
+        assert "Diversity guard" in items[0]["message"]
 
     async def test_activity_summary_emitted(self, prepared_db, fake_llm):
         await _make_mix()
