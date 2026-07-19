@@ -20,55 +20,50 @@ logger = logging.getLogger(__name__)
 # Brand visual defaults
 # ---------------------------------------------------------------------------
 
+# Brand base is the pixel-art / psychedelic / all-seeing-eyes aesthetic Will
+# likes -- but GENRE-NEUTRAL. The old default hard-coded a "psychedelic nature
+# scene ... eyes in foliage ... lush vegetation", which forced EVERY mix into a
+# palm-tree/jungle landscape (wrong for bass music). The concrete environment
+# now comes from GENRE_VISUAL_MODIFIERS so a DnB set reads as a dark neon
+# rave -- not a tropical lagoon.
 DEFAULT_VISUAL_STYLE = (
-    "Chunky pixel art style, psychedelic nature scene, vibrant colors, "
-    "eyes everywhere watching from foliage, retro game aesthetic, "
-    "thick bold pixels, lush vegetation with hidden creatures, "
-    "trippy color palette, low-resolution rendered at high-resolution, "
-    "no text, no watermarks, no logos"
+    "Chunky pixel art style, psychedelic and vibrant, glowing neon colors, "
+    "eyes everywhere watching, retro game aesthetic, thick bold pixels, "
+    "trippy color palette, high-energy electronic music artwork, "
+    "low-resolution rendered at high-resolution, no text, no watermarks, no logos"
 )
 
 DEFAULT_COLOR_PALETTE = [
-    "#FF6B35",  # desert orange
+    "#FF6B35",  # hot orange
     "#7B2D8E",  # psychedelic purple
-    "#1B998B",  # jungle teal
-    "#F7DC6F",  # golden sand
+    "#1B998B",  # electric teal
+    "#F7DC6F",  # golden
     "#E74C3C",  # hot red
     "#2ECC71",  # neon green
-    "#3498DB",  # sky blue
+    "#3498DB",  # electric blue
     "#E91E63",  # magenta
 ]
 
 DEFAULT_MOTIFS = [
     "pixel art eyes",
-    "chunky vegetation",
     "psychedelic colors",
     "retro game aesthetic",
-    "desert landscape elements",
+    "glowing neon",
     "trippy patterns",
-    "hidden faces in nature",
+    "bold geometric shapes",
 ]
 
-# AI fallback for the YouTube thumbnail when no paired video frame is available.
-# Retires the psychedelic-nature-landscape default: a mislabelled genre used to
-# turn the thumbnail into a literal palm-tree/aurora scene. This puts a DJ behind
-# the decks front-and-centre instead.
-DJ_THUMBNAIL_STYLE = (
-    "Cinematic wide photograph of a DJ performing behind the decks at a packed "
-    "nightclub, hands on the mixer and CDJs, dramatic stage lighting, lasers and "
-    "atmospheric haze, crowd silhouettes with raised hands in the background, "
-    "energetic nightlife atmosphere, shallow depth of field, sharp high detail, "
-    "no text, no watermarks, no logos"
-)
-
 GENRE_VISUAL_MODIFIERS: Dict[str, str] = {
-    "house": "warm sunset, terrace vibes, palm trees, golden hour lighting, disco ball reflections",
+    "house": "warm sunset, rooftop terrace vibes, golden hour lighting, disco ball reflections, dancing crowd",
     "techno": "dark industrial, concrete textures, strobe lights, underground bunker, smoke machines",
-    "drum and bass": "neon jungle, fast motion blur, lightning strikes, urban nightscape, graffiti walls",
+    "drum and bass": "dark neon cityscape at night, glowing subwoofers and bass bins, laser grids, fast motion blur, lightning arcs, electric blue purple and green, futuristic rave energy",
     "trance": "cosmic nebula, aurora borealis, crystal formations, ethereal glow, starfield",
-    "dubstep": "heavy bass waveforms, cracked earth, seismic energy, dark neon, bass face skull",
-    "ambient": "misty mountains, still water, bioluminescent forest, fog, gentle moonlight",
-    "breakbeat": "shattered glass, kaleidoscope, street art, broken beat visualizer, urban chaos",
+    "dubstep": "massive bass waveforms, cracked concrete, seismic shockwaves, glitch distortion, dark aggressive neon, bass-face skull",
+    "trap": "gritty urban night, purple and gold haze, heavy 808 sub-bass energy, neon signs, smoky trap house",
+    "garage": "sleek UK garage club, chrome and neon, shuffling dancefloor lights, deep blues and magenta",
+    "ambient": "misty mountains, still water, bioluminescent glow, fog, gentle moonlight",
+    "breakbeat": "shattered glass, kaleidoscope, street art, broken-beat visualizer, vivid neon, urban chaos",
+    "electronic": "glowing synthwave grid, neon geometric shapes, laser lights, futuristic club energy, vibrant electric colors",
 }
 
 
@@ -134,34 +129,19 @@ class ArtGenerator:
         """Generate a 1920x1080 YouTube thumbnail. Returns the saved file path.
 
         Strategy, in order:
-          1. PRIMARY -- grab a real frame from the paired video at a peak-energy
-             timestamp, then brand-overlay it. A photo of the actual set beats
-             any generated art.
-          2. AI DJ-at-the-decks image (fal.ai -> DALL-E) when there is no video.
-          3. Letterboxed cover art as a last resort.
+          1. PRIMARY -- AI-generated branded art from the GENRE-DRIVEN prompt
+             (fal.ai -> DALL-E). This is Will's signature look; the genre-neutral
+             base + GENRE_VISUAL_MODIFIERS make a DnB set read as a dark neon
+             rave rather than a tropical landscape.
+          2. FALLBACK -- a frame grabbed from the paired video at a peak-energy
+             timestamp, if the AI providers fail.
+          3. FALLBACK -- letterboxed cover art as a last resort.
+        Text is brand-overlaid via ``_overlay_text`` in every case.
         """
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-        # 1. Primary: branded frame grabbed from the paired video.
-        if video_file_path and os.path.exists(video_file_path):
-            ts = self._peak_energy_timestamp(energy_profile, duration_seconds)
-            frame = await asyncio.to_thread(
-                self._grab_video_frame, video_file_path, output_path, ts
-            )
-            if frame:
-                self._overlay_text(output_path, mix_title, genres)
-                logger.info(
-                    "YouTube thumbnail from video frame at %.0fs saved to %s",
-                    ts, output_path,
-                )
-                return output_path
-            logger.warning(
-                "Video frame grab failed for %s, falling back to AI thumbnail",
-                video_file_path,
-            )
-
-        # 2. AI DJ-at-the-decks image.
-        prompt = self._build_dj_thumbnail_prompt(genres, vibes, brand_settings)
+        # 1. Primary: AI-generated branded, genre-driven art.
+        prompt = self._build_prompt(genres, vibes, brand_settings, aspect="wide")
         image_url = await self._generate_with_fal(
             prompt, width=1920, height=1080, session=session, mix_id=mix_id,
         )
@@ -172,10 +152,24 @@ class ArtGenerator:
         if image_url:
             await self._download_and_save(image_url, output_path, resize=(1920, 1080))
             self._overlay_text(output_path, mix_title, genres)
-            logger.info("YouTube thumbnail (AI DJ scene) saved to %s", output_path)
+            logger.info("YouTube thumbnail (AI art) saved to %s", output_path)
             return output_path
 
-        # 3. Letterbox the cover art.
+        # 2. Fallback: frame grabbed from the paired video.
+        if video_file_path and os.path.exists(video_file_path):
+            ts = self._peak_energy_timestamp(energy_profile, duration_seconds)
+            frame = await asyncio.to_thread(
+                self._grab_video_frame, video_file_path, output_path, ts
+            )
+            if frame:
+                self._overlay_text(output_path, mix_title, genres)
+                logger.info(
+                    "YouTube thumbnail from video frame at %.0fs saved to %s (AI fallback)",
+                    ts, output_path,
+                )
+                return output_path
+
+        # 3. Fallback: letterbox the cover art.
         if cover_art_path and os.path.exists(cover_art_path):
             self._letterbox_cover(cover_art_path, output_path)
             self._overlay_text(output_path, mix_title, genres)
@@ -243,23 +237,6 @@ class ArtGenerator:
             logger.warning("ffmpeg produced no frame at %.0fs", timestamp)
             return None
         return output_path
-
-    def _build_dj_thumbnail_prompt(
-        self,
-        genres: List[str],
-        vibes: List[str],
-        brand_settings: Optional[BrandSettings],
-    ) -> str:
-        """DJ-at-the-decks prompt for the AI thumbnail fallback."""
-        style = DJ_THUMBNAIL_STYLE
-        if brand_settings and getattr(brand_settings, "thumbnail_style", None):
-            style = brand_settings.thumbnail_style
-        genre_str = ", ".join(genres[:3]) if genres else "electronic"
-        parts = [style, f"{genre_str} DJ set"]
-        if vibes:
-            parts.append(f"mood: {', '.join(vibes[:3])}")
-        parts.append("wide cinematic composition, 16:9 aspect ratio")
-        return ", ".join(parts)
 
     # ------------------------------------------------------------------
     # Prompt construction
