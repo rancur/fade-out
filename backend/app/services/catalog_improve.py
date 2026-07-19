@@ -138,6 +138,13 @@ RULES FOR THE DESCRIPTION:
 - Do NOT write a tracklist — it is re-appended automatically afterward
 - Do NOT include any links or a link list — links are appended automatically
 
+RULES FOR THE TAGS (search discoverability):
+- "tags_youtube": 15-20 search tags — genres and subgenres, notable artists
+  from the current description's tracklist, "{brand_name}", "dj mix",
+  "dj set", the series/show name if any, and the year if known
+- "tags_soundcloud": up to 30 tags, same approach, SoundCloud-style
+- Plain lowercase strings, no "#" characters, no duplicates
+
 MIX DATA:
 - Current title: {current_title}
 - Genres: {genres}
@@ -146,12 +153,38 @@ MIX DATA:
 {current_description}
 {retry_feedback}
 Respond with ONLY a JSON object:
-{{"title": "...", "description": "..."}}\
+{{"title": "...", "description": "...",
+ "tags_youtube": ["..."], "tags_soundcloud": ["..."]}}\
 """
+
+# Tag caps: YouTube search tags stay ~15-20; SoundCloud's tag_list caps at 30.
+YT_TAGS_MAX = 20
+SC_TAGS_MAX = 30
 
 
 def _strip_json_fences(text: str) -> str:
     return re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.S)
+
+
+def _clean_tags(raw: Any, cap: int) -> List[str]:
+    """Normalize an LLM tags list: strings only, '#' stripped, case-insensitive
+    dedupe, order preserved, capped. Anything malformed -> []."""
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for item in raw:
+        tag = str(item).strip().lstrip("#").strip()
+        if not tag:
+            continue
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+        if len(out) >= cap:
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -243,8 +276,11 @@ async def draft_improvement_llm(
     session=None,
     used_titles: Optional[List[str]] = None,
     retry_feedback: str = "",
-) -> Optional[Dict[str, str]]:
-    """Draft {"title", "description"} for a generic mix, or None on failure.
+) -> Optional[Dict[str, Any]]:
+    """Draft {"title", "description", "tags_youtube", "tags_soundcloud"} for a
+    generic mix, or None on failure. The tags lists (search-discoverability
+    riders) are optional — an LLM response without them still yields a valid
+    title/description draft.
 
     ``used_titles`` (existing mix titles + open/applied title proposals + drafts
     already produced this run) is injected into the prompt so the LLM stops
@@ -285,7 +321,12 @@ async def draft_improvement_llm(
             return None
         if len(title) > TITLE_MAX_CHARS:
             title = title[: TITLE_MAX_CHARS - 3].rstrip() + "..."
-        return {"title": title, "description": description}
+        return {
+            "title": title,
+            "description": description,
+            "tags_youtube": _clean_tags(data.get("tags_youtube"), YT_TAGS_MAX),
+            "tags_soundcloud": _clean_tags(data.get("tags_soundcloud"), SC_TAGS_MAX),
+        }
     except Exception as exc:
         logger.warning("LLM improve draft failed for mix %s: %s", mix.id, exc)
         return None
@@ -314,7 +355,7 @@ def title_diversity_problem(title: str, used_titles: List[str]) -> Optional[str]
 
 async def draft_with_diversity_guard(
     mix: Mix, generator, session, used_titles: List[str]
-) -> Optional[Dict[str, str]]:
+) -> Optional[Dict[str, Any]]:
     """draft_improvement_llm + the diversity guard: retry once on a banned-word
     or too-similar title; if the retry is still bad (or fails), keep the best
     draft we have but log an activity warning."""
@@ -377,7 +418,7 @@ async def _has_open_proposal(session, mix_id: str, field: str) -> bool:
     return result.first() is not None
 
 
-def _draft_proposals_for_mix(mix: Mix, draft: Dict[str, str]) -> List[MixProposal]:
+def _draft_proposals_for_mix(mix: Mix, draft: Dict[str, Any]) -> List[MixProposal]:
     """Turn an LLM draft into proposal rows for the platforms the mix is on."""
     platforms = _mix_platforms(mix)
     if not platforms:
@@ -439,6 +480,24 @@ def _draft_proposals_for_mix(mix: Mix, draft: Dict[str, str]) -> List[MixProposa
                     field="description",
                     current_value=current,
                     proposed_value=proposed,
+                    status="draft",
+                    created_by="ai",
+                )
+            )
+
+    # Tags rider: per-platform discoverability tag proposals (JSON-encoded,
+    # like every structured proposed_value). Only when the LLM produced them.
+    current_tags = json.dumps(mix.tags or [])
+    for platform, key in (("youtube", "tags_youtube"), ("soundcloud", "tags_soundcloud")):
+        tags = draft.get(key) or []
+        if platform in platforms and tags:
+            proposals.append(
+                MixProposal(
+                    mix_id=mix.id,
+                    platform=platform,
+                    field="tags",
+                    current_value=current_tags,
+                    proposed_value=json.dumps(tags),
                     status="draft",
                     created_by="ai",
                 )

@@ -67,6 +67,9 @@ vi.mock('@/api/client', () => ({
       if (url === '/catalog/backfill-status') {
         return Promise.resolve({ data: { running: false, last_backfill: null } })
       }
+      if (url === '/catalog/organize-playlists/status') {
+        return Promise.resolve({ data: { running: false, last_playlists: null } })
+      }
       if (url === '/catalog/proposals') {
         return Promise.resolve({ data: { items: [], total: 5 } })
       }
@@ -154,6 +157,52 @@ describe('CatalogPage', () => {
         mix_ids: null,
       })
     })
+  })
+
+  it('starts playlist organization via POST /catalog/organize-playlists', async () => {
+    renderPage()
+
+    const organizeButton = await screen.findByRole('button', {
+      name: /organize playlists/i,
+    })
+    fireEvent.click(organizeButton)
+
+    await waitFor(() => {
+      expect(client.post).toHaveBeenCalledWith('/catalog/organize-playlists', {
+        mix_ids: 'all',
+      })
+    })
+  })
+
+  it('shows the last playlist organization summary line when idle', async () => {
+    const defaultGet = vi.mocked(client.get).getMockImplementation()!
+    vi.mocked(client.get).mockImplementation((url: string) => {
+      if (url === '/catalog/organize-playlists/status') {
+        return Promise.resolve({
+          data: {
+            running: false,
+            last_playlists: {
+              started_at: '2026-07-02T00:00:00Z',
+              finished_at: '2026-07-02T00:10:00Z',
+              status: 'ok',
+              errors: [],
+              targeted: 12,
+              youtube: { placed: 9, created_playlists: 2, queued: 3 },
+              soundcloud: { placed: 11, created_playlists: 1 },
+            },
+          },
+        })
+      }
+      return defaultGet(url)
+    })
+
+    renderPage()
+
+    expect(
+      await screen.findByText(
+        'Playlists ok: 9 YT + 11 SC placements, 3 playlists created, 3 queued on quota',
+      ),
+    ).toBeTruthy()
   })
 
   it('shows the last backfill summary line when idle', async () => {
