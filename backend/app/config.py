@@ -128,10 +128,12 @@ class Settings(BaseSettings):
     # --- Cross-linking ---
     # When True, the cross_link step pushes reciprocal links to the LIVE
     # platform descriptions (YouTube videos.update + SoundCloud PUT /tracks/:id)
-    # using the existing OAuth tokens -- no new credentials required. Left OFF by
-    # default so a published description is never mutated without an explicit
-    # opt-in; the code path is fully implemented and gated on this flag.
-    CROSS_LINK_PUSH_ENABLED: bool = False
+    # using the existing OAuth tokens -- no new credentials required. ON by
+    # default: with it off the cross-links only ever landed in the DB and the
+    # published descriptions never carried them (observed live). Every push is
+    # best-effort and can never fail the pipeline's final step; set to False to
+    # opt out of mutating published descriptions.
+    CROSS_LINK_PUSH_ENABLED: bool = True
 
     # --- Track-detection merge ---
     # Gap-filling detections (Shazam/AudD) scoring strictly below this confidence

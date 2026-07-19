@@ -207,17 +207,29 @@ class AudioAnalyzer:
         """Use Shazam to identify tracks at sample points.
 
         For each sample point, tries two clips (primary and +30s offset) to
-        catch transitions. If the primary clip fails recognition, retries at
-        +45s. Each clip is run through Shazam first and, if an AudD token is
-        configured, falls back to AudD when Shazam returns nothing.
-        Consecutive duplicate tracks are deduplicated (keep first occurrence).
+        catch transitions — BOTH tracks of a transition are kept. If the
+        primary clip fails recognition, it retries at +45s. Each clip is run
+        through Shazam first and, if an AudD token is configured, falls back
+        to AudD when Shazam returns nothing.
+
+        Dedup is consecutive-only: a track may legitimately reappear later in
+        the set (A -> B -> A), so a global seen-set would wrongly drop the
+        comeback.
         """
         identified: List[TrackHit] = []
-        seen_titles: set[str] = set()
         last_title: Optional[str] = None
 
-        # Track how many times each song is identified (for confidence filtering)
+        # Track how many times each song is identified (for confidence scoring)
         title_hit_count: dict[str, int] = {}
+
+        def _emit(hit: TrackHit) -> None:
+            nonlocal last_title
+            title_key = hit.title.lower()
+            title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
+            if title_key == last_title:
+                return
+            identified.append(hit)
+            last_title = title_key
 
         for t in sample_times:
             # Primary clip at sample point
@@ -225,57 +237,25 @@ class AudioAnalyzer:
             if not hit:
                 # Retry with offset if primary fails
                 hit = await self._recognize_segment(path, t + RETRY_CLIP_OFFSET, sr_native)
-
             if hit:
-                title_key = hit.title.lower()
-                title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
-                if title_key != last_title and title_key not in seen_titles:
-                    seen_titles.add(title_key)
-                    identified.append(hit)
-                    last_title = title_key
+                _emit(hit)
 
-            # Secondary clip at +30s to catch tracks during transitions
-            # Only add if we didn't already get a hit at this point
-            if not hit:
-                hit2 = await self._recognize_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
-                if hit2:
-                    title_key = hit2.title.lower()
-                    title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
-                    if title_key != last_title and title_key not in seen_titles:
-                        seen_titles.add(title_key)
-                        identified.append(hit2)
-                        last_title = title_key
+            # Secondary clip at +30s: catches the incoming track during a
+            # transition window. Emit it even when the primary hit — if it
+            # differs, both tracks of the blend belong in the tracklist.
+            hit2 = await self._recognize_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
+            if hit2:
+                _emit(hit2)
 
-        # Sort by timestamp
+        # Sort by timestamp, then re-apply consecutive dedup in time order
+        # (out-of-order emission across sample points can duplicate neighbors)
         identified.sort(key=lambda h: h.timestamp_seconds)
-
-        # Post-processing: remove likely false positives
-        # A track identified only once AND very close (<45s) to neighbors on BOTH sides
-        # is likely a false positive from a transition blend
-        if len(identified) > 3:
-            filtered: List[TrackHit] = []
-            for i, track in enumerate(identified):
-                title_key = track.title.lower()
-                hits = title_hit_count.get(title_key, 0)
-
-                # Keep if identified more than once (confirmed)
-                if hits >= 2:
-                    filtered.append(track)
-                    continue
-
-                # Keep if there's enough gap from at least one neighbor
-                prev_gap = (track.timestamp_seconds - identified[i - 1].timestamp_seconds) if i > 0 else 999
-                next_gap = (identified[i + 1].timestamp_seconds - track.timestamp_seconds) if i < len(identified) - 1 else 999
-
-                # Only filter if BOTH gaps are tiny (sandwiched between close tracks)
-                if prev_gap < 45 and next_gap < 45:
-                    logger.debug(
-                        "Filtering likely false positive: %s - %s at %.0fs (single hit, gaps: %.0fs/%.0fs)",
-                        track.artist, track.title, track.timestamp_seconds, prev_gap, next_gap,
-                    )
-                else:
-                    filtered.append(track)
-            identified = filtered
+        deduped: List[TrackHit] = []
+        for track in identified:
+            if deduped and deduped[-1].title.lower() == track.title.lower():
+                continue
+            deduped.append(track)
+        identified = deduped
 
         # Tag each surviving hit with a recognition confidence derived from how
         # many times its title was independently recognized. The confidence

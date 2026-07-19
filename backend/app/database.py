@@ -34,7 +34,22 @@ engine = create_async_engine(
     _db_url,
     echo=False,
     future=True,
+    # SQLite with several concurrent writers (pipeline task, activity/log
+    # writes, API sessions) needs a busy timeout, or contention surfaces as
+    # instant "database is locked" errors instead of a short wait.
+    connect_args={"timeout": 30} if "sqlite" in _db_url else {},
 )
+
+if "sqlite" in _db_url:
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):
+        # WAL lets readers proceed while one writer commits; busy_timeout
+        # makes late writers queue instead of erroring out.
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
 
 async_session_factory = async_sessionmaker(
     engine,
