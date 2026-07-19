@@ -67,12 +67,14 @@ class PipelineStep(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     mix_id = Column(String, ForeignKey("mixes.id"))
     step_name = Column(String)  # detect, analyze, generate_description, generate_art, upload_soundcloud, upload_youtube, verify_soundcloud, verify_youtube, cross_link
-    status = Column(String)  # pending, running, completed, failed, skipped
+    status = Column(String)  # pending, running, completed, failed, skipped, waiting, interrupted
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
     error = Column(Text)
     retry_count = Column(Integer, default=0)
     output_json = Column(JSON)
+    progress = Column(Integer, nullable=True)  # 0-100 live step progress
+    progress_detail = Column(String, nullable=True)  # e.g. "1.2 GB / 2.9 GB"
 
     mix = relationship("Mix", back_populates="steps")
 

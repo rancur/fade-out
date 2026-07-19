@@ -1,4 +1,10 @@
-"""Multi-channel notification service: Discord webhooks, email, generic webhooks."""
+"""Multi-channel notification service: Discord webhooks, email, generic webhooks.
+
+Configuration comes from ``AppSettings.settings_json`` (the ``notification_*``
+keys written by ``PUT /api/notifications/settings``), with env settings used as
+fallback ONLY for keys absent from the DB. The DB read is cached for 60s and
+uses its own session — the service runs outside any request scope.
+"""
 
 import asyncio
 import logging
@@ -7,14 +13,13 @@ import time
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import async_session_factory
-from app.models import Notification
+from app.models import AppSettings, Notification
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +32,27 @@ NOTIFICATION_TYPES = {
     "upgrade_available",
 }
 
+# Per-event-type default toggles when notification_events is not configured.
+# Terminal/actionable events on, per-step chatter off.
+DEFAULT_EVENT_TOGGLES: Dict[str, bool] = {
+    "pipeline_started": False,
+    "step_completed": False,
+    "upload_complete": True,
+    "error": True,
+    "draft_ready": True,
+    "upgrade_available": True,
+}
+
+# Severity of each notification type, checked against notification_min_level.
+TYPE_LEVELS: Dict[str, str] = {
+    "error": "error",
+}
+LEVEL_RANK = {"info": 0, "warn": 1, "error": 2}
+
 # Rate limit: 1 notification per mix per step per channel within this window
 RATE_LIMIT_SECONDS = 300
+
+CONFIG_CACHE_SECONDS = 60
 
 # Color codes for Discord embeds
 DISCORD_COLORS: Dict[str, int] = {
@@ -41,6 +65,66 @@ DISCORD_COLORS: Dict[str, int] = {
 }
 
 
+def _split_urls(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return [u.strip() for u in value.split(",") if u.strip()]
+
+
+def resolve_config(settings_json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Resolve effective notification config from DB settings_json + env.
+
+    DB keys win whenever present (even if empty/None — an explicit DB write
+    can disable a channel); env values fill in ONLY for absent keys. Empty
+    env strings resolve to None so "unconfigured" is uniform.
+    """
+    sj = settings_json or {}
+
+    def pick(key: str, env_value: Any) -> Any:
+        if key in sj:
+            return sj[key]
+        return env_value if env_value not in ("", None) else None
+
+    events = dict(DEFAULT_EVENT_TOGGLES)
+    raw_events = sj.get("notification_events")
+    if isinstance(raw_events, dict):
+        for k, v in raw_events.items():
+            events[k] = bool(v)
+
+    min_level = sj.get("notification_min_level") or "info"
+    if min_level not in LEVEL_RANK:
+        min_level = "info"
+
+    port = pick("notification_email_smtp_port", settings.NOTIFICATION_EMAIL_SMTP_PORT)
+    try:
+        port = int(port) if port is not None else 587
+    except (TypeError, ValueError):
+        port = 587
+
+    smtp_user = pick("notification_email_smtp_user", settings.NOTIFICATION_EMAIL_SMTP_USER)
+    webhook_raw = pick("notification_webhook_urls", settings.NOTIFICATION_WEBHOOK_URLS)
+
+    return {
+        "discord_webhook_url": pick(
+            "notification_discord_webhook_url", settings.NOTIFICATION_DISCORD_WEBHOOK_URL
+        ),
+        "email_smtp_host": pick(
+            "notification_email_smtp_host", settings.NOTIFICATION_EMAIL_SMTP_HOST
+        ),
+        "email_smtp_port": port,
+        "email_smtp_user": smtp_user,
+        "email_smtp_password": pick(
+            "notification_email_smtp_password", settings.NOTIFICATION_EMAIL_SMTP_PASSWORD
+        ),
+        "email_from": pick("notification_email_from", None) or smtp_user,
+        "email_to": pick("notification_email_to", settings.NOTIFICATION_EMAIL_TO),
+        "email_secure": bool(sj.get("notification_email_smtp_secure", True)),
+        "webhook_urls": webhook_raw if isinstance(webhook_raw, list) else _split_urls(webhook_raw),
+        "events": events,
+        "min_level": min_level,
+    }
+
+
 class NotificationService:
     """Async notification service with rate limiting and multiple channels."""
 
@@ -50,6 +134,45 @@ class NotificationService:
         self._worker_task: Optional[asyncio.Task] = None
         # Rate limit tracker: (mix_id, step, channel) -> last_sent_timestamp
         self._rate_tracker: Dict[tuple, float] = {}
+        # Config cache (60s TTL)
+        self._config_cache: Optional[Dict[str, Any]] = None
+        self._config_cached_at: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
+
+    def invalidate_config_cache(self) -> None:
+        """Drop the cached config so the next send re-reads the DB."""
+        self._config_cache = None
+        self._config_cached_at = 0.0
+
+    async def get_config(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Effective config: DB settings_json first, env fallback. Cached 60s."""
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._config_cache is not None
+            and (now - self._config_cached_at) < CONFIG_CACHE_SECONDS
+        ):
+            return self._config_cache
+
+        sj: Dict[str, Any] = {}
+        try:
+            async with async_session_factory() as session:
+                row = await session.get(AppSettings, 1)
+                if row is not None:
+                    sj = row.settings_json or {}
+        except Exception:
+            logger.exception("Failed to read notification config from DB; using env fallback")
+
+        self._config_cache = resolve_config(sj)
+        self._config_cached_at = now
+        return self._config_cache
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
         """Start the background notification worker."""
@@ -67,6 +190,10 @@ class NotificationService:
             except asyncio.CancelledError:
                 pass
         logger.info("Notification service stopped")
+
+    # ------------------------------------------------------------------
+    # Queueing / dispatch
+    # ------------------------------------------------------------------
 
     async def notify(
         self,
@@ -91,6 +218,49 @@ class NotificationService:
         await self._queue.put(payload)
         logger.debug("Notification queued: %s for mix %s", notification_type, mix_id)
 
+    async def handle_orchestrator_event(
+        self, event_type: str, mix_id: Optional[str], data: Optional[dict] = None
+    ) -> None:
+        """Orchestrator listener: translate pipeline events into notifications.
+
+        Per-event toggles + min-level from the saved settings are applied at
+        send time (config may change while an event sits in the queue).
+        """
+        data = data or {}
+        if event_type == "pipeline_started":
+            await self.notify("pipeline_started", mix_id=mix_id,
+                              message="Pipeline started.", data=data)
+        elif event_type == "step_completed":
+            step = data.get("step", "?")
+            elapsed = data.get("elapsed_seconds")
+            msg = f"Step {step} completed"
+            if elapsed is not None:
+                msg += f" in {elapsed:.1f}s"
+            await self.notify("step_completed", mix_id=mix_id, message=msg + ".", data=data)
+        elif event_type == "upload_complete":
+            await self.notify("upload_complete", mix_id=mix_id,
+                              message="Mix finished: all uploads complete.", data=data)
+        elif event_type == "error":
+            await self.notify("error", mix_id=mix_id,
+                              message=f"Mix failed at step {data.get('step')}.", data=data)
+        elif event_type == "draft_ready":
+            await self.notify("draft_ready", mix_id=mix_id,
+                              message="Mix is ready for draft review.", data=data)
+        # step_progress and anything else: intentionally not notified.
+
+    def _passes_filters(self, ntype: str, cfg: Dict[str, Any]) -> bool:
+        if not cfg["events"].get(ntype, True):
+            logger.debug("Notification type %s disabled by settings", ntype)
+            return False
+        type_level = TYPE_LEVELS.get(ntype, "info")
+        if LEVEL_RANK[type_level] < LEVEL_RANK[cfg["min_level"]]:
+            logger.debug(
+                "Notification type %s (%s) below min level %s",
+                ntype, type_level, cfg["min_level"],
+            )
+            return False
+        return True
+
     async def _worker(self) -> None:
         """Process queued notifications."""
         while self._running:
@@ -107,32 +277,79 @@ class NotificationService:
                 logger.exception("Error sending notification: %s", payload.get("type"))
 
     async def _send_all_channels(self, payload: Dict[str, Any]) -> None:
-        """Send to all configured channels."""
+        """Send to all configured channels, honoring toggles + min level."""
+        cfg = await self.get_config()
+
+        if not self._passes_filters(payload.get("type", ""), cfg):
+            return
+
         tasks = []
+        if cfg["discord_webhook_url"]:
+            tasks.append(self._send_discord(payload, cfg))
 
-        if settings.NOTIFICATION_DISCORD_WEBHOOK_URL:
-            tasks.append(self._send_discord(payload))
+        if cfg["email_smtp_host"] and cfg["email_to"]:
+            tasks.append(self._send_email(payload, cfg))
 
-        if settings.NOTIFICATION_EMAIL_SMTP_HOST and settings.NOTIFICATION_EMAIL_TO:
-            tasks.append(self._send_email(payload))
-
-        webhook_urls = settings.get_webhook_urls()
-        for url in webhook_urls:
-            tasks.append(self._send_webhook(url, payload))
+        for url in cfg["webhook_urls"]:
+            tasks.append(self._send_webhook(url, payload, cfg))
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     # ------------------------------------------------------------------
+    # Test sends
+    # ------------------------------------------------------------------
+
+    async def send_test(self, channel: str, message: Optional[str] = None) -> Tuple[bool, str]:
+        """Send a test notification to one channel using the CURRENT saved
+        settings. Bypasses event toggles/min-level (a test should always try).
+        """
+        cfg = await self.get_config(force_refresh=True)
+        payload = {
+            "type": "test",
+            "mix_id": None,
+            "title": "Test Notification",
+            "message": message or "This is a test notification from Fade-Out.",
+            "data": {},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            if channel == "discord":
+                if not cfg["discord_webhook_url"]:
+                    return False, "Discord webhook URL is not configured."
+                ok = await self._send_discord(payload, cfg)
+            elif channel == "email":
+                if not (cfg["email_smtp_host"] and cfg["email_to"]):
+                    return False, "Email SMTP host / recipient are not configured."
+                ok = await self._send_email(payload, cfg)
+            elif channel == "webhook":
+                if not cfg["webhook_urls"]:
+                    return False, "No webhook URLs are configured."
+                results = await asyncio.gather(
+                    *[self._send_webhook(u, payload, cfg) for u in cfg["webhook_urls"]],
+                    return_exceptions=True,
+                )
+                ok = any(r is True for r in results)
+            else:
+                return False, f"Unknown channel: {channel}"
+        except Exception as exc:
+            logger.exception("Test notification failed for channel %s", channel)
+            return False, f"Failed to send test notification: {exc}"
+
+        if ok:
+            return True, f"Test notification sent to {channel}."
+        return False, f"Test notification to {channel} failed (see logs / activity feed)."
+
+    # ------------------------------------------------------------------
     # Discord
     # ------------------------------------------------------------------
 
-    async def _send_discord(self, payload: Dict[str, Any]) -> None:
+    async def _send_discord(self, payload: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
         mix_id = payload.get("mix_id")
         ntype = payload.get("type", "")
 
         if not self._check_rate_limit(mix_id, ntype, "discord"):
-            return
+            return False
 
         color = DISCORD_COLORS.get(ntype, 0x95A5A6)
         data = payload.get("data", {})
@@ -164,45 +381,71 @@ class NotificationService:
 
         body = {"embeds": [embed]}
 
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(settings.NOTIFICATION_DISCORD_WEBHOOK_URL, json=body)
-            if resp.status_code in (200, 204):
-                await self._record(mix_id, ntype, "discord", payload.get("message", ""))
-                logger.info("Discord notification sent: %s", ntype)
-            else:
-                logger.warning("Discord webhook returned %d: %s", resp.status_code, resp.text[:200])
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(cfg["discord_webhook_url"], json=body)
+        except Exception as exc:
+            logger.error("Discord webhook failed: %s", exc)
+            await self._record(mix_id, ntype, "discord", payload.get("message", ""),
+                               sent=False, detail=str(exc))
+            return False
+
+        if resp.status_code in (200, 204):
+            await self._record(mix_id, ntype, "discord", payload.get("message", ""), sent=True)
+            logger.info("Discord notification sent: %s", ntype)
+            return True
+
+        logger.warning("Discord webhook returned %d: %s", resp.status_code, resp.text[:200])
+        await self._record(mix_id, ntype, "discord", payload.get("message", ""),
+                           sent=False, detail=f"HTTP {resp.status_code}")
+        return False
 
     # ------------------------------------------------------------------
     # Email
     # ------------------------------------------------------------------
 
-    async def _send_email(self, payload: Dict[str, Any]) -> None:
+    async def _send_email(self, payload: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
         mix_id = payload.get("mix_id")
         ntype = payload.get("type", "")
 
         if not self._check_rate_limit(mix_id, ntype, "email"):
-            return
+            return False
 
         subject = f"[Fade-Out] {payload.get('title', ntype)}"
         html_body = self._build_email_html(payload)
 
         try:
-            await asyncio.to_thread(self._smtp_send, subject, html_body)
-            await self._record(mix_id, ntype, "email", payload.get("message", ""))
+            await asyncio.to_thread(self._smtp_send, subject, html_body, cfg)
+            await self._record(mix_id, ntype, "email", payload.get("message", ""), sent=True)
             logger.info("Email notification sent: %s", ntype)
+            return True
         except Exception as exc:
             logger.error("Email send failed: %s", exc)
+            await self._record(mix_id, ntype, "email", payload.get("message", ""),
+                               sent=False, detail=str(exc))
+            return False
 
-    def _smtp_send(self, subject: str, html_body: str) -> None:
+    def _smtp_send(self, subject: str, html_body: str, cfg: Dict[str, Any]) -> None:
         msg = MIMEMultipart("alternative")
-        msg["From"] = settings.NOTIFICATION_EMAIL_SMTP_USER
-        msg["To"] = settings.NOTIFICATION_EMAIL_TO
+        msg["From"] = cfg["email_from"] or cfg["email_smtp_user"] or ""
+        msg["To"] = cfg["email_to"]
         msg["Subject"] = subject
         msg.attach(MIMEText(html_body, "html"))
 
-        with smtplib.SMTP(settings.NOTIFICATION_EMAIL_SMTP_HOST, settings.NOTIFICATION_EMAIL_SMTP_PORT) as server:
-            server.starttls()
-            server.login(settings.NOTIFICATION_EMAIL_SMTP_USER, settings.NOTIFICATION_EMAIL_SMTP_PASSWORD)
+        host = cfg["email_smtp_host"]
+        port = cfg["email_smtp_port"]
+        secure = cfg["email_secure"]
+
+        if secure and port == 465:
+            server_cls: Any = smtplib.SMTP_SSL
+        else:
+            server_cls = smtplib.SMTP
+
+        with server_cls(host, port) as server:
+            if secure and server_cls is smtplib.SMTP:
+                server.starttls()
+            if cfg["email_smtp_user"] and cfg["email_smtp_password"]:
+                server.login(cfg["email_smtp_user"], cfg["email_smtp_password"])
             server.send_message(msg)
 
     def _build_email_html(self, payload: Dict[str, Any]) -> str:
@@ -246,23 +489,31 @@ class NotificationService:
     # Generic webhook
     # ------------------------------------------------------------------
 
-    async def _send_webhook(self, url: str, payload: Dict[str, Any]) -> None:
+    async def _send_webhook(
+        self, url: str, payload: Dict[str, Any], cfg: Dict[str, Any]
+    ) -> bool:
         mix_id = payload.get("mix_id")
         ntype = payload.get("type", "")
 
         if not self._check_rate_limit(mix_id, ntype, f"webhook:{url}"):
-            return
+            return False
 
-        async with httpx.AsyncClient(timeout=15) as client:
-            try:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.post(url, json=payload)
-                if resp.status_code < 300:
-                    await self._record(mix_id, ntype, "webhook", payload.get("message", ""))
-                    logger.info("Webhook notification sent to %s: %s", url, ntype)
-                else:
-                    logger.warning("Webhook %s returned %d", url, resp.status_code)
-            except Exception as exc:
-                logger.error("Webhook %s failed: %s", url, exc)
+            if resp.status_code < 300:
+                await self._record(mix_id, ntype, "webhook", payload.get("message", ""), sent=True)
+                logger.info("Webhook notification sent to %s: %s", url, ntype)
+                return True
+            logger.warning("Webhook %s returned %d", url, resp.status_code)
+            await self._record(mix_id, ntype, "webhook", payload.get("message", ""),
+                               sent=False, detail=f"HTTP {resp.status_code}")
+            return False
+        except Exception as exc:
+            logger.error("Webhook %s failed: %s", url, exc)
+            await self._record(mix_id, ntype, "webhook", payload.get("message", ""),
+                               sent=False, detail=str(exc))
+            return False
 
     # ------------------------------------------------------------------
     # Rate limiting
@@ -281,12 +532,19 @@ class NotificationService:
         return True
 
     # ------------------------------------------------------------------
-    # Persistence
+    # Persistence + activity mirror
     # ------------------------------------------------------------------
 
     async def _record(
-        self, mix_id: Optional[str], ntype: str, channel: str, message: str
+        self,
+        mix_id: Optional[str],
+        ntype: str,
+        channel: str,
+        message: str,
+        sent: bool = True,
+        detail: Optional[str] = None,
     ) -> None:
+        """Record the delivery attempt in history AND the activity feed."""
         try:
             async with async_session_factory() as session:
                 notification = Notification(
@@ -294,10 +552,48 @@ class NotificationService:
                     type=ntype,
                     channel=channel,
                     message=message[:2000],
-                    sent=True,
-                    sent_at=datetime.now(timezone.utc),
+                    sent=sent,
+                    sent_at=datetime.now(timezone.utc) if sent else None,
                 )
                 session.add(notification)
                 await session.commit()
         except Exception:
             logger.exception("Failed to record notification")
+
+        # Mirror every delivery attempt into the activity feed so History
+        # rows tie back to the running event log.
+        try:
+            from app.services import activity_log
+
+            if sent:
+                await activity_log.info(
+                    "notification_sent",
+                    f"Notification sent via {channel}: {ntype} — {message[:200]}",
+                    mix_id=mix_id,
+                    context={"channel": channel, "type": ntype},
+                )
+            else:
+                await activity_log.warn(
+                    "notification_failed",
+                    f"Notification via {channel} failed: {ntype}"
+                    + (f" — {detail}" if detail else ""),
+                    mix_id=mix_id,
+                    context={"channel": channel, "type": ntype, "detail": detail},
+                )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("activity mirror failed for notification", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Singleton
+# ---------------------------------------------------------------------------
+
+_service: Optional[NotificationService] = None
+
+
+def get_notification_service() -> NotificationService:
+    """Process-wide NotificationService singleton (created lazily)."""
+    global _service
+    if _service is None:
+        _service = NotificationService()
+    return _service

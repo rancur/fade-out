@@ -77,7 +77,7 @@ class _FakeYouTubeUploader:
     calls = []
     fail = False
 
-    def __init__(self, db_settings_json=None):
+    def __init__(self, db_settings_json=None, mix_id=None):
         pass
 
     async def update_description(self, video_id, description):
@@ -91,7 +91,7 @@ class _FakeSoundCloudUploader:
     calls = []
     fail = False
 
-    def __init__(self, db_settings_json=None, on_tokens_refreshed=None):
+    def __init__(self, db_settings_json=None, on_tokens_refreshed=None, mix_id=None):
         pass
 
     async def update_description(self, track_url, description):

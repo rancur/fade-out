@@ -89,8 +89,12 @@ class AudioAnalyzer:
         self._shazam = Shazam()
         self._audd_token = (settings.AUDD_API_TOKEN or "").strip()
 
-    async def analyze(self, audio_path: str) -> AnalysisResult:
-        """Full analysis pipeline. Handles files up to 6 hours."""
+    async def analyze(self, audio_path: str, progress_cb=None) -> AnalysisResult:
+        """Full analysis pipeline. Handles files up to 6 hours.
+
+        ``progress_cb`` is an optional ``async (percent, detail)`` callable
+        that receives track-identification progress ("identifying tracks 23/65").
+        """
         logger.info("Starting analysis of %s", audio_path)
         result = AnalysisResult()
 
@@ -134,7 +138,9 @@ class AudioAnalyzer:
             result.bpm_range = (round(min(bpms), 1), round(max(bpms), 1))
 
         # Shazam identification
-        tracklist = await self._identify_tracks(audio_path, sample_times, sr_native)
+        tracklist = await self._identify_tracks(
+            audio_path, sample_times, sr_native, progress_cb=progress_cb
+        )
         result.tracklist = [t.to_dict() for t in tracklist]
 
         # Genre classification from features + identified tracks
@@ -202,7 +208,7 @@ class AudioAnalyzer:
         }
 
     async def _identify_tracks(
-        self, path: str, sample_times: List[float], sr_native: int
+        self, path: str, sample_times: List[float], sr_native: int, progress_cb=None
     ) -> List[TrackHit]:
         """Use Shazam to identify tracks at sample points.
 
@@ -231,7 +237,8 @@ class AudioAnalyzer:
             identified.append(hit)
             last_title = title_key
 
-        for t in sample_times:
+        total_segments = len(sample_times)
+        for n, t in enumerate(sample_times, start=1):
             # Primary clip at sample point
             hit = await self._recognize_segment(path, t, sr_native)
             if not hit:
@@ -246,6 +253,15 @@ class AudioAnalyzer:
             hit2 = await self._recognize_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
             if hit2:
                 _emit(hit2)
+
+            if progress_cb is not None and total_segments:
+                try:
+                    await progress_cb(
+                        int(n * 100 / total_segments),
+                        f"identifying tracks {n}/{total_segments}",
+                    )
+                except Exception:  # pragma: no cover - progress must never break analysis
+                    pass
 
         # Sort by timestamp, then re-apply consecutive dedup in time order
         # (out-of-order emission across sample points can duplicate neighbors)

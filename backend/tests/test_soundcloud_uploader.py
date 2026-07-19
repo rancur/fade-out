@@ -15,6 +15,25 @@ import app.services.soundcloud_uploader as sc_mod
 from app.services.soundcloud_uploader import SoundCloudUploader
 
 
+class _FakeStdStream:
+    """Async stream stand-in for asyncio subprocess stdout/stderr pipes."""
+
+    def __init__(self, data: bytes = b""):
+        self._lines = data.splitlines(keepends=True)
+        self._data = data
+        self._pos = 0
+
+    async def readline(self) -> bytes:
+        if self._pos >= len(self._lines):
+            return b""
+        line = self._lines[self._pos]
+        self._pos += 1
+        return line
+
+    async def read(self) -> bytes:
+        return self._data
+
+
 class FakeResp:
     def __init__(self, status_code=200, json_data=None, text=""):
         self.status_code = status_code
@@ -181,9 +200,11 @@ class TestOversizedUploadTranscode:
 
             class Proc:
                 returncode = 0
+                stdout = _FakeStdStream(b"out_time_ms=1000000\nprogress=end\n")
+                stderr = _FakeStdStream(b"")
 
-                async def communicate(self):
-                    return (b"", b"")
+                async def wait(self):
+                    return 0
 
             return Proc()
 
@@ -219,9 +240,11 @@ class TestOversizedUploadTranscode:
         async def fake_exec(*args, **kwargs):
             class Proc:
                 returncode = 1
+                stdout = _FakeStdStream(b"")
+                stderr = _FakeStdStream(b"boom: no such codec")
 
-                async def communicate(self):
-                    return (b"", b"boom: no such codec")
+                async def wait(self):
+                    return 1
 
             return Proc()
 
@@ -261,3 +284,56 @@ class TestOversizedUploadTranscode:
         # uploader's 4GB. Timeout stays 1h for large uploads on home upstream.
         assert sc_mod.API_MAX_UPLOAD_BYTES == 450 * 1024 * 1024
         assert sc_mod.UPLOAD_TIMEOUT == 3600
+
+
+class TestProgressHelpers:
+    """Counting reader + ffmpeg progress parsing that drive live upload progress."""
+
+    def test_format_bytes(self):
+        assert sc_mod.format_bytes(2.9 * 1024**3) == "2.9 GB"
+        assert sc_mod.format_bytes(340 * 1024**2) == "340 MB"
+        assert sc_mod.format_bytes(5 * 1024) == "5.0 KB"
+        assert sc_mod.format_bytes(12) == "12 B"
+
+    def test_parse_ffmpeg_progress_line(self):
+        # out_time_ms is microseconds despite the name.
+        assert sc_mod.parse_ffmpeg_progress_line("out_time_ms=60000000", 120.0) == 50
+        assert sc_mod.parse_ffmpeg_progress_line("out_time_ms=999000000", 120.0) == 100
+        assert sc_mod.parse_ffmpeg_progress_line("progress=continue", 120.0) is None
+        assert sc_mod.parse_ffmpeg_progress_line("out_time_ms=60000000", 0.0) is None
+        assert sc_mod.parse_ffmpeg_progress_line("out_time_ms=garbage", 120.0) is None
+
+    def test_counting_reader_counts_and_reports(self, tmp_path):
+        f = tmp_path / "audio.bin"
+        f.write_bytes(b"a" * 100)
+        seen = []
+        with open(f, "rb") as fh:
+            reader = sc_mod.CountingReader(fh, 100, lambda sent, total: seen.append((sent, total)))
+            assert reader.read(40) == b"a" * 40
+            assert reader.read(60) == b"a" * 60
+            assert reader.read(10) == b""  # EOF: no callback
+        assert seen == [(40, 100), (100, 100)]
+        assert reader.bytes_sent == 100
+
+    def test_counting_reader_rewind_resets_count(self, tmp_path):
+        f = tmp_path / "audio.bin"
+        f.write_bytes(b"a" * 10)
+        with open(f, "rb") as fh:
+            reader = sc_mod.CountingReader(fh, 10)
+            reader.read(10)
+            assert reader.bytes_sent == 10
+            reader.seek(0)
+            assert reader.bytes_sent == 0
+            # delegation to the wrapped file still works
+            assert reader.tell() == 0
+
+    def test_counting_reader_callback_error_never_breaks_io(self, tmp_path):
+        f = tmp_path / "audio.bin"
+        f.write_bytes(b"a" * 10)
+
+        def boom(sent, total):
+            raise RuntimeError("progress exploded")
+
+        with open(f, "rb") as fh:
+            reader = sc_mod.CountingReader(fh, 10, boom)
+            assert reader.read(10) == b"a" * 10

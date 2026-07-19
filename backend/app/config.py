@@ -91,6 +91,13 @@ class Settings(BaseSettings):
     NOTIFICATION_EMAIL_TO: str = ""
     NOTIFICATION_WEBHOOK_URLS: str = ""  # comma-separated
 
+    # --- Activity log retention ---
+    # A nightly task prunes activity_events older than the retention window or
+    # beyond the row cap (whichever bites first), keeping the feed queryable
+    # without letting the table grow without bound.
+    ACTIVITY_RETENTION_DAYS: int = 90
+    ACTIVITY_MAX_ROWS: int = 50_000
+
     # --- Auto-Upgrade ---
     GITHUB_REPO: str = "rancur/fade-out"
     AUTO_UPGRADE_ENABLED: bool = True
