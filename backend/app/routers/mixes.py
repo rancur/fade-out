@@ -337,3 +337,38 @@ async def retry_step(mix_id: str, step_name: str, db: AsyncSession = Depends(get
     await orch.retry_step(mix.id, step_name)
 
     return MixOut.model_validate(mix)
+
+
+@router.post("/{mix_id}/reread-tracklist", response_model=MixOut, status_code=202)
+async def reread_tracklist(mix_id: str, db: AsyncSession = Depends(get_db)):
+    """Re-detect the tracklist and patch YT/SC descriptions in place.
+
+    Runs analyze + generate_description again, then updates the platform
+    descriptions via their APIs — no re-upload. Analysis takes minutes, so
+    the work runs in the background.
+    """
+    result = await db.execute(select(Mix).where(Mix.id == mix_id))
+    mix = result.scalar_one_or_none()
+    if not mix:
+        raise HTTPException(status_code=404, detail="Mix not found")
+    if not mix.audio_file_path or not os.path.exists(mix.audio_file_path):
+        raise HTTPException(status_code=400, detail="Audio file missing")
+
+    import asyncio
+    import logging
+
+    from app.database import async_session_factory
+    from app.services.handlers import handle_reread_tracklist
+
+    async def _run() -> None:
+        try:
+            async with async_session_factory() as session:
+                await handle_reread_tracklist(mix_id, session)
+                await session.commit()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "reread-tracklist failed for %s", mix_id
+            )
+
+    asyncio.create_task(_run())
+    return MixOut.model_validate(mix)
