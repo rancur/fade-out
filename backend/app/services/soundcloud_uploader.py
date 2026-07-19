@@ -957,26 +957,73 @@ class SoundCloudUploader:
                 params = None  # next_href already carries the query string
         return playlists
 
+    @staticmethod
+    def _playlist_json_body(playlist_fields: Dict[str, Any]) -> tuple:
+        """(content, headers-extra) for a playlist write: an explicitly
+        serialized ``{"playlist": {...}}`` JSON body with an explicit
+        ``Content-Type`` — a live create got 422 "Could not parse JSON request
+        body", so nothing about the body encoding is left to the client lib.
+        Tracks must be an object list (``[{"id": 123}, ...]``), never bare ints.
+        """
+        import json as _json
+
+        content = _json.dumps({"playlist": playlist_fields})
+        return content, {"Content-Type": "application/json; charset=utf-8"}
+
+    @staticmethod
+    def _playlist_form_body(playlist_fields: Dict[str, Any]) -> List[tuple]:
+        """Rails-style form encoding fallback (``playlist[title]``,
+        ``playlist[tracks][][id]``) matching the ``track[...]`` convention the
+        upload/update endpoints already use — used only when the documented
+        JSON body is rejected with a parse error."""
+        data: List[tuple] = []
+        for key, value in playlist_fields.items():
+            if key == "tracks":
+                for t in value:
+                    data.append(("playlist[tracks][][id]", str(t["id"])))
+            else:
+                data.append((f"playlist[{key}]", str(value)))
+        return data
+
+    async def _playlist_write(
+        self, client: httpx.AsyncClient, method: str, url: str,
+        headers: Dict[str, str], playlist_fields: Dict[str, Any],
+    ) -> httpx.Response:
+        """POST/PUT a playlist body: documented JSON first, form fallback on a
+        422 JSON-parse rejection."""
+        content, extra = self._playlist_json_body(playlist_fields)
+        resp = await client.request(
+            method, url, headers={**headers, **extra}, content=content,
+        )
+        if resp.status_code == 422 and "parse" in (resp.text or "").lower():
+            logger.warning(
+                "SoundCloud rejected the JSON playlist body (%s); retrying "
+                "form-encoded: %s", resp.status_code, (resp.text or "")[:200],
+            )
+            resp = await client.request(
+                method, url, headers=headers,
+                data=self._playlist_form_body(playlist_fields),
+            )
+        return resp
+
     async def create_playlist(
         self, title: str, track_ids: List[Any], sharing: str = "public"
     ) -> Dict[str, Any]:
         """Create a playlist with the given tracks; returns the raw resource."""
         token = await self._ensure_access_token()
-        payload = {
-            "playlist": {
-                "title": title,
-                "sharing": sharing,
-                "tracks": [{"id": int(tid)} for tid in track_ids],
-            }
+        fields = {
+            "title": title,
+            "sharing": sharing,
+            "tracks": [{"id": int(tid)} for tid in track_ids],
         }
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{SOUNDCLOUD_API_BASE}/playlists",
-                headers={
+            resp = await self._playlist_write(
+                client, "POST", f"{SOUNDCLOUD_API_BASE}/playlists",
+                {
                     "Authorization": f"OAuth {token}",
                     "Accept": "application/json",
                 },
-                json=payload,
+                fields,
             )
             if resp.status_code not in (200, 201):
                 raise RuntimeError(
@@ -1021,10 +1068,10 @@ class SoundCloudUploader:
                 )
                 return
 
-            put = await client.put(
-                f"{SOUNDCLOUD_API_BASE}/playlists/{playlist_id}",
-                headers=headers,
-                json={"playlist": {"tracks": [*current, {"id": int(track_id)}]}},
+            put = await self._playlist_write(
+                client, "PUT", f"{SOUNDCLOUD_API_BASE}/playlists/{playlist_id}",
+                headers,
+                {"tracks": [*current, {"id": int(track_id)}]},
             )
             if put.status_code not in (200, 201):
                 raise RuntimeError(

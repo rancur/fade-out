@@ -47,6 +47,12 @@ logger = logging.getLogger(__name__)
 
 LAST_PLAYLISTS_KEY = "catalog_last_playlists"
 
+# Real YouTube playlist ids are ~34 chars ("PL" + 32). A live run surfaced a
+# 13-char id ("PLJPcS6-qELD0" — "PL" + what looks like an 11-char VIDEO id)
+# that 404s on playlistItems.list; anything under this floor is treated as
+# malformed and its membership listing skipped rather than trusted.
+MIN_YT_PLAYLIST_ID_LEN = 20
+
 # --- Buckets ---------------------------------------------------------------
 
 SERIES_WEDNESDAYS = "Will See Wednesdays"
@@ -105,6 +111,8 @@ _BUCKET_KEYWORDS: List[Tuple[str, str]] = [
     ("techno", "Techno"),
     ("house", "House"),  # after the more specific buckets; covers deep/tech house
     ("open format", "Open Format"),
+    # Weakest signal — checked dead last so "Trance Festival" stays Trance.
+    ("festival", "EDM & Big Room"),
 ]
 
 
@@ -121,8 +129,12 @@ def classify_playlist(mix: Mix) -> str:
     """The single playlist bucket a mix belongs to (pure — no I/O).
 
     Series titles win first, then raid trains get a genre bucket from
-    title + genres (falling back to "Open Format"), then plain mixes get a
-    genre bucket from ``mix.genres`` (falling back to "DJ Sets").
+    title + genres (falling back to "Open Format"). Plain mixes get a genre
+    bucket from ``mix.genres``, then from TITLE keywords — imported mixes
+    routinely carry empty genres (140/222 fell to the catch-all in the first
+    live run), and titles like "DnB Tuesday" or "Pure Bass Therapy" classify
+    fine — and only then the "DJ Sets" catch-all. Genres outrank the title so
+    a keyword in the name never overrides real analysis data.
     """
     title = mix.title or ""
     if _WEDNESDAYS_RE.search(title):
@@ -132,7 +144,7 @@ def classify_playlist(mix: Mix) -> str:
     genres = [g for g in (mix.genres or []) if g]
     if RAID_TRAIN_RE.search(title):
         return _genre_bucket([title, *genres]) or RAID_FALLBACK_BUCKET
-    return _genre_bucket(genres) or DEFAULT_BUCKET
+    return _genre_bucket(genres) or _genre_bucket([title]) or DEFAULT_BUCKET
 
 
 # --- Fuzzy playlist-name matching ------------------------------------------
@@ -369,57 +381,103 @@ async def run_organize_playlists(
                         yt["queued"] += len(bucket_mixes)
                         continue
 
-                    match = find_matching_playlist(bucket, existing)
-                    if match:
-                        playlist_id = match["id"]
-                        playlist_title = match["title"]
-                    else:
-                        if used + YT_WRITE_COST > budget:
-                            yt["paused"] = True
-                            yt["queued"] += len(bucket_mixes)
-                            continue
-                        playlist_title = playlist_title_for_bucket(bucket)
-                        playlist_id = await uploader.create_playlist(
-                            playlist_title,
-                            description=f"{bucket} DJ sets by {settings.BRAND_NAME}",
-                        )
-                        used += YT_WRITE_COST
-                        yt["created_playlists"] += 1
-                        existing.append({"id": playlist_id, "title": playlist_title})
-                        await activity_log.info(
-                            "catalog_playlists",
-                            f'Created YouTube playlist "{playlist_title}".',
-                            platform="youtube",
-                            context={"playlist_id": playlist_id},
-                        )
+                    # Per-bucket isolation: one playlist 404/failure (seen live
+                    # with a malformed matched playlist id) must not abort the
+                    # rest of the YouTube phase.
+                    try:
+                        match = find_matching_playlist(bucket, existing)
+                        if match:
+                            playlist_id = match["id"]
+                            playlist_title = match["title"]
+                        else:
+                            if used + YT_WRITE_COST > budget:
+                                yt["paused"] = True
+                                yt["queued"] += len(bucket_mixes)
+                                continue
+                            playlist_title = playlist_title_for_bucket(bucket)
+                            playlist_id = await uploader.create_playlist(
+                                playlist_title,
+                                description=f"{bucket} DJ sets by {settings.BRAND_NAME}",
+                            )
+                            used += YT_WRITE_COST
+                            yt["created_playlists"] += 1
+                            existing.append(
+                                {"id": playlist_id, "title": playlist_title}
+                            )
+                            await activity_log.info(
+                                "catalog_playlists",
+                                f'Created YouTube playlist "{playlist_title}".',
+                                platform="youtube",
+                                context={"playlist_id": playlist_id},
+                            )
 
-                    members = set(
-                        await uploader.list_playlist_video_ids(playlist_id)
-                    )
-                    for m in bucket_mixes:
-                        vid = m["youtube_video_id"]
-                        if vid in members:
-                            yt["already_member"] += 1
+                        # Guard: a real playlist id is ~34 chars. A short id
+                        # (observed live: 13-char "PLJPcS6-qELD0") 404s on
+                        # playlistItems.list — log it and treat the playlist
+                        # as empty instead of aborting the platform.
+                        if len(str(playlist_id or "")) < MIN_YT_PLAYLIST_ID_LEN:
+                            logger.warning(
+                                "YouTube playlist id %r for bucket %r looks "
+                                "malformed (<%d chars); skipping membership "
+                                "listing and treating it as empty",
+                                playlist_id, bucket, MIN_YT_PLAYLIST_ID_LEN,
+                            )
+                            await activity_log.warn(
+                                "catalog_playlists",
+                                (
+                                    f'YouTube playlist id "{playlist_id}" for '
+                                    f'bucket "{bucket}" looks malformed; '
+                                    f"treating the playlist as empty."
+                                ),
+                                platform="youtube",
+                                context={
+                                    "playlist_id": playlist_id, "bucket": bucket,
+                                },
+                            )
+                            members = set()
+                        else:
+                            members = set(
+                                await uploader.list_playlist_video_ids(playlist_id)
+                            )
+                        for m in bucket_mixes:
+                            vid = m["youtube_video_id"]
+                            if vid in members:
+                                yt["already_member"] += 1
+                                await _save_placement(
+                                    m["id"], "youtube", playlist_id, bucket
+                                )
+                                continue
+                            if used + YT_WRITE_COST > budget:
+                                yt["paused"] = True
+                                yt["queued"] += 1
+                                continue
+                            await uploader.add_video_to_playlist(playlist_id, vid)
+                            used += YT_WRITE_COST
+                            yt["placed"] += 1
+                            members.add(vid)
                             await _save_placement(
                                 m["id"], "youtube", playlist_id, bucket
                             )
-                            continue
-                        if used + YT_WRITE_COST > budget:
-                            yt["paused"] = True
-                            yt["queued"] += 1
-                            continue
-                        await uploader.add_video_to_playlist(playlist_id, vid)
-                        used += YT_WRITE_COST
-                        yt["placed"] += 1
-                        members.add(vid)
-                        await _save_placement(m["id"], "youtube", playlist_id, bucket)
-                        await activity_log.info(
+                            await activity_log.info(
+                                "catalog_playlists",
+                                f'Added "{m["title"]}" to YouTube playlist '
+                                f'"{playlist_title}".',
+                                mix_id=m["id"],
+                                platform="youtube",
+                                context={
+                                    "playlist_id": playlist_id, "bucket": bucket,
+                                },
+                            )
+                    except Exception as exc:
+                        logger.exception(
+                            "YouTube playlist bucket %r failed", bucket
+                        )
+                        summary["errors"].append(f"youtube/{bucket}: {exc}")
+                        await activity_log.error(
                             "catalog_playlists",
-                            f'Added "{m["title"]}" to YouTube playlist '
-                            f'"{playlist_title}".',
-                            mix_id=m["id"],
+                            f'YouTube playlist bucket "{bucket}" failed: {exc}',
                             platform="youtube",
-                            context={"playlist_id": playlist_id, "bucket": bucket},
+                            context={"bucket": bucket},
                         )
                 if yt["paused"]:
                     await activity_log.warn(
@@ -466,64 +524,22 @@ async def run_organize_playlists(
                     if not bucket_mixes:
                         continue
 
-                    match = find_matching_playlist(bucket, existing_sc)
-                    if match is None:
-                        playlist_title = playlist_title_for_bucket(bucket)
-                        track_ids = [m["soundcloud_track_id"] for m in bucket_mixes]
-                        created = await uploader.create_playlist(
-                            playlist_title, track_ids, sharing="public"
+                    # Per-bucket isolation, mirroring the YouTube phase: one
+                    # bucket's create/update failure must not zero out the rest.
+                    try:
+                        await _sc_place_bucket(
+                            uploader, bucket, bucket_mixes, existing_sc, sc
                         )
-                        playlist_id = created.get("id")
-                        sc["created_playlists"] += 1
-                        sc["placed"] += len(bucket_mixes)
-                        existing_sc.append(
-                            {
-                                "id": playlist_id,
-                                "title": playlist_title,
-                                "track_ids": {str(t) for t in track_ids},
-                            }
+                    except Exception as exc:
+                        logger.exception(
+                            "SoundCloud playlist bucket %r failed", bucket
                         )
-                        for m in bucket_mixes:
-                            await _save_placement(
-                                m["id"], "soundcloud", playlist_id, bucket
-                            )
-                        await activity_log.info(
+                        summary["errors"].append(f"soundcloud/{bucket}: {exc}")
+                        await activity_log.error(
                             "catalog_playlists",
-                            (
-                                f'Created SoundCloud playlist "{playlist_title}" '
-                                f"with {len(track_ids)} tracks."
-                            ),
+                            f'SoundCloud playlist bucket "{bucket}" failed: {exc}',
                             platform="soundcloud",
-                            context={"playlist_id": playlist_id, "bucket": bucket},
-                        )
-                        continue
-
-                    playlist_id = match["id"]
-                    playlist_title = match["title"]
-                    member_ids = match.get("track_ids") or set()
-                    for m in bucket_mixes:
-                        tid = str(m["soundcloud_track_id"])
-                        if tid in member_ids:
-                            sc["already_member"] += 1
-                            await _save_placement(
-                                m["id"], "soundcloud", playlist_id, bucket
-                            )
-                            continue
-                        await uploader.add_track_to_playlist(
-                            playlist_id, m["soundcloud_track_id"]
-                        )
-                        sc["placed"] += 1
-                        member_ids.add(tid)
-                        await _save_placement(
-                            m["id"], "soundcloud", playlist_id, bucket
-                        )
-                        await activity_log.info(
-                            "catalog_playlists",
-                            f'Added "{m["title"]}" to SoundCloud playlist '
-                            f'"{playlist_title}".',
-                            mix_id=m["id"],
-                            platform="soundcloud",
-                            context={"playlist_id": playlist_id, "bucket": bucket},
+                            context={"bucket": bucket},
                         )
             except Exception as exc:
                 logger.exception("SoundCloud playlist phase failed")
@@ -565,3 +581,63 @@ async def run_organize_playlists(
         context=summary,
     )
     return summary
+
+
+async def _sc_place_bucket(
+    uploader: SoundCloudUploader,
+    bucket: str,
+    bucket_mixes: List[Dict[str, Any]],
+    existing_sc: List[Dict[str, Any]],
+    sc: Dict[str, Any],
+) -> None:
+    """Place one bucket's mixes on SoundCloud (create or append)."""
+    match = find_matching_playlist(bucket, existing_sc)
+    if match is None:
+        playlist_title = playlist_title_for_bucket(bucket)
+        track_ids = [m["soundcloud_track_id"] for m in bucket_mixes]
+        created = await uploader.create_playlist(
+            playlist_title, track_ids, sharing="public"
+        )
+        playlist_id = created.get("id")
+        sc["created_playlists"] += 1
+        sc["placed"] += len(bucket_mixes)
+        existing_sc.append(
+            {
+                "id": playlist_id,
+                "title": playlist_title,
+                "track_ids": {str(t) for t in track_ids},
+            }
+        )
+        for m in bucket_mixes:
+            await _save_placement(m["id"], "soundcloud", playlist_id, bucket)
+        await activity_log.info(
+            "catalog_playlists",
+            (
+                f'Created SoundCloud playlist "{playlist_title}" '
+                f"with {len(track_ids)} tracks."
+            ),
+            platform="soundcloud",
+            context={"playlist_id": playlist_id, "bucket": bucket},
+        )
+        return
+
+    playlist_id = match["id"]
+    playlist_title = match["title"]
+    member_ids = match.get("track_ids") or set()
+    for m in bucket_mixes:
+        tid = str(m["soundcloud_track_id"])
+        if tid in member_ids:
+            sc["already_member"] += 1
+            await _save_placement(m["id"], "soundcloud", playlist_id, bucket)
+            continue
+        await uploader.add_track_to_playlist(playlist_id, m["soundcloud_track_id"])
+        sc["placed"] += 1
+        member_ids.add(tid)
+        await _save_placement(m["id"], "soundcloud", playlist_id, bucket)
+        await activity_log.info(
+            "catalog_playlists",
+            f'Added "{m["title"]}" to SoundCloud playlist "{playlist_title}".',
+            mix_id=m["id"],
+            platform="soundcloud",
+            context={"playlist_id": playlist_id, "bucket": bucket},
+        )

@@ -6,6 +6,8 @@ update_track_fields must PUT only the requested track[...] fields with
 upload-style tag formatting.
 """
 
+import json
+
 import pytest
 
 import app.services.soundcloud_uploader as sc_mod
@@ -159,14 +161,23 @@ class TestUpdateTrackFields:
 # YouTube playlist APIs (Feature: playlist grouping)
 # ---------------------------------------------------------------------------
 
+# A realistic modern playlist id: "PL" + 32 chars = 34 total. The live 404
+# incident involved a 13-char id, so fakes use full-length ids to prove the
+# round-trip never truncates.
+FULL_PLAYLIST_ID = "PL" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6"
+assert len(FULL_PLAYLIST_ID) == 34
+
+
 class PlaylistService:
     """Fake youtube service covering playlists() + playlistItems()."""
 
-    def __init__(self, item_pages=None):
+    def __init__(self, item_pages=None, created_id=FULL_PLAYLIST_ID):
         self.created = []
         self.inserted_items = []
+        self.listed_item_calls = []
         self.item_pages = item_pages or [{"items": []}]
         self._page = 0
+        self.created_id = created_id
 
     def playlists(self):
         svc = self
@@ -174,7 +185,7 @@ class PlaylistService:
         class P:
             def insert(self, **kw):
                 svc.created.append(kw)
-                return _Req({"id": "PL-NEW"})
+                return _Req({"id": svc.created_id})
 
         return P()
 
@@ -183,6 +194,7 @@ class PlaylistService:
 
         class PI:
             def list(self, **kw):
+                svc.listed_item_calls.append(kw)
                 page = svc.item_pages[svc._page]
                 svc._page = min(svc._page + 1, len(svc.item_pages) - 1)
                 return _Req(page)
@@ -200,10 +212,21 @@ class TestYouTubePlaylistApis:
         monkeypatch.setattr(YouTubeUploader, "_get_service", lambda self: svc)
         up = YouTubeUploader()
         pid = await up.create_playlist("Will See | House", description="d")
-        assert pid == "PL-NEW"
+        assert pid == FULL_PLAYLIST_ID
         body = svc.created[0]["body"]
         assert body["snippet"]["title"] == "Will See | House"
         assert body["status"]["privacyStatus"] == "public"
+
+    async def test_full_id_survives_create_then_listing_round_trip(self, monkeypatch):
+        # Regression for the live 404: a realistic 34-char playlist id must
+        # reach playlistItems.list exactly as playlists.insert returned it.
+        svc = PlaylistService()
+        monkeypatch.setattr(YouTubeUploader, "_get_service", lambda self: svc)
+        up = YouTubeUploader()
+        pid = await up.create_playlist("Will See | Techno")
+        assert pid == FULL_PLAYLIST_ID and len(pid) == 34
+        await up.list_playlist_video_ids(pid)
+        assert svc.listed_item_calls[0]["playlistId"] == FULL_PLAYLIST_ID
 
     async def test_list_playlist_video_ids_paginates(self, monkeypatch):
         svc = PlaylistService(
@@ -225,11 +248,11 @@ class TestYouTubePlaylistApis:
 # ---------------------------------------------------------------------------
 
 class PlaylistClient:
-    """Fake httpx.AsyncClient recording GET/POST/PUT for playlist endpoints."""
+    """Fake httpx.AsyncClient recording GET + generic request() calls."""
 
     get_responses = []
-    post_response = None
-    put_response = None
+    post_responses = []
+    put_responses = []
     calls = []
 
     def __init__(self, *args, **kwargs):
@@ -245,13 +268,11 @@ class PlaylistClient:
         PlaylistClient.calls.append(("get", url, kwargs))
         return PlaylistClient.get_responses.pop(0)
 
-    async def post(self, url, **kwargs):
-        PlaylistClient.calls.append(("post", url, kwargs))
-        return PlaylistClient.post_response
-
-    async def put(self, url, **kwargs):
-        PlaylistClient.calls.append(("put", url, kwargs))
-        return PlaylistClient.put_response
+    async def request(self, method, url, **kwargs):
+        PlaylistClient.calls.append((method.lower(), url, kwargs))
+        if method.upper() == "POST":
+            return PlaylistClient.post_responses.pop(0)
+        return PlaylistClient.put_responses.pop(0)
 
 
 @pytest.fixture
@@ -263,8 +284,8 @@ def sc_playlist_uploader(monkeypatch):
 
     monkeypatch.setattr(SoundCloudUploader, "_ensure_access_token", fake_token)
     PlaylistClient.get_responses = []
-    PlaylistClient.post_response = None
-    PlaylistClient.put_response = None
+    PlaylistClient.post_responses = []
+    PlaylistClient.put_responses = []
     PlaylistClient.calls = []
     return SoundCloudUploader()
 
@@ -286,20 +307,51 @@ class TestSoundCloudPlaylistApis:
         with pytest.raises(RuntimeError, match="500"):
             await sc_playlist_uploader.list_playlists()
 
-    async def test_create_playlist_posts_tracks(self, sc_playlist_uploader):
-        PlaylistClient.post_response = FakeResp(201, {"id": 42, "title": "T"})
+    async def test_create_playlist_posts_exact_json_body(self, sc_playlist_uploader):
+        PlaylistClient.post_responses = [FakeResp(201, {"id": 42, "title": "T"})]
         created = await sc_playlist_uploader.create_playlist("T", ["7", 8])
         assert created["id"] == 42
         method, url, kwargs = PlaylistClient.calls[0]
         assert method == "post" and url.endswith("/playlists")
-        assert kwargs["json"] == {
+        # Exact documented body: {"playlist": {..., "tracks": [{"id": n}]}}
+        # — tracks as an OBJECT LIST with id keys, never bare ints — sent as
+        # explicitly serialized JSON with an explicit Content-Type.
+        assert json.loads(kwargs["content"]) == {
             "playlist": {
                 "title": "T",
                 "sharing": "public",
                 "tracks": [{"id": 7}, {"id": 8}],
             }
         }
+        assert kwargs["headers"]["Content-Type"] == "application/json; charset=utf-8"
         assert kwargs["headers"]["Authorization"] == "OAuth tok"
+        assert "json" not in kwargs and "data" not in kwargs
+
+    async def test_create_playlist_422_parse_error_falls_back_to_form(
+        self, sc_playlist_uploader
+    ):
+        # Live incident: 422 "Could not parse JSON request body". The retry
+        # uses the same Rails-style form fields the track endpoints use.
+        PlaylistClient.post_responses = [
+            FakeResp(422, text='{"error": "Could not parse JSON request body"}'),
+            FakeResp(201, {"id": 43, "title": "T"}),
+        ]
+        created = await sc_playlist_uploader.create_playlist("T", [7])
+        assert created["id"] == 43
+        assert [c[0] for c in PlaylistClient.calls] == ["post", "post"]
+        retry_kwargs = PlaylistClient.calls[1][2]
+        assert retry_kwargs["data"] == [
+            ("playlist[title]", "T"),
+            ("playlist[sharing]", "public"),
+            ("playlist[tracks][][id]", "7"),
+        ]
+        assert "content" not in retry_kwargs
+
+    async def test_create_playlist_non_parse_422_raises(self, sc_playlist_uploader):
+        PlaylistClient.post_responses = [FakeResp(422, text="title too long")]
+        with pytest.raises(RuntimeError, match="422"):
+            await sc_playlist_uploader.create_playlist("T", [7])
+        assert len(PlaylistClient.calls) == 1  # no blind form retry
 
     async def test_add_track_fetches_then_puts_full_list(self, sc_playlist_uploader):
         # SC's PUT replaces the track array wholesale: existing order must be
@@ -307,13 +359,29 @@ class TestSoundCloudPlaylistApis:
         PlaylistClient.get_responses = [
             FakeResp(200, {"tracks": [{"id": 5}, {"id": 6}]})
         ]
-        PlaylistClient.put_response = FakeResp(200, {})
+        PlaylistClient.put_responses = [FakeResp(200, {})]
         await sc_playlist_uploader.add_track_to_playlist(42, "7")
         method, url, kwargs = PlaylistClient.calls[-1]
         assert method == "put" and url.endswith("/playlists/42")
-        assert kwargs["json"] == {
+        assert json.loads(kwargs["content"]) == {
             "playlist": {"tracks": [{"id": 5}, {"id": 6}, {"id": 7}]}
         }
+        assert kwargs["headers"]["Content-Type"] == "application/json; charset=utf-8"
+
+    async def test_add_track_put_422_parse_error_falls_back_to_form(
+        self, sc_playlist_uploader
+    ):
+        PlaylistClient.get_responses = [FakeResp(200, {"tracks": [{"id": 5}]})]
+        PlaylistClient.put_responses = [
+            FakeResp(422, text="Could not parse JSON request body"),
+            FakeResp(200, {}),
+        ]
+        await sc_playlist_uploader.add_track_to_playlist(42, 7)
+        retry_kwargs = PlaylistClient.calls[-1][2]
+        assert retry_kwargs["data"] == [
+            ("playlist[tracks][][id]", "5"),
+            ("playlist[tracks][][id]", "7"),
+        ]
 
     async def test_add_track_already_member_is_noop(self, sc_playlist_uploader):
         PlaylistClient.get_responses = [FakeResp(200, {"tracks": [{"id": 7}]})]
@@ -322,6 +390,6 @@ class TestSoundCloudPlaylistApis:
 
     async def test_add_track_put_failure_raises(self, sc_playlist_uploader):
         PlaylistClient.get_responses = [FakeResp(200, {"tracks": []})]
-        PlaylistClient.put_response = FakeResp(403, text="no")
+        PlaylistClient.put_responses = [FakeResp(403, text="no")]
         with pytest.raises(RuntimeError, match="403"):
             await sc_playlist_uploader.add_track_to_playlist(42, 7)
