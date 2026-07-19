@@ -118,7 +118,12 @@ class FakeGenerator:
             text = json.dumps([{"n": i + 1, "class": "generic"} for i in range(n)])
         else:
             text = json.dumps(
-                {"title": "Peak-Time Techno Rampage", "description": "Fresh body copy."}
+                {
+                    "title": "Peak-Time Techno Rampage",
+                    "description": "Fresh body copy.",
+                    "tags_youtube": ["techno", "dj mix", "will see"],
+                    "tags_soundcloud": ["techno", "dj set"],
+                }
             )
         return FakeResponse(), text
 
@@ -265,7 +270,8 @@ class TestRunImprove:
 
         assert summary["generic"] == 1
         assert summary["keepers_locked"] == 0
-        assert summary["proposals_drafted"] == 3  # title(both) + desc(yt) + desc(sc)
+        # title(both) + desc(yt) + desc(sc) + tags(yt) + tags(sc)
+        assert summary["proposals_drafted"] == 5
 
         proposals = await _proposals()
         by_key = {(p.platform, p.field): p for p in proposals}
@@ -283,6 +289,13 @@ class TestRunImprove:
         assert TRACKLIST not in sc_desc  # SC description had no tracklist
         assert settings.SOUNDCLOUD_LINKS in sc_desc
 
+        # Tags rider: per-platform JSON-encoded tag drafts.
+        yt_tags = by_key[("youtube", "tags")]
+        assert json.loads(yt_tags.proposed_value) == ["techno", "dj mix", "will see"]
+        assert yt_tags.status == "draft" and yt_tags.created_by == "ai"
+        sc_tags = by_key[("soundcloud", "tags")]
+        assert json.loads(sc_tags.proposed_value) == ["techno", "dj set"]
+
     async def test_keeper_title_locked_and_never_proposed(self, prepared_db, fake_llm):
         mix_id = await _make_mix(title="Four Decks and a Prayer")
         summary = await run_improve("all_generic")
@@ -297,7 +310,7 @@ class TestRunImprove:
         await _make_mix(title="Silk and Static Vol 3")
         summary = await run_improve("all_generic")
         assert summary["generic"] == 1
-        assert summary["proposals_drafted"] == 3
+        assert summary["proposals_drafted"] == 5
         classify_calls = [
             c for g in fake_llm.instances for c in g.calls if "triaging" in c
         ]
@@ -313,10 +326,10 @@ class TestRunImprove:
         await _make_mix()
         first = await run_improve("all_generic")
         second = await run_improve("all_generic")
-        assert first["proposals_drafted"] == 3
+        assert first["proposals_drafted"] == 5
         assert second["proposals_drafted"] == 0
         assert second["skipped"] == 1
-        assert len(await _proposals()) == 3  # no duplicates
+        assert len(await _proposals()) == 5  # no duplicates
 
     async def test_explicit_mix_ids_scope(self, prepared_db, fake_llm):
         target = await _make_mix(title="Raid Train 2024-05-01")
@@ -444,4 +457,4 @@ class TestRunImprove:
         items, _ = await activity_log.query(event="catalog_improve")
         assert len(items) == 1
         assert "1 keeper" not in items[0]["message"]  # 0 keepers here
-        assert "3 proposals drafted" in items[0]["message"]
+        assert "5 proposals drafted" in items[0]["message"]

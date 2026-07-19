@@ -921,6 +921,119 @@ class SoundCloudUploader:
                     val[1].close()
         logger.info("Updated SoundCloud track %s fields: %s", track_id, sorted(data))
 
+    async def list_playlists(self) -> List[Dict[str, Any]]:
+        """Return every playlist owned by the authed user (raw resources).
+
+        GET /me/playlists with linked_partitioning pagination, following
+        ``next_href`` until exhausted. Each resource carries its ``tracks``
+        list, which callers use for membership checks.
+        """
+        token = await self._ensure_access_token()
+        playlists: List[Dict[str, Any]] = []
+        url: Optional[str] = f"{SOUNDCLOUD_API_BASE}/me/playlists"
+        params: Optional[Dict[str, Any]] = {"linked_partitioning": 1, "limit": 50}
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            while url:
+                resp = await client.get(
+                    url,
+                    params=params,
+                    headers={
+                        "Authorization": f"OAuth {token}",
+                        "Accept": "application/json",
+                    },
+                )
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"SoundCloud playlist listing failed ({resp.status_code}): {resp.text}"
+                    )
+                data = resp.json()
+                if isinstance(data, dict):
+                    playlists.extend(data.get("collection", []))
+                    url = data.get("next_href")
+                else:  # non-partitioned plain-list response
+                    playlists.extend(data)
+                    url = None
+                params = None  # next_href already carries the query string
+        return playlists
+
+    async def create_playlist(
+        self, title: str, track_ids: List[Any], sharing: str = "public"
+    ) -> Dict[str, Any]:
+        """Create a playlist with the given tracks; returns the raw resource."""
+        token = await self._ensure_access_token()
+        payload = {
+            "playlist": {
+                "title": title,
+                "sharing": sharing,
+                "tracks": [{"id": int(tid)} for tid in track_ids],
+            }
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{SOUNDCLOUD_API_BASE}/playlists",
+                headers={
+                    "Authorization": f"OAuth {token}",
+                    "Accept": "application/json",
+                },
+                json=payload,
+            )
+            if resp.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"SoundCloud playlist create failed ({resp.status_code}): {resp.text}"
+                )
+            playlist = resp.json()
+        logger.info(
+            "Created SoundCloud playlist '%s' (%s) with %d tracks",
+            title, playlist.get("id"), len(track_ids),
+        )
+        return playlist
+
+    async def add_track_to_playlist(self, playlist_id: Any, track_id: Any) -> None:
+        """Append one track to a playlist (idempotent; raises on failure).
+
+        SoundCloud's ``PUT /playlists/:id`` REPLACES the track array wholesale,
+        so the current list is fetched first, order preserved, and the new
+        track appended — never sent alone. Already-member tracks are a no-op.
+        """
+        token = await self._ensure_access_token()
+        headers = {
+            "Authorization": f"OAuth {token}",
+            "Accept": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(
+                f"{SOUNDCLOUD_API_BASE}/playlists/{playlist_id}", headers=headers
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"SoundCloud playlist fetch failed ({resp.status_code}): {resp.text}"
+                )
+            current = [
+                {"id": int(t["id"])}
+                for t in (resp.json().get("tracks") or [])
+                if t.get("id") is not None
+            ]
+            if any(t["id"] == int(track_id) for t in current):
+                logger.info(
+                    "Track %s already in SoundCloud playlist %s; skipping",
+                    track_id, playlist_id,
+                )
+                return
+
+            put = await client.put(
+                f"{SOUNDCLOUD_API_BASE}/playlists/{playlist_id}",
+                headers=headers,
+                json={"playlist": {"tracks": [*current, {"id": int(track_id)}]}},
+            )
+            if put.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"SoundCloud playlist update failed ({put.status_code}): {put.text}"
+                )
+        logger.info(
+            "Added track %s to SoundCloud playlist %s", track_id, playlist_id
+        )
+
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------

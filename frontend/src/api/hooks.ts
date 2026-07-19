@@ -748,6 +748,57 @@ export function useStartCatalogBackfill() {
   })
 }
 
+export interface CatalogPlaylistsPlatformSummary {
+  placed?: number
+  already_member?: number
+  created_playlists?: number
+  queued?: number
+  paused?: boolean
+}
+
+export interface CatalogPlaylistsSummary {
+  started_at: string
+  finished_at?: string
+  status: 'ok' | 'partial' | 'failed' | 'running' | string
+  errors: string[]
+  targeted?: number
+  buckets?: Record<string, number>
+  youtube?: CatalogPlaylistsPlatformSummary
+  soundcloud?: CatalogPlaylistsPlatformSummary
+}
+
+export interface CatalogPlaylistsStatus {
+  running: boolean
+  last_playlists: CatalogPlaylistsSummary | null
+}
+
+export function useCatalogPlaylistsStatus() {
+  return useQuery({
+    queryKey: ['catalog', 'playlists-status'],
+    queryFn: () =>
+      client
+        .get<CatalogPlaylistsStatus>('/catalog/organize-playlists/status')
+        .then((r) => r.data),
+    // Poll while a run is in flight so the UI notices completion
+    refetchInterval: (query) => (query.state.data?.running ? 2_000 : false),
+  })
+}
+
+export function useStartOrganizePlaylists() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (mixIds?: string[] | 'all') =>
+      client
+        .post<{ status: 'started' | 'already_running' }>('/catalog/organize-playlists', {
+          mix_ids: mixIds ?? null,
+        })
+        .then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['catalog', 'playlists-status'] })
+    },
+  })
+}
+
 export interface PlatformEdit {
   title?: string
   description?: string
