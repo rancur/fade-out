@@ -6,7 +6,8 @@ import MixDetail from './pages/MixDetail'
 import BrandSettings from './pages/BrandSettings'
 import AppSettings from './pages/AppSettings'
 import AIUsage from './pages/AIUsage'
-import NotificationHistory from './pages/NotificationHistory'
+import NotificationsPage from './pages/NotificationsPage'
+import ActivityPage from './pages/ActivityPage'
 import Upgrade from './pages/Upgrade'
 
 export default function App() {
@@ -16,10 +17,11 @@ export default function App() {
         <Route path="/" element={<Dashboard />} />
         <Route path="/mixes" element={<MixList />} />
         <Route path="/mixes/:id" element={<MixDetail />} />
+        <Route path="/activity" element={<ActivityPage />} />
         <Route path="/brand" element={<BrandSettings />} />
         <Route path="/settings" element={<AppSettings />} />
         <Route path="/ai" element={<AIUsage />} />
-        <Route path="/notifications" element={<NotificationHistory />} />
+        <Route path="/notifications" element={<NotificationsPage />} />
         <Route path="/upgrade" element={<Upgrade />} />
       </Routes>
     </Layout>

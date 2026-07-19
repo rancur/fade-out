@@ -20,6 +20,7 @@ import { format } from 'date-fns'
 import { useMix, useApproveMix, useRetryMix, useDeleteMix } from '@/api/hooks'
 import StatusBadge from '@/components/StatusBadge'
 import PipelineProgress from '@/components/PipelineProgress'
+import PipelineStepList from '@/components/PipelineStepList'
 import EnergyChart from '@/components/EnergyChart'
 
 const tabs = [
@@ -381,34 +382,8 @@ export default function MixDetail() {
             {mix.steps && mix.steps.length > 0 ? (
               <>
                 <PipelineProgress steps={mix.steps} />
-                <div className="space-y-2 mt-6">
-                  {mix.steps.map((step) => (
-                    <div
-                      key={step.step_name}
-                      className="flex items-center justify-between px-4 py-3 rounded-lg bg-dark/50"
-                    >
-                      <div className="flex items-center gap-3">
-                        <StatusBadge status={step.status} />
-                        <span className="text-sm text-gray-300 font-mono">{step.step_name}</span>
-                        {step.retry_count > 0 && (
-                          <span className="text-[10px] text-gray-500 font-mono">
-                            (retries: {step.retry_count})
-                          </span>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-3">
-                        {step.error && (
-                          <span className="text-[10px] text-cyber-red font-mono max-w-[200px] truncate" title={step.error}>
-                            {step.error}
-                          </span>
-                        )}
-                        <span className="text-[11px] text-gray-600 font-mono">
-                          {step.started_at && format(new Date(step.started_at), 'HH:mm:ss')}
-                          {step.completed_at && ` - ${format(new Date(step.completed_at), 'HH:mm:ss')}`}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
+                <div className="mt-6">
+                  <PipelineStepList steps={mix.steps} mixId={mix.id} />
                 </div>
               </>
             ) : (
