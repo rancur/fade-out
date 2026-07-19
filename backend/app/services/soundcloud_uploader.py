@@ -23,11 +23,14 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-UPLOAD_TIMEOUT = 3600  # multi-GB FLACs on home upstream need well over 10 min
+UPLOAD_TIMEOUT = 3600  # large uploads on home upstream need well over 10 min
 
-# SoundCloud's documented per-track upload cap. Files beyond this are rejected
-# server-side, so there is no point attempting the API with them.
-MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
+# api.soundcloud.com/tracks rejects large bodies with an empty 413 (observed
+# live at 2.9GB despite the web uploader's documented 4GB cap). Anything over
+# this gets transcoded to 320kbps MP3 first — SoundCloud re-encodes for
+# streaming anyway, and downloads are disabled.
+API_MAX_UPLOAD_BYTES = 450 * 1024 * 1024
+TRANSCODE_BITRATE = "320k"
 
 
 class SoundCloudUploader:
@@ -187,6 +190,64 @@ class SoundCloudUploader:
         """Upload via the official SoundCloud API."""
         token = await self._ensure_access_token()
 
+        transcoded: Optional[str] = None
+        if os.path.getsize(audio_path) > API_MAX_UPLOAD_BYTES:
+            transcoded = await self._transcode_for_api(audio_path)
+            audio_path = transcoded
+        try:
+            return await self._api_upload_inner(
+                audio_path, title, description, genre, tags, cover_art_path, token,
+            )
+        finally:
+            if transcoded:
+                try:
+                    os.unlink(transcoded)
+                except OSError:
+                    pass
+
+    async def _transcode_for_api(self, audio_path: str) -> str:
+        """Transcode an oversized master to 320kbps MP3 for the API upload."""
+        import tempfile
+
+        out = os.path.join(
+            tempfile.gettempdir(),
+            os.path.splitext(os.path.basename(audio_path))[0] + ".sc-upload.mp3",
+        )
+        size_mb = os.path.getsize(audio_path) / 1048576
+        logger.info(
+            "Audio too large for SoundCloud API (%.0f MB); transcoding to %s MP3",
+            size_mb, TRANSCODE_BITRATE,
+        )
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", audio_path,
+            "-codec:a", "libmp3lame", "-b:a", TRANSCODE_BITRATE,
+            "-map_metadata", "0", "-id3v2_version", "3",
+            out,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError(
+                f"ffmpeg transcode failed (rc={proc.returncode}): "
+                f"{(stderr or b'')[-400:].decode(errors='replace')}"
+            )
+        logger.info(
+            "Transcoded to %s (%.0f MB)", out, os.path.getsize(out) / 1048576,
+        )
+        return out
+
+    async def _api_upload_inner(
+        self,
+        audio_path: str,
+        title: str,
+        description: str,
+        genre: str,
+        tags: List[str],
+        cover_art_path: Optional[str],
+        token: str,
+    ) -> str:
+
         # Format tags: space-separated, multi-word tags in quotes
         formatted_tags = []
         for tag in tags[:30]:
@@ -196,12 +257,8 @@ class SoundCloudUploader:
                 formatted_tags.append(tag)
         tag_list = " ".join(formatted_tags)
 
-        # Build multipart upload
+        # Build multipart upload (oversized masters were already transcoded)
         file_size = os.path.getsize(audio_path)
-        if file_size > MAX_UPLOAD_BYTES:
-            raise ValueError(
-                f"File too large for SoundCloud ({file_size / 1024 / 1024:.0f}MB > 4GB)"
-            )
 
         logger.info("Uploading to SoundCloud API: '%s' (%d MB)", title, file_size // (1024 * 1024))
 
