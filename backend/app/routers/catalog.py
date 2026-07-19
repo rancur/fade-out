@@ -218,6 +218,40 @@ async def sync_status(db: AsyncSession = Depends(get_db)):
 # --- Unified mix list ---
 
 
+def _latest_published_expr():
+    """SQL expression for a mix's most recent platform publish date.
+
+    Platform dates live inside ``metadata_json.catalog.<platform>.published_at``
+    (ISO strings), so they must be pulled out with sqlite ``json_extract`` to
+    sort in SQL — sorting must happen before LIMIT/OFFSET for pagination to be
+    correct. ``datetime()`` normalizes both the ISO strings (``T`` separator,
+    tz offsets) and the ``created_at`` column to comparable UTC strings.
+    sqlite's two-arg ``max`` is a scalar max but returns NULL when either arg
+    is NULL, hence the coalesce dance; missing platform dates fall back to
+    ``created_at``.
+    """
+    yt = sa_func.datetime(
+        sa_func.json_extract(Mix.metadata_json, "$.catalog.youtube.published_at")
+    )
+    sc = sa_func.json_extract(Mix.metadata_json, "$.catalog.soundcloud.published_at")
+    sc = sa_func.datetime(sc)
+    latest = sa_func.max(sa_func.coalesce(yt, sc), sa_func.coalesce(sc, yt))
+    return sa_func.coalesce(latest, sa_func.datetime(Mix.created_at))
+
+
+def _catalog_order_by(sort: str):
+    """ORDER BY clauses for a catalog sort key (id tie-break keeps pages stable)."""
+    published = _latest_published_expr()
+    if sort == "oldest":
+        return (published.asc(), Mix.id.asc())
+    if sort == "title":
+        return (sa_func.lower(Mix.title).asc(), Mix.id.asc())
+    if sort == "duration":
+        # DESC puts NULL durations last in sqlite (NULL sorts smallest).
+        return (Mix.duration_seconds.desc(), Mix.id.asc())
+    return (published.desc(), Mix.id.asc())  # newest (default)
+
+
 @router.get("/mixes", response_model=CatalogMixListResponse)
 async def list_catalog_mixes(
     page: int = Query(1, ge=1),
@@ -225,6 +259,7 @@ async def list_catalog_mixes(
     platform: Optional[Literal["yt-only", "sc-only", "both"]] = Query(None),
     source: Optional[str] = Query(None),
     q: Optional[str] = Query(None, description="Title substring filter"),
+    sort: Literal["newest", "oldest", "title", "duration"] = Query("newest"),
     db: AsyncSession = Depends(get_db),
 ):
     """Unified paginated catalog listing with platform/source/title filters."""
@@ -255,7 +290,7 @@ async def list_catalog_mixes(
     rows = (
         (
             await db.execute(
-                base.order_by(Mix.created_at.desc())
+                base.order_by(*_catalog_order_by(sort))
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             )

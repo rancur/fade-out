@@ -15,6 +15,7 @@
 All LLM traffic reuses the DescriptionGenerator client + AIUsage accounting.
 """
 
+import difflib
 import json
 import logging
 import re
@@ -30,6 +31,18 @@ from app.services import activity_log
 logger = logging.getLogger(__name__)
 
 TITLE_MAX_CHARS = 70
+
+# Words the improve LLM has historically leaned on to the point of parody
+# ("Odyssey" showed up in 15+ of 60 drafts). Banned outright in the prompt and
+# enforced by the post-generation diversity guard.
+OVERUSED_TITLE_WORDS = ["odyssey", "sonic", "journey", "voyage", "exploration"]
+
+# A drafted title this difflib-similar to any already-used title triggers a
+# retry (and, failing that, an activity warning).
+TITLE_SIMILARITY_MAX = 0.8
+
+# How many already-used titles to show the LLM (most recent last -> tail).
+MAX_USED_TITLES_IN_PROMPT = 40
 
 # ---------------------------------------------------------------------------
 # Heuristic title classifier
@@ -107,6 +120,16 @@ RULES FOR THE TITLE:
 - <= {title_max} characters
 - No clickbait lies, no emojis, no dates
 - Do not include the words "raid train", "twitch", or "stream"
+- BANNED WORDS (overused across this catalog — never use them in any casing
+  or form): {banned_words}
+- Vary the title STRUCTURE — do NOT default to "Adjective Noun: Subtitle".
+  Rotate between forms: imperative hooks ("Lock the Groove In"), place/time
+  references ("3AM in the Warehouse"), genre slang, "artist | descriptor"
+  forms, questions, single striking phrases
+
+TITLES ALREADY IN USE — do NOT reuse their patterns or key words, and do not
+write anything close to them:
+{used_titles_block}
 
 RULES FOR THE DESCRIPTION:
 - Confident, psychedelic, cool; no emojis, no fake hype
@@ -121,7 +144,7 @@ MIX DATA:
 - Duration: {duration}
 - Current description (for context, may contain a tracklist you must NOT copy):
 {current_description}
-
+{retry_feedback}
 Respond with ONLY a JSON object:
 {{"title": "...", "description": "..."}}\
 """
@@ -215,19 +238,36 @@ async def classify_titles_llm(
 
 
 async def draft_improvement_llm(
-    mix: Mix, generator, session=None
+    mix: Mix,
+    generator,
+    session=None,
+    used_titles: Optional[List[str]] = None,
+    retry_feedback: str = "",
 ) -> Optional[Dict[str, str]]:
-    """Draft {"title", "description"} for a generic mix, or None on failure."""
+    """Draft {"title", "description"} for a generic mix, or None on failure.
+
+    ``used_titles`` (existing mix titles + open/applied title proposals + drafts
+    already produced this run) is injected into the prompt so the LLM stops
+    recycling the same words and patterns; ``retry_feedback`` carries the
+    diversity guard's "too similar, be different" addendum on a retry.
+    """
     current_description = (
         mix.description_youtube or mix.description_soundcloud or ""
+    )
+    recent_used = (used_titles or [])[-MAX_USED_TITLES_IN_PROMPT:]
+    used_titles_block = (
+        "\n".join(f"- {t}" for t in recent_used) if recent_used else "(none)"
     )
     prompt = IMPROVE_PROMPT.format(
         brand_name=settings.BRAND_NAME,
         title_max=TITLE_MAX_CHARS,
+        banned_words=", ".join(OVERUSED_TITLE_WORDS),
+        used_titles_block=used_titles_block,
         current_title=mix.title,
         genres=", ".join(mix.genres or []) or "electronic",
         duration=_format_duration(mix.duration_seconds),
         current_description=current_description[:3000] or "(none)",
+        retry_feedback=f"\n{retry_feedback}\n" if retry_feedback else "",
     )
     try:
         response, text = await generator._create_completion(
@@ -249,6 +289,68 @@ async def draft_improvement_llm(
     except Exception as exc:
         logger.warning("LLM improve draft failed for mix %s: %s", mix.id, exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Title diversity guard
+# ---------------------------------------------------------------------------
+
+def title_diversity_problem(title: str, used_titles: List[str]) -> Optional[str]:
+    """Why a drafted title fails the diversity bar, or None when it's fine.
+
+    Fails on any banned OVERUSED_TITLE_WORDS (word-boundary, case-insensitive)
+    or on >= TITLE_SIMILARITY_MAX difflib similarity to an already-used title.
+    """
+    for word in OVERUSED_TITLE_WORDS:
+        if re.search(rf"\b{re.escape(word)}\b", title, re.IGNORECASE):
+            return f'contains the overused word "{word}"'
+    lowered = title.strip().lower()
+    for used in used_titles:
+        ratio = difflib.SequenceMatcher(None, lowered, used.strip().lower()).ratio()
+        if ratio >= TITLE_SIMILARITY_MAX:
+            return f'is too similar to the existing title "{used}"'
+    return None
+
+
+async def draft_with_diversity_guard(
+    mix: Mix, generator, session, used_titles: List[str]
+) -> Optional[Dict[str, str]]:
+    """draft_improvement_llm + the diversity guard: retry once on a banned-word
+    or too-similar title; if the retry is still bad (or fails), keep the best
+    draft we have but log an activity warning."""
+    draft = await draft_improvement_llm(
+        mix, generator, session, used_titles=used_titles
+    )
+    if not draft:
+        return None
+    problem = title_diversity_problem(draft["title"], used_titles)
+    if not problem:
+        return draft
+
+    feedback = (
+        f'YOUR PREVIOUS ATTEMPT "{draft["title"]}" WAS REJECTED: it {problem}. '
+        "Too similar, be different: produce a COMPLETELY different title — "
+        "different words, different structure."
+    )
+    retry = await draft_improvement_llm(
+        mix, generator, session, used_titles=used_titles, retry_feedback=feedback
+    )
+    if retry:
+        retry_problem = title_diversity_problem(retry["title"], used_titles)
+        if not retry_problem:
+            return retry
+        draft, problem = retry, retry_problem
+
+    await activity_log.warn(
+        "catalog_improve",
+        (
+            f'Diversity guard: kept title "{draft["title"]}" for mix {mix.id} '
+            f"after retry — it still {problem}."
+        ),
+        mix_id=mix.id,
+        context={"title": draft["title"], "problem": problem},
+    )
+    return draft
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +446,39 @@ def _draft_proposals_for_mix(mix: Mix, draft: Dict[str, str]) -> List[MixProposa
     return proposals
 
 
+async def _fetch_used_titles(session) -> List[str]:
+    """All titles already claimed: every mix title (oldest first, so the most
+    recent land at the tail the prompt shows) plus every open or applied title
+    proposal value. Case-insensitively deduped, order preserved."""
+    mix_titles = (
+        (await session.execute(select(Mix.title).order_by(Mix.created_at.asc())))
+        .scalars()
+        .all()
+    )
+    proposal_titles = (
+        (
+            await session.execute(
+                select(MixProposal.proposed_value).where(
+                    MixProposal.field == "title",
+                    MixProposal.status.in_(
+                        ["draft", "approved", "applying", "applied"]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    seen = set()
+    out: List[str] = []
+    for title in [*mix_titles, *proposal_titles]:
+        t = (title or "").strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -402,7 +537,10 @@ async def run_improve(mix_ids: Optional[Any] = None) -> Dict[str, Any]:
                 summary["keepers_locked"] += 1
         await session.commit()
 
-        # Pass 2: draft proposals for generics.
+        # Pass 2: draft proposals for generics. ``used_titles`` starts from the
+        # DB (all mix titles + open/applied title proposals) and accumulates
+        # every title drafted in this run so later drafts can't repeat them.
+        used_titles = await _fetch_used_titles(session)
         for mix in mixes:
             if classes.get(mix.id) != "generic":
                 continue
@@ -410,10 +548,13 @@ async def run_improve(mix_ids: Optional[Any] = None) -> Dict[str, Any]:
             if await _has_open_proposal(session, mix.id, "title"):
                 summary["skipped"] += 1
                 continue
-            draft = await draft_improvement_llm(mix, generator, session)
+            draft = await draft_with_diversity_guard(
+                mix, generator, session, used_titles
+            )
             if not draft:
                 summary["skipped"] += 1
                 continue
+            used_titles.append(draft["title"])
             for proposal in _draft_proposals_for_mix(mix, draft):
                 session.add(proposal)
                 summary["proposals_drafted"] += 1
