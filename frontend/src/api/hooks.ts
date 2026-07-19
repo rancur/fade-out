@@ -250,7 +250,15 @@ export function useLiveEvents() {
 
 // ---------- Mixes ----------
 
-export function useMixes(params?: { status?: string; page?: number; page_size?: number }) {
+export type MixSort = 'newest' | 'oldest' | 'title'
+export type CatalogSort = MixSort | 'duration'
+
+export function useMixes(params?: {
+  status?: string
+  page?: number
+  page_size?: number
+  sort?: MixSort
+}) {
   const wsConnected = useWsConnected()
   return useQuery({
     queryKey: ['mixes', params],
@@ -662,6 +670,7 @@ export interface CatalogMixesParams {
   platform?: 'yt-only' | 'sc-only' | 'both'
   source?: string
   q?: string
+  sort?: CatalogSort
 }
 
 export function useCatalogMixes(params?: CatalogMixesParams) {
