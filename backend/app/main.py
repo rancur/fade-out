@@ -1,8 +1,10 @@
 """Fade-Out — DJ mix upload automation API."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,9 +14,26 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import init_db
 from app.logging_config import configure_logging
-from app.routers import ai_usage, auth, brand, mixes, notifications, pipeline, settings as settings_router, upgrade, ws
+from app.routers import (
+    activity,
+    ai_usage,
+    auth,
+    brand,
+    catalog,
+    mixes,
+    notifications,
+    pipeline,
+    settings as settings_router,
+    system,
+    upgrade,
+    ws,
+)
+from app.services import activity_log
+from app.services.file_watcher import FileWatcherService
 from app.services.handlers import register_all_handlers
-from app.services.pipeline import PipelineOrchestrator
+from app.services.ingest import IngestCoordinator
+from app.services.notification_service import get_notification_service
+from app.services.pipeline import PipelineOrchestrator, sweep_interrupted_at_boot
 
 logger = logging.getLogger("fadeout")
 
@@ -32,6 +51,11 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database ready.")
 
+    # Startup sweep: anything still marked "running" was cut off by the last
+    # shutdown (no orchestrator task can exist at boot). Steps become
+    # "interrupted", their mixes "failed" with a retryable error.
+    await sweep_interrupted_at_boot()
+
     # Register all pipeline step handlers
     register_all_handlers(orchestrator)
     logger.info(
@@ -42,15 +66,70 @@ async def lifespan(app: FastAPI):
     # Stream live pipeline events to any connected WebSocket clients.
     orchestrator.on_event(ws.manager.broadcast_event)
 
+    # Fan out every activity-log entry to connected WebSocket clients too, so
+    # the UI sidebar updates live in addition to its polling fallback.
+    def _broadcast_activity(payload: dict) -> Any:
+        return ws.manager.broadcast({"event": "activity", "data": payload})
+
+    activity_log.add_listener(_broadcast_activity)
+
+    # Notifications: the singleton NotificationService reads its channel
+    # config from AppSettings.settings_json (env as first-boot fallback) and
+    # listens to orchestrator events (pipeline_started, step_completed,
+    # upload_complete, error, draft_ready), honoring the per-event toggles and
+    # min-level saved via /api/notifications/settings.
+    notifier = get_notification_service()
+    await notifier.start()
+    orchestrator.on_event(notifier.handle_orchestrator_event)
+
+    # Nightly activity-log retention: prune rows older than
+    # ACTIVITY_RETENTION_DAYS or beyond ACTIVITY_MAX_ROWS.
+    async def _activity_retention_loop() -> None:
+        while True:
+            try:
+                await activity_log.prune()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Activity retention prune failed")
+            await asyncio.sleep(24 * 3600)
+
+    retention_task = asyncio.create_task(_activity_retention_loop())
+
+    # Start the file watcher so dropped audio/video files auto-ingest into the
+    # pipeline. Without this the watcher service is never instantiated and
+    # nothing is ever picked up from the watch folders.
+    coordinator = IngestCoordinator(orchestrator)
+    coordinator.start()  # background pairing / expiry sweeper for out-of-order drops
+    file_watcher = FileWatcherService(
+        on_audio_file=coordinator.ingest_audio,
+        on_video_file=coordinator.ingest_video,
+    )
+    await file_watcher.start()
+    logger.info(
+        "File watcher started (audio=%s video=%s).",
+        settings.WATCH_AUDIO_PATH,
+        settings.WATCH_VIDEO_PATH,
+    )
+    await activity_log.info("service_started", "fade-out started; watching for drops.")
+
     logger.info("Fade-Out is running.")
     yield
     logger.info("Fade-Out shutting down.")
+    retention_task.cancel()
+    try:
+        await retention_task
+    except asyncio.CancelledError:
+        pass
+    await file_watcher.stop()
+    await coordinator.stop()
+    await notifier.stop()
 
+
+APP_VERSION = "2.0.0"
 
 app = FastAPI(
     title="Fade-Out",
     description="DJ mix upload automation tool",
-    version="0.1.0",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -66,7 +145,10 @@ app.add_middleware(
 # --- Routers ---
 app.include_router(auth.router)
 app.include_router(mixes.router)
+app.include_router(catalog.router)
 app.include_router(pipeline.router)
+app.include_router(activity.router)
+app.include_router(system.router)
 app.include_router(settings_router.router)
 app.include_router(brand.router)
 app.include_router(ai_usage.router)
@@ -79,7 +161,7 @@ app.include_router(ws.router)
 @app.get("/api/health")
 async def health_check():
     """Return service health status."""
-    return {"status": "ok", "version": "0.1.0"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 # --- Static Files & SPA Fallback ---

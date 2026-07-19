@@ -1,5 +1,6 @@
 """SQLAlchemy ORM models for Fade-Out."""
 
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -28,6 +29,16 @@ class Mix(Base):
 
     id = Column(String, primary_key=True, default=_uuid)
     title = Column(String, nullable=False)
+    # Where this mix came from: "pipeline" (recorded + processed locally) or
+    # "imported" (discovered on a platform by the back-catalog sync).
+    source = Column(String, default="pipeline", nullable=False)
+    # Platform-native ids. These are the idempotency keys for catalog sync
+    # (URLs can vary in form; the ids never do).
+    youtube_video_id = Column(String, nullable=True, index=True)
+    soundcloud_track_id = Column(String, nullable=True, index=True)
+    # True for "keeper" titles (unique/creative). AI improve never proposes a
+    # title change for a locked mix; descriptions may still be proposed.
+    title_locked = Column(Boolean, default=False, nullable=False)
     audio_file_path = Column(String)
     video_file_path = Column(String)
     duration_seconds = Column(Float)
@@ -58,6 +69,37 @@ class Mix(Base):
     steps = relationship("PipelineStep", back_populates="mix", cascade="all, delete-orphan")
     ai_usages = relationship("AIUsage", back_populates="mix", cascade="all, delete-orphan")
     notifications = relationship("Notification", back_populates="mix", cascade="all, delete-orphan")
+    proposals = relationship("MixProposal", back_populates="mix", cascade="all, delete-orphan")
+
+
+class MixProposal(Base):
+    """A proposed change to one field of a published mix on one platform.
+
+    Proposals are drafted by the AI improver (``created_by="ai"``, status
+    ``draft``) or created directly by the user via the mix editor
+    (``created_by="user"``, auto-approved). The apply worker consumes
+    ``approved`` rows sequentially and pushes them to the platform APIs,
+    recording ``applied``/``failed`` (+``error``) per row so the full history
+    is kept on the proposal itself.
+    """
+
+    __tablename__ = "mix_proposals"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    mix_id = Column(String, ForeignKey("mixes.id"), nullable=False, index=True)
+    platform = Column(String, nullable=False)  # youtube | soundcloud | both
+    field = Column(String, nullable=False)  # title | description | thumbnail | playlist | tags
+    current_value = Column(Text)
+    proposed_value = Column(Text)  # JSON-encoded when structured (tags, playlist)
+    status = Column(String, default="draft", nullable=False, index=True)
+    # draft | approved | rejected | applying | applied | failed
+    created_by = Column(String, default="ai", nullable=False)  # ai | user
+    error = Column(Text)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    applied_at = Column(DateTime)
+
+    mix = relationship("Mix", back_populates="proposals")
 
 
 class PipelineStep(Base):
@@ -66,12 +108,14 @@ class PipelineStep(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     mix_id = Column(String, ForeignKey("mixes.id"))
     step_name = Column(String)  # detect, analyze, generate_description, generate_art, upload_soundcloud, upload_youtube, verify_soundcloud, verify_youtube, cross_link
-    status = Column(String)  # pending, running, completed, failed, skipped
+    status = Column(String)  # pending, running, completed, failed, skipped, waiting, interrupted
     started_at = Column(DateTime)
     completed_at = Column(DateTime)
     error = Column(Text)
     retry_count = Column(Integer, default=0)
     output_json = Column(JSON)
+    progress = Column(Integer, nullable=True)  # 0-100 live step progress
+    progress_detail = Column(String, nullable=True)  # e.g. "1.2 GB / 2.9 GB"
 
     mix = relationship("Mix", back_populates="steps")
 
@@ -122,6 +166,30 @@ class Notification(Base):
     created_at = Column(DateTime, default=func.now())
 
     mix = relationship("Mix", back_populates="notifications")
+
+
+class ActivityEvent(Base):
+    """Persistent, append-only running log of pipeline + system events.
+
+    Every meaningful thing the app does (a file detected or skipped, a mix
+    created, each pipeline stage starting/finishing, upload attempts and their
+    result per platform, auth/connect events, and every error) is written here
+    so the history survives restarts and can be surfaced live in the UI sidebar
+    and via GET /api/activity.
+    """
+
+    __tablename__ = "activity_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    level = Column(String, default="info", index=True)  # info, warn, error
+    event = Column(String, index=True)  # short machine key, e.g. file_detected
+    message = Column(Text)  # short human-readable message
+    mix_id = Column(String, ForeignKey("mixes.id", ondelete="SET NULL"), nullable=True, index=True)
+    filename = Column(String, nullable=True)
+    platform = Column(String, nullable=True)  # soundcloud, youtube, mixcloud
+    stage = Column(String, nullable=True)  # pipeline step name
+    context = Column(JSON, nullable=True)  # arbitrary structured detail
 
 
 class AppSettings(Base):

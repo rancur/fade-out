@@ -67,17 +67,9 @@ class AnalysisResult:
         }
 
 
-# Genre inference from spectral features
-_GENRE_HINTS: Dict[str, Dict[str, Tuple[float, float]]] = {
-    # genre -> feature_name -> (low, high) expected range
-    "drum and bass": {"bpm": (160, 180), "centroid_mean": (2000, 5000)},
-    "house": {"bpm": (118, 132), "centroid_mean": (1500, 4000)},
-    "techno": {"bpm": (125, 150), "centroid_mean": (1000, 3500)},
-    "trance": {"bpm": (128, 145), "centroid_mean": (2000, 5000)},
-    "dubstep": {"bpm": (135, 145), "centroid_mean": (500, 3000)},
-    "ambient": {"bpm": (60, 100), "centroid_mean": (500, 2000)},
-    "breakbeat": {"bpm": (120, 150), "centroid_mean": (1500, 4500)},
-}
+# Genre inference from spectral features lives in ``genre_utils.GENRE_HINTS``
+# (kept there, dep-free, alongside the per-segment classifier so it is unit
+# testable without importing librosa/soundfile/shazamio).
 
 _VIBE_FROM_ENERGY: List[Tuple[str, float, float]] = [
     ("chill", 0.0, 0.25),
@@ -97,8 +89,12 @@ class AudioAnalyzer:
         self._shazam = Shazam()
         self._audd_token = (settings.AUDD_API_TOKEN or "").strip()
 
-    async def analyze(self, audio_path: str) -> AnalysisResult:
-        """Full analysis pipeline. Handles files up to 6 hours."""
+    async def analyze(self, audio_path: str, progress_cb=None) -> AnalysisResult:
+        """Full analysis pipeline. Handles files up to 6 hours.
+
+        ``progress_cb`` is an optional ``async (percent, detail)`` callable
+        that receives track-identification progress ("identifying tracks 23/65").
+        """
         logger.info("Starting analysis of %s", audio_path)
         result = AnalysisResult()
 
@@ -142,7 +138,9 @@ class AudioAnalyzer:
             result.bpm_range = (round(min(bpms), 1), round(max(bpms), 1))
 
         # Shazam identification
-        tracklist = await self._identify_tracks(audio_path, sample_times, sr_native)
+        tracklist = await self._identify_tracks(
+            audio_path, sample_times, sr_native, progress_cb=progress_cb
+        )
         result.tracklist = [t.to_dict() for t in tracklist]
 
         # Genre classification from features + identified tracks
@@ -210,80 +208,70 @@ class AudioAnalyzer:
         }
 
     async def _identify_tracks(
-        self, path: str, sample_times: List[float], sr_native: int
+        self, path: str, sample_times: List[float], sr_native: int, progress_cb=None
     ) -> List[TrackHit]:
         """Use Shazam to identify tracks at sample points.
 
         For each sample point, tries two clips (primary and +30s offset) to
-        catch transitions. If the primary clip fails recognition, retries at
-        +45s. Each clip is run through Shazam first and, if an AudD token is
-        configured, falls back to AudD when Shazam returns nothing.
-        Consecutive duplicate tracks are deduplicated (keep first occurrence).
+        catch transitions — BOTH tracks of a transition are kept. If the
+        primary clip fails recognition, it retries at +45s. Each clip is run
+        through Shazam first and, if an AudD token is configured, falls back
+        to AudD when Shazam returns nothing.
+
+        Dedup is consecutive-only: a track may legitimately reappear later in
+        the set (A -> B -> A), so a global seen-set would wrongly drop the
+        comeback.
         """
         identified: List[TrackHit] = []
-        seen_titles: set[str] = set()
         last_title: Optional[str] = None
 
-        # Track how many times each song is identified (for confidence filtering)
+        # Track how many times each song is identified (for confidence scoring)
         title_hit_count: dict[str, int] = {}
 
-        for t in sample_times:
+        def _emit(hit: TrackHit) -> None:
+            nonlocal last_title
+            title_key = hit.title.lower()
+            title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
+            if title_key == last_title:
+                return
+            identified.append(hit)
+            last_title = title_key
+
+        total_segments = len(sample_times)
+        for n, t in enumerate(sample_times, start=1):
             # Primary clip at sample point
             hit = await self._recognize_segment(path, t, sr_native)
             if not hit:
                 # Retry with offset if primary fails
                 hit = await self._recognize_segment(path, t + RETRY_CLIP_OFFSET, sr_native)
-
             if hit:
-                title_key = hit.title.lower()
-                title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
-                if title_key != last_title and title_key not in seen_titles:
-                    seen_titles.add(title_key)
-                    identified.append(hit)
-                    last_title = title_key
+                _emit(hit)
 
-            # Secondary clip at +30s to catch tracks during transitions
-            # Only add if we didn't already get a hit at this point
-            if not hit:
-                hit2 = await self._recognize_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
-                if hit2:
-                    title_key = hit2.title.lower()
-                    title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
-                    if title_key != last_title and title_key not in seen_titles:
-                        seen_titles.add(title_key)
-                        identified.append(hit2)
-                        last_title = title_key
+            # Secondary clip at +30s: catches the incoming track during a
+            # transition window. Emit it even when the primary hit — if it
+            # differs, both tracks of the blend belong in the tracklist.
+            hit2 = await self._recognize_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
+            if hit2:
+                _emit(hit2)
 
-        # Sort by timestamp
-        identified.sort(key=lambda h: h.timestamp_seconds)
-
-        # Post-processing: remove likely false positives
-        # A track identified only once AND very close (<45s) to neighbors on BOTH sides
-        # is likely a false positive from a transition blend
-        if len(identified) > 3:
-            filtered: List[TrackHit] = []
-            for i, track in enumerate(identified):
-                title_key = track.title.lower()
-                hits = title_hit_count.get(title_key, 0)
-
-                # Keep if identified more than once (confirmed)
-                if hits >= 2:
-                    filtered.append(track)
-                    continue
-
-                # Keep if there's enough gap from at least one neighbor
-                prev_gap = (track.timestamp_seconds - identified[i - 1].timestamp_seconds) if i > 0 else 999
-                next_gap = (identified[i + 1].timestamp_seconds - track.timestamp_seconds) if i < len(identified) - 1 else 999
-
-                # Only filter if BOTH gaps are tiny (sandwiched between close tracks)
-                if prev_gap < 45 and next_gap < 45:
-                    logger.debug(
-                        "Filtering likely false positive: %s - %s at %.0fs (single hit, gaps: %.0fs/%.0fs)",
-                        track.artist, track.title, track.timestamp_seconds, prev_gap, next_gap,
+            if progress_cb is not None and total_segments:
+                try:
+                    await progress_cb(
+                        int(n * 100 / total_segments),
+                        f"identifying tracks {n}/{total_segments}",
                     )
-                else:
-                    filtered.append(track)
-            identified = filtered
+                except Exception:  # pragma: no cover - progress must never break analysis
+                    pass
+
+        # Sort by timestamp, then re-apply consecutive dedup in time order
+        # (out-of-order emission across sample points can duplicate neighbors)
+        identified.sort(key=lambda h: h.timestamp_seconds)
+        deduped: List[TrackHit] = []
+        for track in identified:
+            if deduped and deduped[-1].title.lower() == track.title.lower():
+                continue
+            deduped.append(track)
+        identified = deduped
 
         # Tag each surviving hit with a recognition confidence derived from how
         # many times its title was independently recognized. The confidence
@@ -429,42 +417,21 @@ class AudioAnalyzer:
         centroids: List[float],
         tracklist: List[TrackHit],
     ) -> List[str]:
-        """Infer genres from BPM + spectral features + track metadata."""
-        if not bpms:
-            return ["electronic"]
+        """Infer genres from PER-SEGMENT features + track metadata.
 
-        avg_bpm = float(np.mean(bpms))
-        avg_centroid = float(np.mean(centroids)) if centroids else 2000.0
+        Delegates to ``genre_utils.classify_genres_from_segments`` which tallies
+        the arg-max genre of every sampled segment (folding half/double-tempo
+        first) instead of scoring one global ``mean(bpms)``. Averaging a
+        multi-genre set previously landed a half-tempo DnB mix (~87 BPM) inside
+        house's 118-132 band and mislabelled the whole set. Word-boundary
+        keyword matches from identified tracks win precedence over spectral
+        guesses, and genres come back ordered by prevalence so ``genres[0]`` is
+        truly the primary genre.
+        """
+        from app.services.genre_utils import classify_genres_from_segments
 
-        scores: Dict[str, float] = {}
-        for genre, ranges in _GENRE_HINTS.items():
-            score = 0.0
-            bpm_lo, bpm_hi = ranges["bpm"]
-            if bpm_lo <= avg_bpm <= bpm_hi:
-                score += 2.0
-            elif abs(avg_bpm - (bpm_lo + bpm_hi) / 2) < 20:
-                score += 0.5
-
-            cent_lo, cent_hi = ranges["centroid_mean"]
-            if cent_lo <= avg_centroid <= cent_hi:
-                score += 1.0
-
-            scores[genre] = score
-
-        # Boost genres mentioned in Shazam track metadata. Word-boundary matching
-        # (see genre_utils.keyword_matches) avoids over-crediting e.g. "drum and
-        # bass" for titles that merely contain "bass" inside a longer word.
-        from app.services.genre_utils import keyword_boosts
-
-        for track in tracklist:
-            combined = f"{track.title} {track.artist}"
-            for genre, boost in keyword_boosts(combined).items():
-                scores[genre] = scores.get(genre, 0) + boost
-
-        # Return top genres with score > 0
-        sorted_genres = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-        result = [g for g, s in sorted_genres if s > 0][:4]
-        return result if result else ["electronic"]
+        track_texts = [f"{t.title} {t.artist}" for t in tracklist]
+        return classify_genres_from_segments(bpms, centroids, track_texts)
 
     def _classify_vibes(self, energy_points: List[Dict[str, Any]]) -> List[str]:
         """Classify overall vibes from energy profile."""

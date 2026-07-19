@@ -112,6 +112,83 @@ class TestMixStateTransitions:
         resp = await client.post(f"/api/mixes/{mix_id}/retry-step/not_a_step")
         assert resp.status_code == 404
 
+    async def test_retry_step_returns_before_step_completes(self, client, monkeypatch):
+        # The endpoint must commit its own txn and run the step in the
+        # background: awaiting the orchestrator inline self-deadlocked sqlite
+        # (the request held an uncommitted write txn while _execute_step wrote
+        # from its own session) and pinned multi-GB uploads inside the request.
+        import asyncio
+
+        from app.main import orchestrator
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = {}
+
+        async def slow_retry(mix_id, step_name):
+            calls["args"] = (mix_id, step_name)
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(orchestrator, "retry_step", slow_retry)
+
+        created = (await client.post("/api/mixes", json={"title": "Fresh"})).json()
+        mix_id = created["id"]
+
+        resp = await client.post(f"/api/mixes/{mix_id}/retry-step/analyze")
+        # Responds while the (still-running) step is blocked on `release`.
+        assert resp.status_code == 200
+        assert resp.json()["id"] == mix_id
+
+        await asyncio.wait_for(started.wait(), timeout=5)
+        assert calls["args"] == (mix_id, "analyze")
+        release.set()
+
+
+class TestRereadTracklist:
+    async def test_404_unknown_mix(self, client):
+        resp = await client.post("/api/mixes/does-not-exist/reread-tracklist")
+        assert resp.status_code == 404
+
+    async def test_400_when_audio_missing(self, client):
+        created = (await client.post("/api/mixes", json={"title": "No Audio"})).json()
+        resp = await client.post(f"/api/mixes/{created['id']}/reread-tracklist")
+        assert resp.status_code == 400
+
+    async def test_202_runs_handler_in_background(self, client, tmp_path, monkeypatch):
+        import asyncio
+
+        import app.services.handlers as handlers_mod
+
+        audio = tmp_path / "mix.flac"
+        audio.write_bytes(b"x")
+
+        done = asyncio.Event()
+        calls = {}
+
+        async def fake_reread(mix_id, session):
+            calls["mix_id"] = mix_id
+            done.set()
+            return {"tracks_found": 0}
+
+        # The router resolves the handler at request time from the module, so
+        # patching the module attribute intercepts the background task.
+        monkeypatch.setattr(handlers_mod, "handle_reread_tracklist", fake_reread)
+
+        created = (
+            await client.post(
+                "/api/mixes",
+                json={"title": "Reread Me", "audio_file_path": str(audio)},
+            )
+        ).json()
+
+        resp = await client.post(f"/api/mixes/{created['id']}/reread-tracklist")
+        assert resp.status_code == 202
+        assert resp.json()["id"] == created["id"]
+
+        await asyncio.wait_for(done.wait(), timeout=5)
+        assert calls["mix_id"] == created["id"]
+
 
 class TestPipelineEndpoints:
     async def test_status_counts(self, client):

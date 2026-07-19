@@ -1,8 +1,13 @@
-"""Notification listing, testing, and settings endpoints."""
+"""Notification listing, testing, and settings endpoints.
+
+Settings live in ``AppSettings.settings_json`` under ``notification_*`` keys —
+the single config source the NotificationService reads (env vars are first-boot
+fallback only). The SMTP password is write-only: GET returns ``has_password``.
+"""
 
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -15,6 +20,9 @@ from app.models import AppSettings, Notification
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/notifications", tags=["notifications"])
+
+VALID_CHANNELS = {"discord", "email", "webhook"}
+VALID_LEVELS = {"info", "warn", "error"}
 
 
 # --- Schemas ---
@@ -52,13 +60,19 @@ class TestNotificationResponse(BaseModel):
 
 
 class NotificationSettingsUpdate(BaseModel):
+    """PUT body. Every field optional — only provided fields are written."""
+
     discord_webhook_url: Optional[str] = None
     email_smtp_host: Optional[str] = None
     email_smtp_port: Optional[int] = None
     email_smtp_user: Optional[str] = None
-    email_smtp_password: Optional[str] = None
+    email_smtp_password: Optional[str] = None  # write-only, never returned
+    email_from: Optional[str] = None
     email_to: Optional[str] = None
+    email_smtp_secure: Optional[bool] = None
     webhook_urls: Optional[str] = None  # comma-separated
+    events: Optional[Dict[str, bool]] = None  # event-type -> enabled
+    min_level: Optional[str] = None  # info | warn | error
 
 
 class NotificationSettingsOut(BaseModel):
@@ -66,11 +80,13 @@ class NotificationSettingsOut(BaseModel):
     email_smtp_host: Optional[str] = None
     email_smtp_port: Optional[int] = None
     email_smtp_user: Optional[str] = None
+    has_password: bool = False  # password itself is never returned
+    email_from: Optional[str] = None
     email_to: Optional[str] = None
+    email_smtp_secure: bool = True
     webhook_urls: Optional[str] = None
-
-    class Config:
-        from_attributes = True
+    events: Dict[str, bool] = {}
+    min_level: str = "info"
 
 
 # --- Helpers ---
@@ -86,17 +102,25 @@ async def _get_or_create_app_settings(db: AsyncSession) -> AppSettings:
     return row
 
 
-def _extract_notification_settings(app_settings: AppSettings) -> dict:
-    """Extract notification-related fields from settings_json."""
-    sj = app_settings.settings_json or {}
-    return {
-        "discord_webhook_url": sj.get("notification_discord_webhook_url"),
-        "email_smtp_host": sj.get("notification_email_smtp_host"),
-        "email_smtp_port": sj.get("notification_email_smtp_port"),
-        "email_smtp_user": sj.get("notification_email_smtp_user"),
-        "email_to": sj.get("notification_email_to"),
-        "webhook_urls": sj.get("notification_webhook_urls"),
-    }
+def _settings_out(settings_json: Optional[dict]) -> NotificationSettingsOut:
+    """Build the API view of the EFFECTIVE config (DB first, env fallback)."""
+    from app.services.notification_service import resolve_config
+
+    cfg = resolve_config(settings_json)
+    webhook_urls = cfg["webhook_urls"]
+    return NotificationSettingsOut(
+        discord_webhook_url=cfg["discord_webhook_url"],
+        email_smtp_host=cfg["email_smtp_host"],
+        email_smtp_port=cfg["email_smtp_port"],
+        email_smtp_user=cfg["email_smtp_user"],
+        has_password=bool(cfg["email_smtp_password"]),
+        email_from=cfg["email_from"],
+        email_to=cfg["email_to"],
+        email_smtp_secure=cfg["email_secure"],
+        webhook_urls=",".join(webhook_urls) if webhook_urls else None,
+        events=cfg["events"],
+        min_level=cfg["min_level"],
+    )
 
 
 # --- Endpoints ---
@@ -136,47 +160,36 @@ async def list_notifications(
     )
 
 
-@router.post("/test", response_model=TestNotificationResponse)
-async def test_notification(body: TestNotificationRequest):
-    """Send a test notification to the specified channel."""
-    from app.services.notification_service import NotificationService
+@router.post("/test/{channel}", response_model=TestNotificationResponse)
+async def test_notification_channel(channel: str):
+    """Send a test notification to one channel using the CURRENT saved settings."""
+    from app.services.notification_service import get_notification_service
 
-    valid_channels = {"discord", "email", "webhook"}
-    if body.channel not in valid_channels:
+    if channel not in VALID_CHANNELS:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid channel '{body.channel}'. Must be one of: {', '.join(sorted(valid_channels))}",
+            detail=f"Invalid channel '{channel}'. Must be one of: {', '.join(sorted(VALID_CHANNELS))}",
         )
 
-    service = NotificationService()
-    try:
-        await service.notify(
-            notification_type="info",
-            title="Test Notification",
-            message=body.message or "This is a test notification from Fade-Out.",
+    service = get_notification_service()
+    success, detail = await service.send_test(channel)
+    return TestNotificationResponse(success=success, channel=channel, detail=detail)
+
+
+@router.post("/test", response_model=TestNotificationResponse)
+async def test_notification(body: TestNotificationRequest):
+    """Legacy test endpoint (channel in body). Delegates to the saved-settings path."""
+    from app.services.notification_service import get_notification_service
+
+    if body.channel not in VALID_CHANNELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid channel '{body.channel}'. Must be one of: {', '.join(sorted(VALID_CHANNELS))}",
         )
-        # The notification service queues and sends asynchronously.
-        # For a direct test, attempt immediate delivery.
-        await service._send_all_channels({
-            "type": "info",
-            "mix_id": None,
-            "title": "Test Notification",
-            "message": body.message or "This is a test notification from Fade-Out.",
-            "data": {},
-            "timestamp": datetime.utcnow().isoformat(),
-        })
-        return TestNotificationResponse(
-            success=True,
-            channel=body.channel,
-            detail=f"Test notification sent to {body.channel}.",
-        )
-    except Exception as exc:
-        logger.exception("Test notification failed for channel %s", body.channel)
-        return TestNotificationResponse(
-            success=False,
-            channel=body.channel,
-            detail=f"Failed to send test notification: {exc}",
-        )
+
+    service = get_notification_service()
+    success, detail = await service.send_test(body.channel, message=body.message)
+    return TestNotificationResponse(success=success, channel=body.channel, detail=detail)
 
 
 @router.put("/settings", response_model=NotificationSettingsOut)
@@ -184,7 +197,17 @@ async def update_notification_settings(
     body: NotificationSettingsUpdate,
     db: AsyncSession = Depends(get_db),
 ):
-    """Update notification configuration stored in AppSettings.settings_json."""
+    """Update notification configuration stored in AppSettings.settings_json.
+
+    Only fields present in the request are written; the SMTP password is
+    write-only (omit it to keep the stored one).
+    """
+    if body.min_level is not None and body.min_level not in VALID_LEVELS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid min_level '{body.min_level}'. Must be one of: {', '.join(sorted(VALID_LEVELS))}",
+        )
+
     app_settings = await _get_or_create_app_settings(db)
 
     sj = dict(app_settings.settings_json or {})
@@ -196,8 +219,12 @@ async def update_notification_settings(
         "email_smtp_port": "notification_email_smtp_port",
         "email_smtp_user": "notification_email_smtp_user",
         "email_smtp_password": "notification_email_smtp_password",
+        "email_from": "notification_email_from",
         "email_to": "notification_email_to",
+        "email_smtp_secure": "notification_email_smtp_secure",
         "webhook_urls": "notification_webhook_urls",
+        "events": "notification_events",
+        "min_level": "notification_min_level",
     }
 
     for field_name, json_key in field_map.items():
@@ -206,21 +233,21 @@ async def update_notification_settings(
 
     app_settings.settings_json = sj
     await db.flush()
+    await db.commit()
 
-    # Return settings without the password
-    return NotificationSettingsOut(
-        discord_webhook_url=sj.get("notification_discord_webhook_url"),
-        email_smtp_host=sj.get("notification_email_smtp_host"),
-        email_smtp_port=sj.get("notification_email_smtp_port"),
-        email_smtp_user=sj.get("notification_email_smtp_user"),
-        email_to=sj.get("notification_email_to"),
-        webhook_urls=sj.get("notification_webhook_urls"),
-    )
+    # Saved settings apply immediately (the service caches config for 60s).
+    try:
+        from app.services.notification_service import get_notification_service
+
+        get_notification_service().invalidate_config_cache()
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not invalidate notification config cache", exc_info=True)
+
+    return _settings_out(sj)
 
 
 @router.get("/settings", response_model=NotificationSettingsOut)
 async def get_notification_settings(db: AsyncSession = Depends(get_db)):
-    """Get current notification configuration."""
+    """Get the effective notification configuration (password never included)."""
     app_settings = await _get_or_create_app_settings(db)
-    data = _extract_notification_settings(app_settings)
-    return NotificationSettingsOut(**data)
+    return _settings_out(app_settings.settings_json)

@@ -17,6 +17,17 @@ from app.models import AppSettings
 
 logger = logging.getLogger("fadeout.auth")
 
+
+async def _emit_auth(level: str, event: str, message: str, **kwargs) -> None:
+    """Best-effort activity-log emit for auth/connect events."""
+    try:
+        from app.services import activity_log
+
+        await activity_log.log(level, event, message, **kwargs)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("auth activity emit failed for %s", event, exc_info=True)
+
+
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 YOUTUBE_OAUTH_SCOPES = [
@@ -387,10 +398,19 @@ async def set_soundcloud_token(body: TokenUpdate, db: AsyncSession = Depends(get
             )
         if resp.status_code == 200:
             data = resp.json()
+            await _emit_auth(
+                "info", "auth_connected",
+                f"SoundCloud connected as {data.get('username') or data.get('permalink')}",
+                platform="soundcloud",
+            )
             return SoundCloudStatus(
                 connected=True,
                 username=data.get("username") or data.get("permalink"),
             )
+        await _emit_auth(
+            "warn", "auth_failed",
+            f"SoundCloud token rejected (HTTP {resp.status_code})", platform="soundcloud",
+        )
         return SoundCloudStatus(connected=False, error=f"Token rejected (HTTP {resp.status_code})")
     except Exception as exc:
         return SoundCloudStatus(connected=False, error=str(exc))
@@ -564,7 +584,14 @@ async def set_youtube_token(body: TokenUpdate, db: AsyncSession = Depends(get_db
     row.settings_json = sj
     await db.flush()
 
-    return await _get_youtube_status(db)
+    status = await _get_youtube_status(db)
+    await _emit_auth(
+        "info" if status.connected else "warn",
+        "auth_connected" if status.connected else "auth_failed",
+        "YouTube refresh token stored" + ("" if status.connected else " (not verified)"),
+        platform="youtube",
+    )
+    return status
 
 
 @router.get("/youtube/oauth-url", response_model=OAuthURL)

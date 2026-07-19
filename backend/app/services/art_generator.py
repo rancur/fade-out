@@ -1,7 +1,9 @@
 """Image generation service for SoundCloud cover art and YouTube thumbnails."""
 
+import asyncio
 import logging
 import os
+import subprocess
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,43 +20,50 @@ logger = logging.getLogger(__name__)
 # Brand visual defaults
 # ---------------------------------------------------------------------------
 
+# Brand base is the pixel-art / psychedelic / all-seeing-eyes aesthetic Will
+# likes -- but GENRE-NEUTRAL. The old default hard-coded a "psychedelic nature
+# scene ... eyes in foliage ... lush vegetation", which forced EVERY mix into a
+# palm-tree/jungle landscape (wrong for bass music). The concrete environment
+# now comes from GENRE_VISUAL_MODIFIERS so a DnB set reads as a dark neon
+# rave -- not a tropical lagoon.
 DEFAULT_VISUAL_STYLE = (
-    "Chunky pixel art style, psychedelic nature scene, vibrant colors, "
-    "eyes everywhere watching from foliage, retro game aesthetic, "
-    "thick bold pixels, lush vegetation with hidden creatures, "
-    "trippy color palette, low-resolution rendered at high-resolution, "
-    "no text, no watermarks, no logos"
+    "Chunky pixel art style, psychedelic and vibrant, glowing neon colors, "
+    "eyes everywhere watching, retro game aesthetic, thick bold pixels, "
+    "trippy color palette, high-energy electronic music artwork, "
+    "low-resolution rendered at high-resolution, no text, no watermarks, no logos"
 )
 
 DEFAULT_COLOR_PALETTE = [
-    "#FF6B35",  # desert orange
+    "#FF6B35",  # hot orange
     "#7B2D8E",  # psychedelic purple
-    "#1B998B",  # jungle teal
-    "#F7DC6F",  # golden sand
+    "#1B998B",  # electric teal
+    "#F7DC6F",  # golden
     "#E74C3C",  # hot red
     "#2ECC71",  # neon green
-    "#3498DB",  # sky blue
+    "#3498DB",  # electric blue
     "#E91E63",  # magenta
 ]
 
 DEFAULT_MOTIFS = [
     "pixel art eyes",
-    "chunky vegetation",
     "psychedelic colors",
     "retro game aesthetic",
-    "desert landscape elements",
+    "glowing neon",
     "trippy patterns",
-    "hidden faces in nature",
+    "bold geometric shapes",
 ]
 
 GENRE_VISUAL_MODIFIERS: Dict[str, str] = {
-    "house": "warm sunset, terrace vibes, palm trees, golden hour lighting, disco ball reflections",
+    "house": "warm sunset, rooftop terrace vibes, golden hour lighting, disco ball reflections, dancing crowd",
     "techno": "dark industrial, concrete textures, strobe lights, underground bunker, smoke machines",
-    "drum and bass": "neon jungle, fast motion blur, lightning strikes, urban nightscape, graffiti walls",
+    "drum and bass": "dark neon cityscape at night, glowing subwoofers and bass bins, laser grids, fast motion blur, lightning arcs, electric blue purple and green, futuristic rave energy",
     "trance": "cosmic nebula, aurora borealis, crystal formations, ethereal glow, starfield",
-    "dubstep": "heavy bass waveforms, cracked earth, seismic energy, dark neon, bass face skull",
-    "ambient": "misty mountains, still water, bioluminescent forest, fog, gentle moonlight",
-    "breakbeat": "shattered glass, kaleidoscope, street art, broken beat visualizer, urban chaos",
+    "dubstep": "massive bass waveforms, cracked concrete, seismic shockwaves, glitch distortion, dark aggressive neon, bass-face skull",
+    "trap": "gritty urban night, purple and gold haze, heavy 808 sub-bass energy, neon signs, smoky trap house",
+    "garage": "sleek UK garage club, chrome and neon, shuffling dancefloor lights, deep blues and magenta",
+    "ambient": "misty mountains, still water, bioluminescent glow, fog, gentle moonlight",
+    "breakbeat": "shattered glass, kaleidoscope, street art, broken-beat visualizer, vivid neon, urban chaos",
+    "electronic": "glowing synthwave grid, neon geometric shapes, laser lights, futuristic club energy, vibrant electric colors",
 }
 
 
@@ -113,37 +122,120 @@ class ArtGenerator:
         session: Optional[AsyncSession] = None,
         mix_id: Optional[str] = None,
         brand_settings: Optional[BrandSettings] = None,
+        video_file_path: Optional[str] = None,
+        energy_profile: Optional[List[Dict[str, Any]]] = None,
+        duration_seconds: float = 0.0,
     ) -> str:
-        """Generate 1920x1080 YouTube thumbnail. Returns the saved file path."""
+        """Generate a 1920x1080 YouTube thumbnail. Returns the saved file path.
+
+        Strategy, in order:
+          1. PRIMARY -- AI-generated branded art from the GENRE-DRIVEN prompt
+             (fal.ai -> DALL-E). This is Will's signature look; the genre-neutral
+             base + GENRE_VISUAL_MODIFIERS make a DnB set read as a dark neon
+             rave rather than a tropical landscape.
+          2. FALLBACK -- a frame grabbed from the paired video at a peak-energy
+             timestamp, if the AI providers fail.
+          3. FALLBACK -- letterboxed cover art as a last resort.
+        Text is brand-overlaid via ``_overlay_text`` in every case.
+        """
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-        if cover_art_path and os.path.exists(cover_art_path):
-            # Extend the cover art to 16:9
-            thumbnail_url = await self._generate_wide_variant(
-                genres, vibes, brand_settings, session, mix_id,
+        # 1. Primary: AI-generated branded, genre-driven art.
+        prompt = self._build_prompt(genres, vibes, brand_settings, aspect="wide")
+        image_url = await self._generate_with_fal(
+            prompt, width=1920, height=1080, session=session, mix_id=mix_id,
+        )
+        if not image_url:
+            image_url = await self._generate_with_dalle(
+                prompt, size="1792x1024", session=session, mix_id=mix_id,
             )
-            if thumbnail_url:
-                await self._download_and_save(thumbnail_url, output_path, resize=(1920, 1080))
-            else:
-                # Fallback: letterbox the cover art
-                self._letterbox_cover(cover_art_path, output_path)
-        else:
-            # Generate fresh wide image
-            prompt = self._build_prompt(genres, vibes, brand_settings, aspect="wide")
-            image_url = await self._generate_with_fal(
-                prompt, width=1920, height=1080, session=session, mix_id=mix_id,
-            )
-            if not image_url:
-                image_url = await self._generate_with_dalle(
-                    prompt, size="1792x1024", session=session, mix_id=mix_id,
-                )
-            if not image_url:
-                raise RuntimeError("All providers failed for thumbnail generation")
+        if image_url:
             await self._download_and_save(image_url, output_path, resize=(1920, 1080))
+            self._overlay_text(output_path, mix_title, genres)
+            logger.info("YouTube thumbnail (AI art) saved to %s", output_path)
+            return output_path
 
-        # Overlay text
-        self._overlay_text(output_path, mix_title, genres)
-        logger.info("YouTube thumbnail saved to %s", output_path)
+        # 2. Fallback: frame grabbed from the paired video.
+        if video_file_path and os.path.exists(video_file_path):
+            ts = self._peak_energy_timestamp(energy_profile, duration_seconds)
+            frame = await asyncio.to_thread(
+                self._grab_video_frame, video_file_path, output_path, ts
+            )
+            if frame:
+                self._overlay_text(output_path, mix_title, genres)
+                logger.info(
+                    "YouTube thumbnail from video frame at %.0fs saved to %s (AI fallback)",
+                    ts, output_path,
+                )
+                return output_path
+
+        # 3. Fallback: letterbox the cover art.
+        if cover_art_path and os.path.exists(cover_art_path):
+            self._letterbox_cover(cover_art_path, output_path)
+            self._overlay_text(output_path, mix_title, genres)
+            logger.info("YouTube thumbnail (letterboxed cover) saved to %s", output_path)
+            return output_path
+
+        raise RuntimeError("All thumbnail generation strategies failed")
+
+    # ------------------------------------------------------------------
+    # Video-frame thumbnail helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _peak_energy_timestamp(
+        energy_profile: Optional[List[Dict[str, Any]]], duration_seconds: float
+    ) -> float:
+        """Pick a lively timestamp to grab a frame from.
+
+        Prefers the highest-RMS sampled point from the analyzer's energy curve;
+        otherwise a sensible point ~35% in (past the intro), min 90s.
+        """
+        if energy_profile:
+            try:
+                peak = max(energy_profile, key=lambda p: p.get("rms", 0) or 0)
+                ts = peak.get("timestamp_seconds")
+                if ts:
+                    return float(ts)
+            except (ValueError, TypeError):
+                pass
+        if duration_seconds and duration_seconds > 240:
+            return duration_seconds * 0.35
+        return 90.0
+
+    @staticmethod
+    def _grab_video_frame(
+        video_path: str, output_path: str, timestamp: float
+    ) -> Optional[str]:
+        """Extract a single 1920x1080 frame from the video at ``timestamp``.
+
+        Scales-to-cover and centre-crops to 16:9 so any source aspect fills the
+        thumbnail. Returns the output path on success, else ``None``.
+        """
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(max(0.0, timestamp)),
+            "-i", video_path,
+            "-frames:v", "1",
+            "-vf",
+            "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080",
+            "-q:v", "2",
+            output_path,
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.warning("ffmpeg frame grab error: %s", exc)
+            return None
+        if result.returncode != 0:
+            logger.warning("ffmpeg frame grab failed (rc=%s): %s",
+                           result.returncode, (result.stderr or "")[-300:])
+            return None
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            logger.warning("ffmpeg produced no frame at %.0fs", timestamp)
+            return None
         return output_path
 
     # ------------------------------------------------------------------
@@ -329,28 +421,6 @@ class ArtGenerator:
         except Exception as exc:
             logger.error("DALL-E generation failed: %s", exc)
             return None
-
-    # ------------------------------------------------------------------
-    # Wide variant for thumbnail
-    # ------------------------------------------------------------------
-
-    async def _generate_wide_variant(
-        self,
-        genres: List[str],
-        vibes: List[str],
-        brand_settings: Optional[BrandSettings],
-        session: Optional[AsyncSession],
-        mix_id: Optional[str],
-    ) -> Optional[str]:
-        prompt = self._build_prompt(genres, vibes, brand_settings, aspect="wide")
-        url = await self._generate_with_fal(
-            prompt, width=1920, height=1080, session=session, mix_id=mix_id,
-        )
-        if not url:
-            url = await self._generate_with_dalle(
-                prompt, size="1792x1024", session=session, mix_id=mix_id,
-            )
-        return url
 
     # ------------------------------------------------------------------
     # Image utilities

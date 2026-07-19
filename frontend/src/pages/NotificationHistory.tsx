@@ -6,12 +6,11 @@ import {
   XCircle,
   Info,
   Filter,
-  Send,
+  Activity,
 } from 'lucide-react'
-import { toast } from 'sonner'
 import clsx from 'clsx'
 import { format } from 'date-fns'
-import { useNotifications, useTestNotification } from '@/api/hooks'
+import { useNotifications } from '@/api/hooks'
 import { Link } from 'react-router-dom'
 
 const typeIcons: Record<string, { icon: React.ElementType; color: string }> = {
@@ -24,92 +23,64 @@ const typeIcons: Record<string, { icon: React.ElementType; color: string }> = {
 const typeFilters = ['all', 'success', 'error', 'warning', 'info']
 const channelFilters = ['all', 'email', 'discord', 'webhook']
 
-export default function NotificationHistory() {
+/** Embeddable notification history list (used by the History tab on /notifications). */
+export default function NotificationHistoryList() {
   const [typeFilter, setTypeFilter] = useState('all')
   const [channelFilter, setChannelFilter] = useState('all')
   const { data, isLoading } = useNotifications({
     type: typeFilter === 'all' ? undefined : typeFilter,
     channel: channelFilter === 'all' ? undefined : channelFilter,
   })
-  const testNotif = useTestNotification()
-
-  const handleTest = (channel: string) => {
-    testNotif.mutate(channel, {
-      onSuccess: () => toast.success(`Test ${channel} notification sent`),
-      onError: () => toast.error(`Failed to send test ${channel} notification`),
-    })
-  }
 
   const notifications = data?.items ?? []
 
   return (
-    <div className="space-y-8">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="font-pixel text-lg text-primary glow-text flex items-center gap-3">
-            <Bell className="w-6 h-6" /> Notifications
-          </h1>
-          <p className="text-sm text-gray-500 mt-1">
-            Pipeline events and alerts
-            {data ? ` (${data.total} total)` : ''}
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <button
-            onClick={() => handleTest('email')}
-            disabled={testNotif.isPending}
-            className="flex items-center gap-2 px-4 py-2 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-400 hover:text-primary hover:border-primary/30 disabled:opacity-50 transition-all"
-          >
-            <Send className="w-3.5 h-3.5" /> Test Email
-          </button>
-          <button
-            onClick={() => handleTest('discord')}
-            disabled={testNotif.isPending}
-            className="flex items-center gap-2 px-4 py-2 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-400 hover:text-accent hover:border-accent/30 disabled:opacity-50 transition-all"
-          >
-            <Send className="w-3.5 h-3.5" /> Test Discord
-          </button>
-        </div>
-      </div>
-
+    <div className="space-y-6">
       {/* Filters */}
-      <div className="space-y-3">
-        <div className="flex flex-wrap gap-2">
-          <Filter className="w-4 h-4 text-gray-600 mt-1.5" />
-          <span className="text-[10px] text-gray-600 font-mono uppercase mt-2 mr-1">Type:</span>
-          {typeFilters.map((t) => (
-            <button
-              key={t}
-              onClick={() => setTypeFilter(t)}
-              className={clsx(
-                'px-3 py-1.5 rounded-lg text-[11px] font-mono uppercase tracking-wider border transition-all',
-                typeFilter === t
-                  ? 'bg-primary/10 text-primary border-primary/30'
-                  : 'bg-surface-light text-gray-500 border-white/5 hover:border-primary/20 hover:text-gray-300',
-              )}
-            >
-              {t}
-            </button>
-          ))}
+      <div className="flex items-start justify-between gap-4">
+        <div className="space-y-3">
+          <div className="flex flex-wrap gap-2">
+            <Filter className="w-4 h-4 text-gray-600 mt-1.5" />
+            <span className="text-[10px] text-gray-600 font-mono uppercase mt-2 mr-1">Type:</span>
+            {typeFilters.map((t) => (
+              <button
+                key={t}
+                onClick={() => setTypeFilter(t)}
+                className={clsx(
+                  'px-3 py-1.5 rounded-lg text-[11px] font-mono uppercase tracking-wider border transition-all',
+                  typeFilter === t
+                    ? 'bg-primary/10 text-primary border-primary/30'
+                    : 'bg-surface-light text-gray-500 border-white/5 hover:border-primary/20 hover:text-gray-300',
+                )}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-2 pl-6">
+            <span className="text-[10px] text-gray-600 font-mono uppercase mt-2 mr-1">Channel:</span>
+            {channelFilters.map((c) => (
+              <button
+                key={c}
+                onClick={() => setChannelFilter(c)}
+                className={clsx(
+                  'px-3 py-1.5 rounded-lg text-[11px] font-mono uppercase tracking-wider border transition-all',
+                  channelFilter === c
+                    ? 'bg-accent/10 text-accent border-accent/30'
+                    : 'bg-surface-light text-gray-500 border-white/5 hover:border-accent/20 hover:text-gray-300',
+                )}
+              >
+                {c}
+              </button>
+            ))}
+          </div>
         </div>
-        <div className="flex flex-wrap gap-2 pl-6">
-          <span className="text-[10px] text-gray-600 font-mono uppercase mt-2 mr-1">Channel:</span>
-          {channelFilters.map((c) => (
-            <button
-              key={c}
-              onClick={() => setChannelFilter(c)}
-              className={clsx(
-                'px-3 py-1.5 rounded-lg text-[11px] font-mono uppercase tracking-wider border transition-all',
-                channelFilter === c
-                  ? 'bg-accent/10 text-accent border-accent/30'
-                  : 'bg-surface-light text-gray-500 border-white/5 hover:border-accent/20 hover:text-gray-300',
-              )}
-            >
-              {c}
-            </button>
-          ))}
-        </div>
+        <Link
+          to="/activity?q=notification"
+          className="flex items-center gap-1.5 px-3 py-1.5 shrink-0 bg-surface-light border border-primary/10 rounded-lg text-[11px] font-mono text-gray-400 hover:text-primary hover:border-primary/30 transition-all"
+        >
+          <Activity className="w-3.5 h-3.5" /> Delivery activity
+        </Link>
       </div>
 
       {/* Notification List */}
@@ -133,10 +104,7 @@ export default function NotificationHistory() {
               return (
                 <div
                   key={notif.id}
-                  className={clsx(
-                    'flex items-start gap-4 px-6 py-4 transition-colors',
-                    notif.sent ? 'opacity-60' : 'hover:bg-white/[0.02]',
-                  )}
+                  className="flex items-start gap-4 px-6 py-4 transition-colors hover:bg-white/[0.02]"
                 >
                   {/* Icon */}
                   <div className={clsx('mt-0.5 shrink-0', color)}>
@@ -155,9 +123,13 @@ export default function NotificationHistory() {
                           <span className="text-[10px] text-gray-600 font-mono px-1.5 py-0.5 bg-dark rounded">
                             {notif.type}
                           </span>
-                          {notif.sent && (
+                          {notif.sent ? (
                             <span className="flex items-center gap-1 text-[10px] text-primary font-mono">
                               <CheckCircle2 className="w-3 h-3" /> sent
+                            </span>
+                          ) : (
+                            <span className="flex items-center gap-1 text-[10px] text-cyber-red font-mono">
+                              <XCircle className="w-3 h-3" /> not sent
                             </span>
                           )}
                         </div>
