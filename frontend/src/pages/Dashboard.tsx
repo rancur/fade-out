@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import {
   Music2,
@@ -10,8 +11,11 @@ import {
   Activity,
   Pause,
 } from 'lucide-react'
+import { toast } from 'sonner'
 import { useMixes, usePipelineStatus, useAIBudget } from '@/api/hooks'
+import { wsManager, type WsMessage } from '@/api/ws'
 import StatusBadge from '@/components/StatusBadge'
+import RecentActivityCard from '@/components/RecentActivityCard'
 import clsx from 'clsx'
 
 function StatCard({
@@ -53,6 +57,24 @@ export default function Dashboard() {
   const { data: mixesData } = useMixes({ page_size: 5 })
   const { data: pipeline } = usePipelineStatus()
   const { data: budget } = useAIBudget()
+
+  // Surface live pipeline errors as toasts, deduped by mix+step
+  const seenErrors = useRef(new Set<string>())
+  useEffect(() => {
+    return wsManager.subscribe('error', (msg: WsMessage) => {
+      const step = typeof msg.data?.step === 'string' ? msg.data.step : ''
+      const key = `${msg.mix_id ?? ''}:${step}`
+      if (seenErrors.current.has(key)) return
+      seenErrors.current.add(key)
+      const detail =
+        typeof msg.data?.error === 'string'
+          ? msg.data.error
+          : typeof msg.data?.message === 'string'
+            ? msg.data.message
+            : 'Pipeline error'
+      toast.error(step ? `${step}: ${detail}` : detail)
+    })
+  }, [])
 
   const mixes = mixesData?.items ?? []
   const total = mixesData?.total ?? 0
@@ -209,6 +231,9 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      {/* Recent Activity */}
+      <RecentActivityCard />
 
       {/* Quick Actions */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">

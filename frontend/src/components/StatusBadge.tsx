@@ -10,7 +10,11 @@ const statusConfig: Record<string, { label: string; color: string; glow: string 
   verifying: { label: 'Verifying', color: 'text-gold border-gold', glow: '' },
   draft_review: { label: 'Draft Review', color: 'text-gold border-gold', glow: '' },
   completed: { label: 'Completed', color: 'text-cyber-lime border-cyber-lime', glow: '' },
+  complete: { label: 'Completed', color: 'text-cyber-lime border-cyber-lime', glow: '' },
   failed: { label: 'Failed', color: 'text-cyber-red border-cyber-red', glow: 'shadow-neon-red' },
+  skipped: { label: 'Skipped', color: 'text-gray-500 border-gray-600', glow: '' },
+  waiting: { label: 'Waiting', color: 'text-gold border-gold', glow: '' },
+  interrupted: { label: 'Interrupted', color: 'text-gold border-gold border-dashed', glow: '' },
 }
 
 const animatedStatuses = new Set(['running', 'analyzing', 'generating', 'uploading_soundcloud', 'uploading_youtube'])

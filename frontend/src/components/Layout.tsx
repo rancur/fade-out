@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import clsx from 'clsx'
-import ActivityPanel from './ActivityPanel'
+import { useLiveEvents, useWsConnected } from '../api/hooks'
 import {
   LayoutDashboard,
   Music2,
@@ -9,6 +9,7 @@ import {
   Settings,
   Brain,
   Bell,
+  Activity,
   ArrowUpCircle,
   ChevronLeft,
   ChevronRight,
@@ -18,6 +19,7 @@ import {
 const nav = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/mixes', icon: Music2, label: 'Mixes' },
+  { to: '/activity', icon: Activity, label: 'Activity' },
   { to: '/brand', icon: Palette, label: 'Brand' },
   { to: '/settings', icon: Settings, label: 'Settings' },
   { to: '/ai', icon: Brain, label: 'AI Usage' },
@@ -25,8 +27,35 @@ const nav = [
   { to: '/upgrade', icon: ArrowUpCircle, label: 'Upgrade' },
 ]
 
+function LiveDot({ collapsed }: { collapsed: boolean }) {
+  const connected = useWsConnected()
+  return (
+    <div
+      className="flex items-center gap-2 px-4 py-2 border-t border-primary/10"
+      title={connected ? 'Live updates connected' : 'Live updates degraded — polling'}
+    >
+      <span
+        className={clsx(
+          'w-2 h-2 rounded-full shrink-0',
+          connected
+            ? 'bg-cyber-lime shadow-[0_0_6px_theme(colors.cyber.lime)]'
+            : 'bg-gold shadow-[0_0_6px_theme(colors.gold)] animate-pulse',
+        )}
+      />
+      {!collapsed && (
+        <span className={clsx('text-[10px] font-mono', connected ? 'text-gray-500' : 'text-gold')}>
+          {connected ? 'live' : 'polling'}
+        </span>
+      )}
+    </div>
+  )
+}
+
 export default function Layout({ children }: { children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(false)
+
+  // Bridge WebSocket events into react-query caches app-wide
+  useLiveEvents()
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -77,6 +106,9 @@ export default function Layout({ children }: { children: React.ReactNode }) {
           ))}
         </nav>
 
+        {/* Live connection indicator */}
+        <LiveDot collapsed={collapsed} />
+
         {/* Collapse toggle */}
         <button
           onClick={() => setCollapsed(!collapsed)}
@@ -97,9 +129,6 @@ export default function Layout({ children }: { children: React.ReactNode }) {
       <main className="flex-1 overflow-y-auto cyber-grid">
         <div className="p-6 max-w-7xl mx-auto animate-fade-in">{children}</div>
       </main>
-
-      {/* Live activity log sidebar */}
-      <ActivityPanel />
     </div>
   )
 }
