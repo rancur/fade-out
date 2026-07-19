@@ -65,8 +65,12 @@ class TestIngestCoordinator:
         assert orch.started == ["mix-set"]
         assert coord._last == ("set", str(afile), str(vfile))
 
-    async def test_audio_only_starts_with_no_video(self, watch_dirs):
+    async def test_audio_only_waits_then_runs_on_expiry(self, watch_dirs, monkeypatch):
+        # Out-of-order contract: a lone audio drop does NOT run immediately; it
+        # waits in PENDING for a video sibling and only runs audio-only once the
+        # pairing window expires (never "half", never silently dropped).
         audio, _ = watch_dirs
+        monkeypatch.setattr("app.services.ingest.settings.PAIRING_WAIT_SECONDS", 0)
         orch = _FakeOrchestrator()
         coord = IngestCoordinator(orch)
         await _fake_create_and_start(coord, orch)
@@ -74,6 +78,8 @@ class TestIngestCoordinator:
         afile = audio / "solo.flac"
         afile.write_bytes(b"a")
         await coord.ingest_audio(str(afile))
+        assert orch.started == []  # pending, waiting for video
 
+        await coord._sweep_once()  # window expired -> proceed audio-only
         assert orch.started == ["mix-solo"]
         assert coord._last == ("solo", str(afile), None)

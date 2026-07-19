@@ -81,13 +81,52 @@ class PipelineOrchestrator:
     # ------------------------------------------------------------------
 
     async def _emit(self, event_type: str, mix_id: str, data: Optional[dict] = None) -> None:
+        data = data or {}
+        await self._activity_from_event(event_type, mix_id, data)
         for listener in self._event_listeners:
             try:
-                result = listener(event_type, mix_id, data or {})
+                result = listener(event_type, mix_id, data)
                 if asyncio.iscoroutine(result):
                     await result
             except Exception:
                 logger.exception("Event listener error for %s", event_type)
+
+    async def _activity_from_event(
+        self, event_type: str, mix_id: str, data: dict
+    ) -> None:
+        """Mirror an orchestrator event into the persistent activity log."""
+        try:
+            from app.services import activity_log
+
+            stage = data.get("step")
+            if event_type == "pipeline_started":
+                await activity_log.info("pipeline_started", "Pipeline started", mix_id=mix_id)
+            elif event_type == "step_completed":
+                elapsed = data.get("elapsed_seconds")
+                msg = f"Step {stage} completed"
+                if elapsed is not None:
+                    msg += f" in {elapsed:.1f}s"
+                await activity_log.info("step_completed", msg, mix_id=mix_id, stage=stage)
+            elif event_type == "draft_ready":
+                await activity_log.info(
+                    "draft_paused",
+                    "DRAFT_MODE: pipeline paused for review before any upload",
+                    mix_id=mix_id,
+                )
+            elif event_type == "upload_complete":
+                await activity_log.info(
+                    "upload_complete", "Pipeline completed — all uploads done", mix_id=mix_id
+                )
+            elif event_type == "error":
+                await activity_log.error(
+                    "pipeline_error",
+                    f"Pipeline error at step {stage}: {data.get('error', 'failed')}",
+                    mix_id=mix_id,
+                    stage=stage,
+                    context={"retryable": True, **{k: v for k, v in data.items() if k != "step"}},
+                )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("activity mirror failed for %s", event_type, exc_info=True)
 
     # ------------------------------------------------------------------
     # Pause / Resume
@@ -246,6 +285,19 @@ class PipelineOrchestrator:
                 "Executing step %s for mix %s (attempt %d/%d)",
                 step_name, mix_id, attempt, MAX_RETRIES,
             )
+            try:
+                from app.services import activity_log
+
+                await activity_log.info(
+                    "step_started",
+                    f"Step {step_name} started"
+                    + (f" (retry {attempt}/{MAX_RETRIES})" if attempt > 1 else ""),
+                    mix_id=mix_id,
+                    stage=step_name,
+                    context={"attempt": attempt},
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
             started_at = datetime.now(timezone.utc)
             await self._set_mix_status(mix_id, "running", step_name)
 
@@ -291,6 +343,19 @@ class PipelineOrchestrator:
                 if attempt < MAX_RETRIES:
                     backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
                     logger.info("Retrying step %s in %ds", step_name, backoff)
+                    try:
+                        from app.services import activity_log
+
+                        await activity_log.warn(
+                            "step_retry",
+                            f"Step {step_name} failed (attempt {attempt}/{MAX_RETRIES}): "
+                            f"{exc}. Retrying in {backoff}s.",
+                            mix_id=mix_id,
+                            stage=step_name,
+                            context={"attempt": attempt, "backoff_seconds": backoff},
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        pass
                     await asyncio.sleep(backoff)
                 else:
                     await self._record_step(

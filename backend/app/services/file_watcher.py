@@ -16,9 +16,21 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-AUDIO_EXTENSIONS = {".flac"}
+AUDIO_EXTENSIONS = {".flac", ".wav"}
 VIDEO_EXTENSIONS = {".mkv"}
 HASH_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB for dedup hash
+
+
+async def _safe_activity(level: str, event: str, message: str, **kwargs) -> None:
+    """Emit an activity-log entry without ever letting a logging failure break
+    the watcher. Imported lazily to keep this low-level module dependency-light.
+    """
+    try:
+        from app.services import activity_log
+
+        await activity_log.log(level, event, message, **kwargs)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("activity emit failed for %s", event, exc_info=True)
 
 
 STATUS_PROCESSING = "processing"
@@ -128,12 +140,20 @@ def _compute_file_hash(path: str) -> str:
 
 
 class _StabilityTracker:
-    """Tracks file sizes and detects when a file has stopped growing."""
+    """Tracks file sizes and detects when a file has stopped growing.
 
-    def __init__(self, stable_seconds: int) -> None:
+    Stability requires BOTH a quiet period (size unchanged for
+    ``stable_seconds``) AND a minimum number of consecutive same-size
+    observations (``confirmations``). The confirmation count guards against a
+    slow SMB copy that briefly pauses mid-write being mistaken for a finished
+    file. ``last_size`` is retained so callers can enforce a minimum-size floor.
+    """
+
+    def __init__(self, stable_seconds: int, confirmations: int = 2) -> None:
         self._stable_seconds = stable_seconds
-        # path -> (last_size, last_change_time)
-        self._files: Dict[str, tuple[int, float]] = {}
+        self._confirmations = max(1, confirmations)
+        # path -> (last_size, last_change_time, stable_observations)
+        self._files: Dict[str, tuple[int, float, int]] = {}
 
     def update(self, path: str) -> None:
         """Record current file size."""
@@ -143,16 +163,26 @@ class _StabilityTracker:
             return
         prev = self._files.get(path)
         if prev is None or prev[0] != size:
-            self._files[path] = (size, time.time())
-        # else size unchanged, keep existing timestamp
+            # New or grew/shrank: reset the timer and the confirmation counter.
+            self._files[path] = (size, time.time(), 1)
+        else:
+            # Size held steady: bump the consecutive-observation counter.
+            self._files[path] = (prev[0], prev[1], prev[2] + 1)
+
+    def size(self, path: str) -> Optional[int]:
+        entry = self._files.get(path)
+        return entry[0] if entry else None
 
     def is_stable(self, path: str) -> bool:
-        """Return True if file size has not changed for stable_seconds."""
+        """True once size has held for stable_seconds AND enough confirmations."""
         entry = self._files.get(path)
         if entry is None:
             return False
-        _, last_change = entry
-        return (time.time() - last_change) >= self._stable_seconds
+        _, last_change, observations = entry
+        return (
+            (time.time() - last_change) >= self._stable_seconds
+            and observations >= self._confirmations
+        )
 
     def remove(self, path: str) -> None:
         self._files.pop(path, None)
@@ -213,8 +243,12 @@ class FileWatcherService:
         self._on_audio = on_audio_file
         self._on_video = on_video_file
         self._observer: Optional[Observer] = None
-        self._audio_tracker = _StabilityTracker(self._stable_seconds)
-        self._video_tracker = _StabilityTracker(self._stable_seconds)
+        self._audio_tracker = _StabilityTracker(
+            self._stable_seconds, settings.STABILITY_CONFIRMATIONS
+        )
+        self._video_tracker = _StabilityTracker(
+            self._stable_seconds, settings.STABILITY_CONFIRMATIONS
+        )
         self._seen_db = _SeenFilesDB()
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
@@ -300,6 +334,27 @@ class FileWatcherService:
             if not tracker.is_stable(path):
                 continue
 
+            # Partial-file / stray-file safety: the file has stopped growing,
+            # but reject anything under the minimum-size floor outright. This
+            # kills the 0-byte / stray-file class (a real set is always well
+            # over a megabyte) so a half-written or junk drop is never ingested.
+            size = tracker.size(path)
+            if size is not None and size < settings.MIN_FILE_SIZE_BYTES:
+                logger.warning(
+                    "Skipping undersized %s file (%d bytes < %d floor): %s",
+                    file_type, size, settings.MIN_FILE_SIZE_BYTES, path,
+                )
+                await _safe_activity(
+                    "warn",
+                    "file_skipped",
+                    f"Skipped undersized {file_type} file "
+                    f"({size} bytes < {settings.MIN_FILE_SIZE_BYTES}): {os.path.basename(path)}",
+                    filename=os.path.basename(path),
+                    context={"size_bytes": size, "reason": "undersized"},
+                )
+                tracker.remove(path)
+                continue
+
             # File is stable -- check dedup
             try:
                 file_hash = await asyncio.to_thread(_compute_file_hash, path)
@@ -310,8 +365,23 @@ class FileWatcherService:
 
             if self._seen_db.is_done(file_hash):
                 logger.info("Skipping already-processed file: %s (hash=%s)", path, file_hash)
+                await _safe_activity(
+                    "info",
+                    "file_skipped",
+                    f"Skipped already-processed {file_type} file: {os.path.basename(path)}",
+                    filename=os.path.basename(path),
+                    context={"reason": "duplicate"},
+                )
                 tracker.remove(path)
                 continue
+
+            await _safe_activity(
+                "info",
+                "file_detected",
+                f"Stable new {file_type} file detected: {os.path.basename(path)}",
+                filename=os.path.basename(path),
+                context={"file_type": file_type, "size_bytes": size},
+            )
 
             # Durably mark 'processing' BEFORE the callback and drop it from the
             # stability tracker so it is dispatched exactly once. If we crash

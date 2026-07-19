@@ -321,6 +321,39 @@ export function useUpdateNotificationSettings() {
   })
 }
 
+// ---------- Activity log ----------
+
+export interface ActivityItem {
+  id: number
+  ts: string
+  level: 'info' | 'warn' | 'error'
+  event: string | null
+  message: string | null
+  mix_id: string | null
+  filename: string | null
+  platform: string | null
+  stage: string | null
+  context: Record<string, unknown> | null
+}
+
+export interface ActivityResponse {
+  items: ActivityItem[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export function useActivity(params?: { level?: string; mix_id?: string; limit?: number }) {
+  return useQuery({
+    queryKey: ['activity', params],
+    queryFn: () =>
+      client
+        .get<ActivityResponse>('/activity', { params: { limit: 100, ...params } })
+        .then((r) => r.data),
+    refetchInterval: 4000, // live-ish poll; SSE/WS not required
+  })
+}
+
 // ---------- Upgrade ----------
 
 export function useUpgradeStatus() {

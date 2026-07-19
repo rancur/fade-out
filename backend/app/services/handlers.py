@@ -27,6 +27,16 @@ async def _get_mix(mix_id: str, session: AsyncSession) -> Mix:
     return mix
 
 
+async def _emit_activity(level: str, event: str, message: str, **kwargs) -> None:
+    """Best-effort activity-log emit — never breaks a pipeline step."""
+    try:
+        from app.services import activity_log
+
+        await activity_log.log(level, event, message, **kwargs)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("activity emit failed for %s", event, exc_info=True)
+
+
 async def _get_brand_settings(session: AsyncSession) -> Optional[BrandSettings]:
     """Load brand settings (row id=1) if they exist."""
     return await session.get(BrandSettings, 1)
@@ -403,6 +413,18 @@ async def handle_upload_soundcloud(
     """Upload the mix to SoundCloud."""
     mix = await _get_mix(mix_id, session)
 
+    # Idempotency: never double-upload. If this mix already has a SoundCloud URL
+    # (e.g. this is a retry/re-run after a later step failed), skip re-uploading
+    # and reuse the existing track.
+    if mix.soundcloud_url:
+        logger.info("SoundCloud already uploaded for mix %s (%s); skipping.", mix_id, mix.soundcloud_url)
+        await _emit_activity(
+            "info", "upload_skipped",
+            f"SoundCloud upload skipped — already uploaded: {mix.soundcloud_url}",
+            mix_id=mix_id, platform="soundcloud",
+        )
+        return {"skipped": True, "reason": "already uploaded", "soundcloud_url": mix.soundcloud_url}
+
     # Check for an access token in AppSettings or env config
     app_settings = await _get_app_settings(session)
     has_token = bool(settings.SOUNDCLOUD_ACCESS_TOKEN)
@@ -436,6 +458,10 @@ async def handle_upload_soundcloud(
 
     sj_sc = (app_settings.settings_json or {}) if app_settings else {}
     uploader = SoundCloudUploader(db_settings_json=sj_sc)
+    await _emit_activity(
+        "info", "upload_attempt", f"Uploading to SoundCloud: {mix.title}",
+        mix_id=mix_id, platform="soundcloud",
+    )
     permalink = await uploader.upload(
         audio_path=mix.audio_file_path,
         title=mix.title,
@@ -446,6 +472,10 @@ async def handle_upload_soundcloud(
     )
 
     mix.soundcloud_url = permalink
+    await _emit_activity(
+        "info", "upload_result", f"SoundCloud upload succeeded: {permalink}",
+        mix_id=mix_id, platform="soundcloud", context={"url": permalink},
+    )
     return {"soundcloud_url": permalink}
 
 
@@ -488,6 +518,18 @@ async def handle_upload_youtube(
     """Upload the video to YouTube."""
     mix = await _get_mix(mix_id, session)
 
+    # Idempotency: never double-upload. If a YouTube URL/video id is already
+    # recorded for this mix, reuse it instead of uploading the video again.
+    if mix.youtube_url:
+        existing_id = extract_youtube_video_id(mix.youtube_url)
+        logger.info("YouTube already uploaded for mix %s (%s); skipping.", mix_id, mix.youtube_url)
+        await _emit_activity(
+            "info", "upload_skipped",
+            f"YouTube upload skipped — already uploaded: {mix.youtube_url}",
+            mix_id=mix_id, platform="youtube",
+        )
+        return {"skipped": True, "reason": "already uploaded", "youtube_url": mix.youtube_url, "video_id": existing_id}
+
     # Check for refresh token
     app_settings = await _get_app_settings(session)
     has_token = bool(settings.YOUTUBE_REFRESH_TOKEN)
@@ -520,6 +562,11 @@ async def handle_upload_youtube(
 
     sj_yt = (app_settings.settings_json or {}) if app_settings else {}
     uploader = YouTubeUploader(db_settings_json=sj_yt)
+    await _emit_activity(
+        "info", "upload_attempt",
+        f"Uploading to YouTube ({premiere_mode}): {mix.title_youtube or mix.title}",
+        mix_id=mix_id, platform="youtube", context={"premiere_mode": premiere_mode},
+    )
     result = await uploader.upload(
         video_path=mix.video_file_path,
         title=mix.title_youtube or mix.title,
@@ -534,6 +581,11 @@ async def handle_upload_youtube(
     if result.get("playlist_id"):
         mix.youtube_playlist_id = result["playlist_id"]
 
+    await _emit_activity(
+        "info", "upload_result", f"YouTube upload succeeded: {result['video_url']}",
+        mix_id=mix_id, platform="youtube",
+        context={"url": result["video_url"], "video_id": result.get("video_id")},
+    )
     return {
         "youtube_url": result["video_url"],
         "video_id": result["video_id"],
@@ -587,6 +639,16 @@ async def handle_upload_mixcloud(
 ) -> Optional[dict]:
     """Upload the mix to Mixcloud (gated behind MIXCLOUD_ENABLED, default OFF)."""
     mix = await _get_mix(mix_id, session)
+
+    # Idempotency: never double-upload.
+    if mix.mixcloud_url:
+        logger.info("Mixcloud already uploaded for mix %s (%s); skipping.", mix_id, mix.mixcloud_url)
+        await _emit_activity(
+            "info", "upload_skipped",
+            f"Mixcloud upload skipped — already uploaded: {mix.mixcloud_url}",
+            mix_id=mix_id, platform="mixcloud",
+        )
+        return {"skipped": True, "reason": "already uploaded", "mixcloud_url": mix.mixcloud_url}
 
     app_settings = await _get_app_settings(session)
     sj = (app_settings.settings_json or {}) if app_settings else {}

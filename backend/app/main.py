@@ -3,6 +3,7 @@
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,10 +13,24 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import init_db
 from app.logging_config import configure_logging
-from app.routers import ai_usage, auth, brand, mixes, notifications, pipeline, settings as settings_router, upgrade, ws
+from app.routers import (
+    activity,
+    ai_usage,
+    auth,
+    brand,
+    mixes,
+    notifications,
+    pipeline,
+    settings as settings_router,
+    system,
+    upgrade,
+    ws,
+)
+from app.services import activity_log
 from app.services.file_watcher import FileWatcherService
 from app.services.handlers import register_all_handlers
 from app.services.ingest import IngestCoordinator
+from app.services.notification_service import NotificationService
 from app.services.pipeline import PipelineOrchestrator
 
 logger = logging.getLogger("fadeout")
@@ -44,10 +59,35 @@ async def lifespan(app: FastAPI):
     # Stream live pipeline events to any connected WebSocket clients.
     orchestrator.on_event(ws.manager.broadcast_event)
 
+    # Fan out every activity-log entry to connected WebSocket clients too, so
+    # the UI sidebar updates live in addition to its polling fallback.
+    def _broadcast_activity(payload: dict) -> Any:
+        return ws.manager.broadcast({"event": "activity", "data": payload})
+
+    activity_log.add_listener(_broadcast_activity)
+
+    # Deliver a done/failed notification when a mix finishes or fails. The
+    # NotificationService (Discord/email/webhook) already exists; wiring it to
+    # the orchestrator's terminal events closes the "no summary on finish/fail"
+    # gap. Draft-mode/rate-limits keep it from being noisy.
+    notifier = NotificationService()
+    await notifier.start()
+
+    async def _notify_from_event(event_type: str, mix_id: Optional[str], data: dict) -> None:
+        if event_type == "upload_complete":
+            await notifier.notify("upload_complete", mix_id=mix_id, message="Mix finished: all uploads complete.", data=data)
+        elif event_type == "error":
+            await notifier.notify("error", mix_id=mix_id, message=f"Mix failed at step {data.get('step')}.", data=data)
+        elif event_type == "draft_ready":
+            await notifier.notify("draft_ready", mix_id=mix_id, message="Mix is ready for draft review.", data=data)
+
+    orchestrator.on_event(_notify_from_event)
+
     # Start the file watcher so dropped audio/video files auto-ingest into the
     # pipeline. Without this the watcher service is never instantiated and
     # nothing is ever picked up from the watch folders.
     coordinator = IngestCoordinator(orchestrator)
+    coordinator.start()  # background pairing / expiry sweeper for out-of-order drops
     file_watcher = FileWatcherService(
         on_audio_file=coordinator.ingest_audio,
         on_video_file=coordinator.ingest_video,
@@ -58,11 +98,14 @@ async def lifespan(app: FastAPI):
         settings.WATCH_AUDIO_PATH,
         settings.WATCH_VIDEO_PATH,
     )
+    await activity_log.info("service_started", "fade-out started; watching for drops.")
 
     logger.info("Fade-Out is running.")
     yield
     logger.info("Fade-Out shutting down.")
     await file_watcher.stop()
+    await coordinator.stop()
+    await notifier.stop()
 
 
 app = FastAPI(
@@ -85,6 +128,8 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(mixes.router)
 app.include_router(pipeline.router)
+app.include_router(activity.router)
+app.include_router(system.router)
 app.include_router(settings_router.router)
 app.include_router(brand.router)
 app.include_router(ai_usage.router)
