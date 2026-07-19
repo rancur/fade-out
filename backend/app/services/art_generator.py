@@ -1,7 +1,9 @@
 """Image generation service for SoundCloud cover art and YouTube thumbnails."""
 
+import asyncio
 import logging
 import os
+import subprocess
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +48,18 @@ DEFAULT_MOTIFS = [
     "trippy patterns",
     "hidden faces in nature",
 ]
+
+# AI fallback for the YouTube thumbnail when no paired video frame is available.
+# Retires the psychedelic-nature-landscape default: a mislabelled genre used to
+# turn the thumbnail into a literal palm-tree/aurora scene. This puts a DJ behind
+# the decks front-and-centre instead.
+DJ_THUMBNAIL_STYLE = (
+    "Cinematic wide photograph of a DJ performing behind the decks at a packed "
+    "nightclub, hands on the mixer and CDJs, dramatic stage lighting, lasers and "
+    "atmospheric haze, crowd silhouettes with raised hands in the background, "
+    "energetic nightlife atmosphere, shallow depth of field, sharp high detail, "
+    "no text, no watermarks, no logos"
+)
 
 GENRE_VISUAL_MODIFIERS: Dict[str, str] = {
     "house": "warm sunset, terrace vibes, palm trees, golden hour lighting, disco ball reflections",
@@ -113,38 +127,139 @@ class ArtGenerator:
         session: Optional[AsyncSession] = None,
         mix_id: Optional[str] = None,
         brand_settings: Optional[BrandSettings] = None,
+        video_file_path: Optional[str] = None,
+        energy_profile: Optional[List[Dict[str, Any]]] = None,
+        duration_seconds: float = 0.0,
     ) -> str:
-        """Generate 1920x1080 YouTube thumbnail. Returns the saved file path."""
+        """Generate a 1920x1080 YouTube thumbnail. Returns the saved file path.
+
+        Strategy, in order:
+          1. PRIMARY -- grab a real frame from the paired video at a peak-energy
+             timestamp, then brand-overlay it. A photo of the actual set beats
+             any generated art.
+          2. AI DJ-at-the-decks image (fal.ai -> DALL-E) when there is no video.
+          3. Letterboxed cover art as a last resort.
+        """
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-        if cover_art_path and os.path.exists(cover_art_path):
-            # Extend the cover art to 16:9
-            thumbnail_url = await self._generate_wide_variant(
-                genres, vibes, brand_settings, session, mix_id,
+        # 1. Primary: branded frame grabbed from the paired video.
+        if video_file_path and os.path.exists(video_file_path):
+            ts = self._peak_energy_timestamp(energy_profile, duration_seconds)
+            frame = await asyncio.to_thread(
+                self._grab_video_frame, video_file_path, output_path, ts
             )
-            if thumbnail_url:
-                await self._download_and_save(thumbnail_url, output_path, resize=(1920, 1080))
-            else:
-                # Fallback: letterbox the cover art
-                self._letterbox_cover(cover_art_path, output_path)
-        else:
-            # Generate fresh wide image
-            prompt = self._build_prompt(genres, vibes, brand_settings, aspect="wide")
-            image_url = await self._generate_with_fal(
-                prompt, width=1920, height=1080, session=session, mix_id=mix_id,
-            )
-            if not image_url:
-                image_url = await self._generate_with_dalle(
-                    prompt, size="1792x1024", session=session, mix_id=mix_id,
+            if frame:
+                self._overlay_text(output_path, mix_title, genres)
+                logger.info(
+                    "YouTube thumbnail from video frame at %.0fs saved to %s",
+                    ts, output_path,
                 )
-            if not image_url:
-                raise RuntimeError("All providers failed for thumbnail generation")
-            await self._download_and_save(image_url, output_path, resize=(1920, 1080))
+                return output_path
+            logger.warning(
+                "Video frame grab failed for %s, falling back to AI thumbnail",
+                video_file_path,
+            )
 
-        # Overlay text
-        self._overlay_text(output_path, mix_title, genres)
-        logger.info("YouTube thumbnail saved to %s", output_path)
+        # 2. AI DJ-at-the-decks image.
+        prompt = self._build_dj_thumbnail_prompt(genres, vibes, brand_settings)
+        image_url = await self._generate_with_fal(
+            prompt, width=1920, height=1080, session=session, mix_id=mix_id,
+        )
+        if not image_url:
+            image_url = await self._generate_with_dalle(
+                prompt, size="1792x1024", session=session, mix_id=mix_id,
+            )
+        if image_url:
+            await self._download_and_save(image_url, output_path, resize=(1920, 1080))
+            self._overlay_text(output_path, mix_title, genres)
+            logger.info("YouTube thumbnail (AI DJ scene) saved to %s", output_path)
+            return output_path
+
+        # 3. Letterbox the cover art.
+        if cover_art_path and os.path.exists(cover_art_path):
+            self._letterbox_cover(cover_art_path, output_path)
+            self._overlay_text(output_path, mix_title, genres)
+            logger.info("YouTube thumbnail (letterboxed cover) saved to %s", output_path)
+            return output_path
+
+        raise RuntimeError("All thumbnail generation strategies failed")
+
+    # ------------------------------------------------------------------
+    # Video-frame thumbnail helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _peak_energy_timestamp(
+        energy_profile: Optional[List[Dict[str, Any]]], duration_seconds: float
+    ) -> float:
+        """Pick a lively timestamp to grab a frame from.
+
+        Prefers the highest-RMS sampled point from the analyzer's energy curve;
+        otherwise a sensible point ~35% in (past the intro), min 90s.
+        """
+        if energy_profile:
+            try:
+                peak = max(energy_profile, key=lambda p: p.get("rms", 0) or 0)
+                ts = peak.get("timestamp_seconds")
+                if ts:
+                    return float(ts)
+            except (ValueError, TypeError):
+                pass
+        if duration_seconds and duration_seconds > 240:
+            return duration_seconds * 0.35
+        return 90.0
+
+    @staticmethod
+    def _grab_video_frame(
+        video_path: str, output_path: str, timestamp: float
+    ) -> Optional[str]:
+        """Extract a single 1920x1080 frame from the video at ``timestamp``.
+
+        Scales-to-cover and centre-crops to 16:9 so any source aspect fills the
+        thumbnail. Returns the output path on success, else ``None``.
+        """
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(max(0.0, timestamp)),
+            "-i", video_path,
+            "-frames:v", "1",
+            "-vf",
+            "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080",
+            "-q:v", "2",
+            output_path,
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.warning("ffmpeg frame grab error: %s", exc)
+            return None
+        if result.returncode != 0:
+            logger.warning("ffmpeg frame grab failed (rc=%s): %s",
+                           result.returncode, (result.stderr or "")[-300:])
+            return None
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            logger.warning("ffmpeg produced no frame at %.0fs", timestamp)
+            return None
         return output_path
+
+    def _build_dj_thumbnail_prompt(
+        self,
+        genres: List[str],
+        vibes: List[str],
+        brand_settings: Optional[BrandSettings],
+    ) -> str:
+        """DJ-at-the-decks prompt for the AI thumbnail fallback."""
+        style = DJ_THUMBNAIL_STYLE
+        if brand_settings and getattr(brand_settings, "thumbnail_style", None):
+            style = brand_settings.thumbnail_style
+        genre_str = ", ".join(genres[:3]) if genres else "electronic"
+        parts = [style, f"{genre_str} DJ set"]
+        if vibes:
+            parts.append(f"mood: {', '.join(vibes[:3])}")
+        parts.append("wide cinematic composition, 16:9 aspect ratio")
+        return ", ".join(parts)
 
     # ------------------------------------------------------------------
     # Prompt construction
@@ -329,28 +444,6 @@ class ArtGenerator:
         except Exception as exc:
             logger.error("DALL-E generation failed: %s", exc)
             return None
-
-    # ------------------------------------------------------------------
-    # Wide variant for thumbnail
-    # ------------------------------------------------------------------
-
-    async def _generate_wide_variant(
-        self,
-        genres: List[str],
-        vibes: List[str],
-        brand_settings: Optional[BrandSettings],
-        session: Optional[AsyncSession],
-        mix_id: Optional[str],
-    ) -> Optional[str]:
-        prompt = self._build_prompt(genres, vibes, brand_settings, aspect="wide")
-        url = await self._generate_with_fal(
-            prompt, width=1920, height=1080, session=session, mix_id=mix_id,
-        )
-        if not url:
-            url = await self._generate_with_dalle(
-                prompt, size="1792x1024", session=session, mix_id=mix_id,
-            )
-        return url
 
     # ------------------------------------------------------------------
     # Image utilities

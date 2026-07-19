@@ -178,6 +178,8 @@ Generate a YouTube title for a DJ mix upload.
 
 RULES:
 - Format: "{brand_name} | [Genre descriptor] [Mix Type] | [Vibe/Hook]"
+- LEAD the genre descriptor with the PRIMARY genre (the first one listed) --
+  it is the dominant genre of the set and must drive the title and discovery
 - Under 60 characters when possible
 - Artist name first, genre keywords for discovery
 - No dates in title
@@ -185,6 +187,7 @@ RULES:
 - Make it SEO-friendly: include genre keywords people actually search for
 
 MIX DATA:
+- Primary genre: {primary_genre}
 - Genres: {genres}
 - Vibes: {vibes}
 - BPM Range: {bpm_range}
@@ -388,6 +391,7 @@ class DescriptionGenerator:
 
         prompt = YOUTUBE_TITLE_PROMPT.format(
             brand_name=settings.BRAND_NAME,
+            primary_genre=(genres[0] if genres else "electronic"),
             genres=", ".join(genres),
             vibes=", ".join(vibes),
             bpm_range=bpm_str,
