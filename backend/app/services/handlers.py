@@ -214,32 +214,37 @@ async def handle_detect(mix_id: str, session: AsyncSession) -> Optional[dict]:
 # analyze
 # ---------------------------------------------------------------------------
 
-async def handle_analyze(
-    mix_id: str, session: AsyncSession, progress_cb=None, **_kwargs
-) -> Optional[dict]:
-    """Run audio analysis and merge with CUE/DJCTL data if available."""
-    mix = await _get_mix(mix_id, session)
+async def analyze_audio_with_cue(
+    audio_path: str,
+    mix_id: Optional[str] = None,
+    progress_cb=None,
+    analyzer=None,
+):
+    """Analyze an audio file and merge with a date-matched CUE session.
 
-    if not mix.audio_file_path:
-        raise RuntimeError("No audio file path on mix")
+    Shared core of the pipeline ``analyze`` step and the catalog tracklist
+    backfill. The CUE must match the audio's filename date AND contain a
+    session whose timestamps actually fit this recording — otherwise recent
+    unrelated DJCTL plays would override the fingerprinted tracklist. No valid
+    CUE -> fingerprint-only. The confidence merge then weights the
+    authoritative CUE timestamps/names above the Shazam fallback: CUE wins any
+    overlap, Shazam only fills gaps (and fills CUE "Track N" placeholders),
+    and weak Shazam guesses collapse to "ID - ID" rather than a wrong name.
 
+    Returns ``(result, final_tracklist, source)`` where ``result`` is the
+    :class:`AnalysisResult`, ``final_tracklist`` the cleaned merged tracklist,
+    and ``source`` the merge's winning source ("cue"/"merged"/"shazam"/...).
+    """
     from app.services.audio_analyzer import AudioAnalyzer
     from app.services.confidence_merge import DetectionSource, merge_detections
     from app.services.djctl_integration import find_cue_for_audio, select_cue_tracks
+    from app.services.tracklist_utils import clean_tracklist
 
-    analyzer = AudioAnalyzer()
-    result = await analyzer.analyze(mix.audio_file_path, progress_cb=progress_cb)
+    analyzer = analyzer or AudioAnalyzer()
+    result = await analyzer.analyze(audio_path, progress_cb=progress_cb)
 
-    # Try to merge with CUE-sheet tracklist. The CUE must match the audio's
-    # filename date AND contain a session whose timestamps actually fit this
-    # recording — otherwise recent unrelated DJCTL plays would override the
-    # fingerprinted tracklist. No valid CUE -> fingerprint-only. The confidence
-    # merge then weights the authoritative CUE timestamps/names above the
-    # Shazam fallback: CUE wins any overlap, Shazam only fills gaps (and fills
-    # CUE "Track N" placeholders), and weak Shazam guesses collapse to
-    # "ID - ID" rather than a wrong name.
     cue_tracks = None
-    cue_path = find_cue_for_audio(mix.audio_file_path)
+    cue_path = find_cue_for_audio(audio_path)
     if cue_path:
         cue_name = os.path.basename(cue_path)
         await _emit_activity(
@@ -288,12 +293,30 @@ async def handle_analyze(
         detection_sources,
         name_confidence_threshold=settings.DETECTION_NAME_CONFIDENCE_THRESHOLD,
     )
-    from app.services.tracklist_utils import clean_tracklist
 
     final_tracklist = merged.tracklist if merged.tracklist else result.tracklist
     # Drop recognition noise (Unknown - Unknown) and consecutive duplicates, and
     # normalize timestamps before this list drives descriptions + chapters.
     final_tracklist = clean_tracklist(final_tracklist)
+    return result, final_tracklist, merged.source
+
+
+async def handle_analyze(
+    mix_id: str, session: AsyncSession, progress_cb=None, **_kwargs
+) -> Optional[dict]:
+    """Run audio analysis and merge with CUE/DJCTL data if available."""
+    mix = await _get_mix(mix_id, session)
+
+    if not mix.audio_file_path:
+        raise RuntimeError("No audio file path on mix")
+
+    from app.services.audio_analyzer import AudioAnalyzer
+
+    analyzer = AudioAnalyzer()
+    result, final_tracklist, merged_source = await analyze_audio_with_cue(
+        mix.audio_file_path, mix_id=mix_id, progress_cb=progress_cb,
+        analyzer=analyzer,
+    )
 
     mix.genres = result.genres
     mix.vibes = result.vibes
@@ -320,7 +343,7 @@ async def handle_analyze(
         "vibes": result.vibes,
         "bpm_range": list(result.bpm_range),
         "tracks_found": len(final_tracklist),
-        "tracklist_source": merged.source,
+        "tracklist_source": merged_source,
         "duration_seconds": result.duration_seconds,
         "youtube_timestamp_offset": yt_offset,
     }

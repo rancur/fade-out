@@ -182,6 +182,12 @@ class Settings(BaseSettings):
     PAIRING_WAIT_SECONDS: int = 7200  # 2 hours
     PAIRING_SWEEP_INTERVAL_SECONDS: int = 30
 
+    # --- Catalog tracklist backfill ---
+    # Extra directories (comma-separated) scanned for back-catalog audio in
+    # addition to WATCH_AUDIO_PATH when matching local files to imported mixes
+    # that have no tracklist. Leave blank to scan the watch folder only.
+    CATALOG_EXTRA_AUDIO_PATHS: str = ""
+
     # --- Disk safety ---
     # Ingest is refused (and surfaced in the activity log + health endpoint)
     # when free space on the output volume drops below this, so a multi-GB set
@@ -192,6 +198,16 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_webhook_urls(cls, v: str) -> str:
         return v
+
+    def get_catalog_extra_audio_paths(self) -> List[str]:
+        """Return CATALOG_EXTRA_AUDIO_PATHS split into a list of directories."""
+        if not self.CATALOG_EXTRA_AUDIO_PATHS:
+            return []
+        return [
+            p.strip()
+            for p in self.CATALOG_EXTRA_AUDIO_PATHS.split(",")
+            if p.strip()
+        ]
 
     def get_webhook_urls(self) -> List[str]:
         """Return NOTIFICATION_WEBHOOK_URLS split into a list."""
