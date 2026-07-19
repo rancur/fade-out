@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import AIUsage, BrandSettings
+from app.services import thumbnail_design
 
 logger = logging.getLogger(__name__)
 
@@ -89,10 +90,24 @@ class ArtGenerator:
         session: Optional[AsyncSession] = None,
         mix_id: Optional[str] = None,
         brand_settings: Optional[BrandSettings] = None,
+        hook_text: Optional[str] = None,
     ) -> str:
-        """Generate 1400x1400 SoundCloud cover art. Returns the saved file path."""
-        prompt = self._build_prompt(genres, vibes, brand_settings, aspect="square")
-        logger.info("Generating cover art for '%s': %s", mix_title, prompt[:120])
+        """Generate 1400x1400 SoundCloud cover art (brand design system).
+
+        The scene comes from the Will-approved genre motif (desert-psychedelic
+        focal subject + eye, square composition with the upper third kept for
+        text) and the deterministic pixel-font overlay is composed on top with
+        the text centered in the upper third. ``hook_text`` overrides the
+        motif's default <=3-word hook. Returns the saved file path.
+        """
+        genre_key = thumbnail_design.resolve_genre_key(genres)
+        motif = thumbnail_design.GENRE_MOTIFS[genre_key]
+        hook = hook_text or str(motif["hook"])
+        prompt = thumbnail_design.build_scene_prompt(
+            genre_key, brand_settings, aspect="square"
+        )
+        logger.info("Generating cover art for '%s' (%s): %s",
+                    mix_title, genre_key, prompt[:120])
 
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
@@ -109,6 +124,9 @@ class ArtGenerator:
             raise RuntimeError("All image generation providers failed")
 
         await self._download_and_save(image_url, output_path, resize=(1400, 1400))
+        thumbnail_design.compose_thumbnail(
+            output_path, hook, motif["accent"], output_path, size=(1400, 1400),
+        )
         logger.info("Cover art saved to %s", output_path)
         return output_path
 
@@ -125,34 +143,45 @@ class ArtGenerator:
         video_file_path: Optional[str] = None,
         energy_profile: Optional[List[Dict[str, Any]]] = None,
         duration_seconds: float = 0.0,
+        hook_text: Optional[str] = None,
     ) -> str:
-        """Generate a 1920x1080 YouTube thumbnail. Returns the saved file path.
+        """Generate a 1280x720 YouTube thumbnail. Returns the saved file path.
 
         Strategy, in order:
-          1. PRIMARY -- AI-generated branded art from the GENRE-DRIVEN prompt
-             (fal.ai -> DALL-E). This is Will's signature look; the genre-neutral
-             base + GENRE_VISUAL_MODIFIERS make a DnB set read as a dark neon
-             rave rather than a tropical landscape.
+          1. PRIMARY -- the Will-approved brand design system
+             (:mod:`thumbnail_design`): a fal-generated (-> DALL-E fallback)
+             desert-psychedelic scene picked by the mix's genre motif, with
+             the deterministic pixel-font hook overlay composed on top.
           2. FALLBACK -- a frame grabbed from the paired video at a peak-energy
              timestamp, if the AI providers fail.
           3. FALLBACK -- letterboxed cover art as a last resort.
-        Text is brand-overlaid via ``_overlay_text`` in every case.
+        The brand overlay (``compose_thumbnail``) runs in every case;
+        ``hook_text`` overrides the motif's default <=3-word hook.
         """
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-        # 1. Primary: AI-generated branded, genre-driven art.
-        prompt = self._build_prompt(genres, vibes, brand_settings, aspect="wide")
+        genre_key = thumbnail_design.resolve_genre_key(genres)
+        motif = thumbnail_design.GENRE_MOTIFS[genre_key]
+        hook = hook_text or str(motif["hook"])
+        accent = motif["accent"]
+
+        # 1. Primary: brand design system scene + overlay.
+        prompt = thumbnail_design.build_scene_prompt(
+            genre_key, brand_settings, aspect="wide"
+        )
         image_url = await self._generate_with_fal(
-            prompt, width=1920, height=1080, session=session, mix_id=mix_id,
+            prompt, width=1280, height=720, session=session, mix_id=mix_id,
         )
         if not image_url:
             image_url = await self._generate_with_dalle(
                 prompt, size="1792x1024", session=session, mix_id=mix_id,
             )
         if image_url:
-            await self._download_and_save(image_url, output_path, resize=(1920, 1080))
-            self._overlay_text(output_path, mix_title, genres)
-            logger.info("YouTube thumbnail (AI art) saved to %s", output_path)
+            await self._download_and_save(image_url, output_path, resize=(1280, 720))
+            thumbnail_design.compose_thumbnail(
+                output_path, hook, accent, output_path, size=(1280, 720),
+            )
+            logger.info("YouTube thumbnail (brand design) saved to %s", output_path)
             return output_path
 
         # 2. Fallback: frame grabbed from the paired video.
@@ -162,7 +191,9 @@ class ArtGenerator:
                 self._grab_video_frame, video_file_path, output_path, ts
             )
             if frame:
-                self._overlay_text(output_path, mix_title, genres)
+                thumbnail_design.compose_thumbnail(
+                    output_path, hook, accent, output_path, size=(1280, 720),
+                )
                 logger.info(
                     "YouTube thumbnail from video frame at %.0fs saved to %s (AI fallback)",
                     ts, output_path,
@@ -172,7 +203,9 @@ class ArtGenerator:
         # 3. Fallback: letterbox the cover art.
         if cover_art_path and os.path.exists(cover_art_path):
             self._letterbox_cover(cover_art_path, output_path)
-            self._overlay_text(output_path, mix_title, genres)
+            thumbnail_design.compose_thumbnail(
+                output_path, hook, accent, output_path, size=(1280, 720),
+            )
             logger.info("YouTube thumbnail (letterboxed cover) saved to %s", output_path)
             return output_path
 
