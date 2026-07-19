@@ -13,6 +13,7 @@ import {
   Filter,
   Library,
   ListChecks,
+  ListMusic,
   Loader2,
   Lock,
   Music,
@@ -23,13 +24,16 @@ import {
   Unlock,
 } from 'lucide-react'
 import {
+  useCatalogBackfillStatus,
   useCatalogImprove,
   useCatalogMixes,
   useCatalogSyncStatus,
   useLockTitle,
   useProposals,
+  useStartCatalogBackfill,
   useStartCatalogSync,
   type ActivityItem,
+  type CatalogBackfillSummary,
   type CatalogMix,
   type CatalogSort,
   type CatalogSyncSummary,
@@ -61,6 +65,14 @@ function summaryText(s: CatalogSyncSummary): string {
     `Sync ${s.status}: ${s.youtube_items ?? 0} YT + ${s.soundcloud_items ?? 0} SC items, ` +
     `${s.pairs_created ?? 0} pairs + ${s.singles_created ?? 0} singles created, ` +
     `${s.existing_updated ?? 0} updated`
+  )
+}
+
+function backfillSummaryText(s: CatalogBackfillSummary): string {
+  return (
+    `Backfill ${s.status}: ${s.processed ?? 0}/${s.matched ?? 0} matched mixes analyzed, ` +
+    `${s.tracks_found ?? 0} tracks found, ${s.proposals_created ?? 0} proposals approved, ` +
+    `${s.unmatched_mixes?.length ?? 0} mixes without local audio`
   )
 }
 
@@ -238,16 +250,21 @@ export default function CatalogPage() {
   const syncStatus = useCatalogSyncStatus()
   const startSync = useStartCatalogSync()
   const improve = useCatalogImprove()
+  const backfillStatus = useCatalogBackfillStatus()
+  const startBackfill = useStartCatalogBackfill()
   const draftProposals = useProposals({ status: 'draft', limit: 1 })
 
   const running = syncStatus.data?.running ?? false
+  const backfillRunning = backfillStatus.data?.running ?? false
 
-  // Live sync progress line from WS catalog_sync activity events
+  // Live progress lines from WS catalog_sync / catalog_backfill activity events
   const [liveStatus, setLiveStatus] = useState<string | null>(null)
+  const [backfillLive, setBackfillLive] = useState<string | null>(null)
   useEffect(() => {
     return wsManager.subscribe('activity', (msg: WsMessage) => {
       const item = msg.data as unknown as ActivityItem
       if (item?.event === 'catalog_sync' && item.message) setLiveStatus(item.message)
+      if (item?.event === 'catalog_backfill' && item.message) setBackfillLive(item.message)
     })
   }, [])
 
@@ -267,11 +284,28 @@ export default function CatalogPage() {
     wasRunning.current = running
   }, [running, syncStatus.data, qc])
 
+  // Toast the summary when a running backfill finishes
+  const backfillWasRunning = useRef(false)
+  useEffect(() => {
+    if (backfillWasRunning.current && !backfillRunning) {
+      const last = backfillStatus.data?.last_backfill
+      if (last) {
+        const fn = last.status === 'ok' ? toast.success : toast.warning
+        fn(backfillSummaryText(last))
+        if (last.errors?.length) last.errors.forEach((e) => toast.error(e))
+      }
+      setBackfillLive(null)
+      qc.invalidateQueries({ queryKey: ['catalog'] })
+    }
+    backfillWasRunning.current = backfillRunning
+  }, [backfillRunning, backfillStatus.data, qc])
+
   const mixes = data?.items ?? []
   const total = data?.total ?? 0
   const totalPages = Math.ceil(total / PAGE_SIZE)
   const openCount = draftProposals.data?.total ?? 0
   const lastSync = syncStatus.data?.last_sync
+  const lastBackfill = backfillStatus.data?.last_backfill
 
   return (
     <div className="space-y-6">
@@ -317,6 +351,29 @@ export default function CatalogPage() {
 
           <button
             onClick={() =>
+              startBackfill.mutate(undefined, {
+                onSuccess: (res) => {
+                  if (res.status === 'already_running')
+                    toast.info('A tracklist backfill is already running')
+                  else toast.success('Tracklist backfill started')
+                },
+                onError: () => toast.error('Failed to start tracklist backfill'),
+              })
+            }
+            disabled={backfillRunning || startBackfill.isPending}
+            title="Match local audio files to imported mixes without tracklists, analyze them, and draft refreshed descriptions with the detected tracklist."
+            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-cyber-cyan/10 text-cyber-cyan border border-cyber-cyan/30 text-xs font-mono uppercase tracking-wider hover:bg-cyber-cyan/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+          >
+            {backfillRunning ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <ListMusic className="w-4 h-4" />
+            )}
+            {backfillRunning ? 'Backfilling…' : 'Backfill tracklists'}
+          </button>
+
+          <button
+            onClick={() =>
               improve.mutate('all_generic', {
                 onSuccess: (res) => {
                   if (res.status === 'already_running') toast.info('AI improve is already running')
@@ -356,6 +413,24 @@ export default function CatalogPage() {
           <span className="truncate">{liveStatus ?? 'Catalog sync running…'}</span>
         </div>
       )}
+
+      {/* Tracklist backfill status line */}
+      {backfillRunning ? (
+        <div className="flex items-center gap-2 bg-surface-light border border-cyber-cyan/20 rounded-lg px-4 py-2.5 text-xs font-mono text-gray-300">
+          <Loader2 className="w-3.5 h-3.5 text-cyber-cyan animate-spin shrink-0" />
+          <span className="truncate">{backfillLive ?? 'Tracklist backfill running…'}</span>
+        </div>
+      ) : lastBackfill ? (
+        <div className="flex items-center gap-2 bg-surface-light border border-white/5 rounded-lg px-4 py-2.5 text-xs font-mono text-gray-500">
+          <ListMusic className="w-3.5 h-3.5 text-cyber-cyan/60 shrink-0" />
+          <span className="truncate">{backfillSummaryText(lastBackfill)}</span>
+          {lastBackfill.finished_at && (
+            <span className="ml-auto shrink-0 text-gray-600">
+              {format(new Date(lastBackfill.finished_at), 'MMM d, HH:mm')}
+            </span>
+          )}
+        </div>
+      ) : null}
 
       {/* Toolbar */}
       <div className="flex flex-col sm:flex-row gap-3">

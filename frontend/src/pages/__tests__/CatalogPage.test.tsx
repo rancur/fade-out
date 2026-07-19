@@ -64,6 +64,9 @@ vi.mock('@/api/client', () => ({
       if (url === '/catalog/sync/status') {
         return Promise.resolve({ data: { running: false, last_sync: null } })
       }
+      if (url === '/catalog/backfill-status') {
+        return Promise.resolve({ data: { running: false, last_backfill: null } })
+      }
       if (url === '/catalog/proposals') {
         return Promise.resolve({ data: { items: [], total: 5 } })
       }
@@ -136,5 +139,53 @@ describe('CatalogPage', () => {
     await waitFor(() => {
       expect(client.post).toHaveBeenCalledWith('/catalog/sync')
     })
+  })
+
+  it('starts a tracklist backfill via POST /catalog/backfill-tracklists', async () => {
+    renderPage()
+
+    const backfillButton = await screen.findByRole('button', {
+      name: /backfill tracklists/i,
+    })
+    fireEvent.click(backfillButton)
+
+    await waitFor(() => {
+      expect(client.post).toHaveBeenCalledWith('/catalog/backfill-tracklists', {
+        mix_ids: null,
+      })
+    })
+  })
+
+  it('shows the last backfill summary line when idle', async () => {
+    const defaultGet = vi.mocked(client.get).getMockImplementation()!
+    vi.mocked(client.get).mockImplementation((url: string) => {
+      if (url === '/catalog/backfill-status') {
+        return Promise.resolve({
+          data: {
+            running: false,
+            last_backfill: {
+              started_at: '2026-07-01T00:00:00Z',
+              finished_at: '2026-07-01T02:00:00Z',
+              status: 'ok',
+              errors: [],
+              matched: 4,
+              processed: 4,
+              tracks_found: 80,
+              proposals_created: 8,
+              unmatched_mixes: [{ mix_id: 'x', title: 'No Audio Anywhere' }],
+            },
+          },
+        })
+      }
+      return defaultGet(url)
+    })
+
+    renderPage()
+
+    expect(
+      await screen.findByText(
+        'Backfill ok: 4/4 matched mixes analyzed, 80 tracks found, 8 proposals approved, 1 mixes without local audio',
+      ),
+    ).toBeTruthy()
   })
 })
