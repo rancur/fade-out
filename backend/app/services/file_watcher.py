@@ -251,7 +251,19 @@ class FileWatcherService:
         await self._scan_existing()
 
     async def _scan_existing(self) -> None:
-        """Scan directories for files that arrived while we were offline."""
+        """Scan directories for files that arrived while we were offline.
+
+        Gated behind ``WATCH_INGEST_EXISTING_ON_START`` (default off): the watch
+        folders permanently hold a back-catalog, so sweeping them on startup
+        would auto-ingest the entire history. When disabled we only react to
+        files created/modified after the watcher is running.
+        """
+        if not settings.WATCH_INGEST_EXISTING_ON_START:
+            logger.info(
+                "Skipping startup scan of existing files "
+                "(WATCH_INGEST_EXISTING_ON_START=False); watching for new drops only."
+            )
+            return
         for dirpath, extensions, file_type, tracker in [
             (self._audio_path, AUDIO_EXTENSIONS, "audio", self._audio_tracker),
             (self._video_path, VIDEO_EXTENSIONS, "video", self._video_tracker),
