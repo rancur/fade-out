@@ -41,6 +41,8 @@ class PipelineStepOut(BaseModel):
     error: Optional[str] = None
     retry_count: int = 0
     output_json: Optional[dict] = None
+    progress: Optional[int] = None
+    progress_detail: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -277,15 +279,15 @@ async def retry_mix(mix_id: str, db: AsyncSession = Depends(get_db)):
     mix = result.scalar_one_or_none()
     if not mix:
         raise HTTPException(status_code=404, detail="Mix not found")
-    if mix.pipeline_status != "failed":
+    if mix.pipeline_status not in ("failed", "interrupted"):
         raise HTTPException(
             status_code=400,
             detail=f"Mix is not in failed status (current: {mix.pipeline_status})",
         )
 
-    # Find the failed step and reset it
+    # Find the failed/interrupted step(s) and reset them
     for step in mix.steps:
-        if step.status == "failed":
+        if step.status in ("failed", "interrupted"):
             step.status = "pending"
             step.error = None
             step.retry_count += 1
@@ -325,7 +327,7 @@ async def retry_step(mix_id: str, step_name: str, db: AsyncSession = Depends(get
     target_step.error = None
     target_step.retry_count += 1
 
-    if mix.pipeline_status == "failed":
+    if mix.pipeline_status in ("failed", "interrupted"):
         mix.pipeline_status = "pending"
         mix.pipeline_error = None
 

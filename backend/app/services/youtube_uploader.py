@@ -32,11 +32,25 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
 class YouTubeUploader:
     """Upload videos to YouTube via the Data API v3."""
 
-    def __init__(self, db_settings_json: Optional[Dict] = None) -> None:
+    def __init__(
+        self, db_settings_json: Optional[Dict] = None, mix_id: Optional[str] = None
+    ) -> None:
         sj = db_settings_json or {}
         self._db_settings = sj
+        self._mix_id = mix_id  # for activity-log attribution (optional)
         self._credentials: Optional[Credentials] = None
         self._youtube = None
+
+    async def _activity(self, level: str, event: str, message: str, **kwargs) -> None:
+        """Best-effort activity-log emit — never breaks an upload."""
+        try:
+            from app.services import activity_log
+
+            await activity_log.log(
+                level, event, message, mix_id=self._mix_id, platform="youtube", **kwargs
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("activity emit failed for %s", event, exc_info=True)
 
     # ------------------------------------------------------------------
     # Auth
@@ -86,6 +100,7 @@ class YouTubeUploader:
         thumbnail_path: Optional[str] = None,
         premiere_mode: Optional[str] = None,
         genre_for_playlist: Optional[str] = None,
+        progress_cb: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Upload a video to YouTube.
 
@@ -133,10 +148,22 @@ class YouTubeUploader:
             media_body=media,
         )
 
-        response = await asyncio.to_thread(self._resumable_upload, insert_request)
+        # The resumable upload runs in a worker thread; capture the loop so
+        # chunk progress can be bridged back to the async progress callback.
+        loop = asyncio.get_running_loop() if progress_cb else None
+        response = await asyncio.to_thread(
+            self._resumable_upload, insert_request, progress_cb, loop
+        )
         video_id = response["id"]
         video_url = f"https://www.youtube.com/watch?v={video_id}"
         logger.info("Video uploaded: %s (%s)", video_url, video_id)
+        if progress_cb:
+            # The final chunk returns with no status object, so 100% would
+            # otherwise never be reported.
+            try:
+                await progress_cb(100, "upload complete")
+            except Exception:  # pragma: no cover - progress must never break IO
+                pass
 
         # Set thumbnail
         if thumbnail_path and os.path.exists(thumbnail_path):
@@ -153,8 +180,13 @@ class YouTubeUploader:
             "playlist_id": playlist_id,
         }
 
-    def _resumable_upload(self, request) -> dict:
-        """Execute a resumable upload, handling retries."""
+    def _resumable_upload(self, request, progress_cb=None, loop=None) -> dict:
+        """Execute a resumable upload, handling retries.
+
+        Runs in a worker thread; per-chunk percent is forwarded to the async
+        ``progress_cb`` (when given) via ``run_coroutine_threadsafe`` on the
+        captured event loop.
+        """
         response = None
         retries = 0
         max_retries = 5
@@ -165,6 +197,15 @@ class YouTubeUploader:
                 if status:
                     progress = int(status.progress() * 100)
                     logger.info("YouTube upload progress: %d%%", progress)
+                    if progress_cb is not None and loop is not None:
+                        try:
+                            import asyncio
+
+                            asyncio.run_coroutine_threadsafe(
+                                progress_cb(progress, f"uploading {progress}%"), loop
+                            )
+                        except Exception:  # pragma: no cover - progress must never break IO
+                            pass
             except Exception as exc:
                 retries += 1
                 if retries > max_retries:
@@ -353,6 +394,12 @@ class YouTubeUploader:
             ).execute
         )
         logger.info("Updated YouTube description for video %s", video_id)
+        await self._activity(
+            "info", "description_updated",
+            f"YouTube description updated for video {video_id}"
+            + (f" (title: {title[:60]!r})" if title else ""),
+            context={"video_id": video_id, "title_changed": bool(title)},
+        )
         return True
 
     # ------------------------------------------------------------------

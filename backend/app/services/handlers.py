@@ -214,7 +214,9 @@ async def handle_detect(mix_id: str, session: AsyncSession) -> Optional[dict]:
 # analyze
 # ---------------------------------------------------------------------------
 
-async def handle_analyze(mix_id: str, session: AsyncSession) -> Optional[dict]:
+async def handle_analyze(
+    mix_id: str, session: AsyncSession, progress_cb=None, **_kwargs
+) -> Optional[dict]:
     """Run audio analysis and merge with CUE/DJCTL data if available."""
     mix = await _get_mix(mix_id, session)
 
@@ -226,7 +228,7 @@ async def handle_analyze(mix_id: str, session: AsyncSession) -> Optional[dict]:
     from app.services.djctl_integration import find_cue_for_audio, select_cue_tracks
 
     analyzer = AudioAnalyzer()
-    result = await analyzer.analyze(mix.audio_file_path)
+    result = await analyzer.analyze(mix.audio_file_path, progress_cb=progress_cb)
 
     # Try to merge with CUE-sheet tracklist. The CUE must match the audio's
     # filename date AND contain a session whose timestamps actually fit this
@@ -239,6 +241,12 @@ async def handle_analyze(mix_id: str, session: AsyncSession) -> Optional[dict]:
     cue_tracks = None
     cue_path = find_cue_for_audio(mix.audio_file_path)
     if cue_path:
+        cue_name = os.path.basename(cue_path)
+        await _emit_activity(
+            "info", "cue_matched",
+            f"CUE sheet matched by recording date: {cue_name}",
+            mix_id=mix_id, filename=cue_name, stage="analyze",
+        )
         cue_tracks = select_cue_tracks(cue_path, result.duration_seconds)
         if cue_tracks is None:
             logger.warning(
@@ -246,6 +254,27 @@ async def handle_analyze(mix_id: str, session: AsyncSession) -> Optional[dict]:
                 "using fingerprint-only tracklist",
                 cue_path, result.duration_seconds or 0.0,
             )
+            await _emit_activity(
+                "warn", "cue_rejected",
+                f"CUE {cue_name} rejected: no recording session fits the mix duration "
+                f"({result.duration_seconds or 0.0:.0f}s) — using fingerprint-only tracklist",
+                mix_id=mix_id, filename=cue_name, stage="analyze",
+            )
+        else:
+            span = cue_tracks[-1].timestamp_seconds if cue_tracks else 0.0
+            await _emit_activity(
+                "info", "cue_session_selected",
+                f"CUE session selected from {cue_name}: {len(cue_tracks)} tracks "
+                f"spanning {span:.0f}s (authoritative over fingerprints)",
+                mix_id=mix_id, filename=cue_name, stage="analyze",
+                context={"tracks": len(cue_tracks), "span_seconds": round(span, 1)},
+            )
+    else:
+        await _emit_activity(
+            "info", "cue_none",
+            "No same-date CUE sheet found — tracklist will be fingerprint-only",
+            mix_id=mix_id, stage="analyze",
+        )
 
     detection_sources = []
     if cue_tracks:
@@ -472,7 +501,7 @@ async def handle_generate_art(
 # ---------------------------------------------------------------------------
 
 async def handle_upload_soundcloud(
-    mix_id: str, session: AsyncSession
+    mix_id: str, session: AsyncSession, progress_cb=None, **_kwargs
 ) -> Optional[dict]:
     """Upload the mix to SoundCloud."""
     mix = await _get_mix(mix_id, session)
@@ -524,6 +553,7 @@ async def handle_upload_soundcloud(
     uploader = SoundCloudUploader(
         db_settings_json=sj_sc,
         on_tokens_refreshed=_sc_token_persister(session, app_settings),
+        mix_id=mix_id,
     )
     await _emit_activity(
         "info", "upload_attempt", f"Uploading to SoundCloud: {mix.title}",
@@ -536,6 +566,7 @@ async def handle_upload_soundcloud(
         genre=genre_label,
         tags=tags,
         cover_art_path=mix.cover_art_path,
+        progress_cb=progress_cb,
     )
 
     mix.soundcloud_url = permalink
@@ -583,7 +614,7 @@ async def handle_verify_soundcloud(
 # ---------------------------------------------------------------------------
 
 async def handle_upload_youtube(
-    mix_id: str, session: AsyncSession
+    mix_id: str, session: AsyncSession, progress_cb=None, **_kwargs
 ) -> Optional[dict]:
     """Upload the video to YouTube."""
     mix = await _get_mix(mix_id, session)
@@ -631,7 +662,7 @@ async def handle_upload_youtube(
         premiere_mode = app_settings.premiere_mode
 
     sj_yt = (app_settings.settings_json or {}) if app_settings else {}
-    uploader = YouTubeUploader(db_settings_json=sj_yt)
+    uploader = YouTubeUploader(db_settings_json=sj_yt, mix_id=mix_id)
     await _emit_activity(
         "info", "upload_attempt",
         f"Uploading to YouTube ({premiere_mode}): {mix.title_youtube or mix.title}",
@@ -645,6 +676,7 @@ async def handle_upload_youtube(
         thumbnail_path=mix.thumbnail_path,
         premiere_mode=premiere_mode,
         genre_for_playlist=genres[0] if genres else None,
+        progress_cb=progress_cb,
     )
 
     mix.youtube_url = result["video_url"]
@@ -858,11 +890,21 @@ async def handle_cross_link(
                 from app.services.youtube_uploader import YouTubeUploader
 
                 video_id = extract_youtube_video_id(yt_url)
-                yt_uploader = YouTubeUploader(db_settings_json=sj)
+                yt_uploader = YouTubeUploader(db_settings_json=sj, mix_id=mix_id)
                 await yt_uploader.update_description(video_id, mix.description_youtube)
                 pushed.append("youtube")
+                await _emit_activity(
+                    "info", "cross_link_pushed",
+                    f"Cross-link pushed to YouTube description ({video_id})",
+                    mix_id=mix_id, platform="youtube", stage="cross_link",
+                )
             except Exception as exc:
                 logger.error("Cross-link YouTube push failed for mix %s: %s", mix_id, exc)
+                await _emit_activity(
+                    "warn", "cross_link_failed",
+                    f"Cross-link push to YouTube failed: {exc}",
+                    mix_id=mix_id, platform="youtube", stage="cross_link",
+                )
 
         if mix.description_soundcloud:
             try:
@@ -871,11 +913,22 @@ async def handle_cross_link(
                 sc_uploader = SoundCloudUploader(
                     db_settings_json=sj,
                     on_tokens_refreshed=_sc_token_persister(session, app_settings),
+                    mix_id=mix_id,
                 )
                 await sc_uploader.update_description(sc_url, mix.description_soundcloud)
                 pushed.append("soundcloud")
+                await _emit_activity(
+                    "info", "cross_link_pushed",
+                    f"Cross-link pushed to SoundCloud description ({sc_url})",
+                    mix_id=mix_id, platform="soundcloud", stage="cross_link",
+                )
             except Exception as exc:
                 logger.error("Cross-link SoundCloud push failed for mix %s: %s", mix_id, exc)
+                await _emit_activity(
+                    "warn", "cross_link_failed",
+                    f"Cross-link push to SoundCloud failed: {exc}",
+                    mix_id=mix_id, platform="soundcloud", stage="cross_link",
+                )
 
         if mc_url and mix.description_soundcloud:
             try:

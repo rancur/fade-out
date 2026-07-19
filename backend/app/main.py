@@ -1,9 +1,10 @@
 """Fade-Out — DJ mix upload automation API."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,8 +31,8 @@ from app.services import activity_log
 from app.services.file_watcher import FileWatcherService
 from app.services.handlers import register_all_handlers
 from app.services.ingest import IngestCoordinator
-from app.services.notification_service import NotificationService
-from app.services.pipeline import PipelineOrchestrator
+from app.services.notification_service import get_notification_service
+from app.services.pipeline import PipelineOrchestrator, sweep_interrupted_at_boot
 
 logger = logging.getLogger("fadeout")
 
@@ -48,6 +49,11 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     await init_db()
     logger.info("Database ready.")
+
+    # Startup sweep: anything still marked "running" was cut off by the last
+    # shutdown (no orchestrator task can exist at boot). Steps become
+    # "interrupted", their mixes "failed" with a retryable error.
+    await sweep_interrupted_at_boot()
 
     # Register all pipeline step handlers
     register_all_handlers(orchestrator)
@@ -66,22 +72,26 @@ async def lifespan(app: FastAPI):
 
     activity_log.add_listener(_broadcast_activity)
 
-    # Deliver a done/failed notification when a mix finishes or fails. The
-    # NotificationService (Discord/email/webhook) already exists; wiring it to
-    # the orchestrator's terminal events closes the "no summary on finish/fail"
-    # gap. Draft-mode/rate-limits keep it from being noisy.
-    notifier = NotificationService()
+    # Notifications: the singleton NotificationService reads its channel
+    # config from AppSettings.settings_json (env as first-boot fallback) and
+    # listens to orchestrator events (pipeline_started, step_completed,
+    # upload_complete, error, draft_ready), honoring the per-event toggles and
+    # min-level saved via /api/notifications/settings.
+    notifier = get_notification_service()
     await notifier.start()
+    orchestrator.on_event(notifier.handle_orchestrator_event)
 
-    async def _notify_from_event(event_type: str, mix_id: Optional[str], data: dict) -> None:
-        if event_type == "upload_complete":
-            await notifier.notify("upload_complete", mix_id=mix_id, message="Mix finished: all uploads complete.", data=data)
-        elif event_type == "error":
-            await notifier.notify("error", mix_id=mix_id, message=f"Mix failed at step {data.get('step')}.", data=data)
-        elif event_type == "draft_ready":
-            await notifier.notify("draft_ready", mix_id=mix_id, message="Mix is ready for draft review.", data=data)
+    # Nightly activity-log retention: prune rows older than
+    # ACTIVITY_RETENTION_DAYS or beyond ACTIVITY_MAX_ROWS.
+    async def _activity_retention_loop() -> None:
+        while True:
+            try:
+                await activity_log.prune()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Activity retention prune failed")
+            await asyncio.sleep(24 * 3600)
 
-    orchestrator.on_event(_notify_from_event)
+    retention_task = asyncio.create_task(_activity_retention_loop())
 
     # Start the file watcher so dropped audio/video files auto-ingest into the
     # pipeline. Without this the watcher service is never instantiated and
@@ -103,6 +113,11 @@ async def lifespan(app: FastAPI):
     logger.info("Fade-Out is running.")
     yield
     logger.info("Fade-Out shutting down.")
+    retention_task.cancel()
+    try:
+        await retention_task
+    except asyncio.CancelledError:
+        pass
     await file_watcher.stop()
     await coordinator.stop()
     await notifier.stop()
