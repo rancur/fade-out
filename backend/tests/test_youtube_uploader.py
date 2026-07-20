@@ -1,6 +1,9 @@
-"""Tests for YouTube premiere-time selection and privacy resolution."""
+"""Tests for YouTube premiere-time selection, privacy resolution, and Shorts."""
 
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
+
+import pytest
 
 from app.services.youtube_uploader import YouTubeUploader
 
@@ -47,3 +50,40 @@ class TestCalculateOptimalTime:
         result = self.up._calculate_optimal_time()
         phoenix = result.replace(tzinfo=None) + PHOENIX_UTC_OFFSET
         assert phoenix.hour in {hour for _, hour in PREMIERE_SLOTS}
+
+
+class TestUploadShort:
+    async def test_upload_short_inserts_public_music_video(self, tmp_path, monkeypatch):
+        clip = tmp_path / "Backtrack 2026-05-14 21-03-22.mp4"
+        clip.write_bytes(b"fake mp4 bytes")
+
+        up = YouTubeUploader()
+        fake_service = MagicMock()
+        insert_call = fake_service.videos.return_value.insert
+        monkeypatch.setattr(up, "_get_service", lambda: fake_service)
+        monkeypatch.setattr(
+            up, "_resumable_upload", lambda request, *a, **k: {"id": "vid123"}
+        )
+
+        result = await up.upload_short(
+            str(clip),
+            title="T" * 120,  # gets clamped to YouTube's 100-char max
+            description="desc #shorts",
+            tags=["dj", "house"],
+        )
+
+        assert result == {
+            "video_id": "vid123",
+            "video_url": "https://www.youtube.com/shorts/vid123",
+        }
+        body = insert_call.call_args.kwargs["body"]
+        assert body["snippet"]["categoryId"] == "10"  # Music
+        assert len(body["snippet"]["title"]) == 100
+        assert body["snippet"]["tags"] == ["dj", "house"]
+        assert body["status"]["privacyStatus"] == "public"
+        assert body["status"]["selfDeclaredMadeForKids"] is False
+
+    async def test_upload_short_missing_file_raises(self):
+        up = YouTubeUploader()
+        with pytest.raises(FileNotFoundError):
+            await up.upload_short("/nope/missing.mp4", "t", "d", [])
