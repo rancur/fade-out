@@ -225,6 +225,14 @@ SETTINGS_SCHEMA: Tuple[SettingDef, ...] = (
         min_value=0, max_value=10_000,
     ),
     SettingDef(
+        key="shorts_daily_upload_cap",
+        label="Shorts daily upload cap",
+        help="Maximum Shorts uploaded per day by the backlog drip (each "
+             "videos.insert costs 1600 quota units).",
+        type="int", category="YouTube", env_attr="SHORTS_DAILY_UPLOAD_CAP",
+        min_value=0, max_value=100,
+    ),
+    SettingDef(
         key="youtube_default_playlist_prefix",
         label="Playlist prefix",
         help="Prefix for auto-created genre playlists (e.g. 'Will See | House Mixes').",
