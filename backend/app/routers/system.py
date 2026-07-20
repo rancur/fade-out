@@ -16,6 +16,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import async_session_factory
+from app.services import app_config
 from app.services import ingest as ingest_module
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ async def system_health() -> Dict[str, Any]:
             "ok": disk_ok,
         },
         "safety": {
-            "draft_mode": settings.DRAFT_MODE,
-            "premiere_mode": settings.PREMIERE_MODE,
+            "draft_mode": bool(await app_config.resolve("draft_mode")),
+            "premiere_mode": await app_config.resolve("premiere_mode"),
         },
     }

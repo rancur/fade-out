@@ -37,7 +37,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.database import async_session_factory
 from app.models import Mix
-from app.services import activity_log
+from app.services import activity_log, app_config
 from app.services.catalog_apply import QUOTA_KEY, YT_WRITE_COST
 from app.services.genre_utils import keyword_matches
 from app.services.soundcloud_uploader import SoundCloudUploader
@@ -221,9 +221,10 @@ def find_matching_playlist(
     return best
 
 
-def playlist_title_for_bucket(bucket: str) -> str:
+def playlist_title_for_bucket(bucket: str, prefix: Optional[str] = None) -> str:
     """Display title used when a bucket's playlist must be created."""
-    prefix = settings.YOUTUBE_DEFAULT_PLAYLIST_PREFIX
+    if prefix is None:
+        prefix = settings.YOUTUBE_DEFAULT_PLAYLIST_PREFIX
     if bucket.lower().startswith(prefix.lower()):
         return bucket
     return f"{prefix} | {bucket}"
@@ -320,7 +321,7 @@ async def run_organize_playlists(
             "placed": 0, "already_member": 0, "created_playlists": 0,
         },
     }
-    budget = settings.YOUTUBE_DAILY_QUOTA_BUDGET
+    budget = int(await app_config.resolve("youtube_daily_quota_budget"))
     today = date.today().isoformat()
     used = 0
     await activity_log.info("catalog_playlists", "Playlist organization started.")
@@ -394,7 +395,10 @@ async def run_organize_playlists(
                                 yt["paused"] = True
                                 yt["queued"] += len(bucket_mixes)
                                 continue
-                            playlist_title = playlist_title_for_bucket(bucket)
+                            playlist_title = playlist_title_for_bucket(
+                                bucket,
+                                await app_config.resolve("youtube_default_playlist_prefix"),
+                            )
                             playlist_id = await uploader.create_playlist(
                                 playlist_title,
                                 description=f"{bucket} DJ sets by {settings.BRAND_NAME}",
@@ -593,7 +597,9 @@ async def _sc_place_bucket(
     """Place one bucket's mixes on SoundCloud (create or append)."""
     match = find_matching_playlist(bucket, existing_sc)
     if match is None:
-        playlist_title = playlist_title_for_bucket(bucket)
+        playlist_title = playlist_title_for_bucket(
+            bucket, await app_config.resolve("youtube_default_playlist_prefix")
+        )
         track_ids = [m["soundcloud_track_id"] for m in bucket_mixes]
         created = await uploader.create_playlist(
             playlist_title, track_ids, sharing="public"
