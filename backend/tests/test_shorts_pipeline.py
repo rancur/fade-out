@@ -1,6 +1,7 @@
 """Tests for the YouTube Shorts pipeline (ffprobe/Shazam/LLM/YT all mocked)."""
 
 import json
+import os
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from types import SimpleNamespace
 
@@ -76,12 +77,16 @@ def _patch_pipeline(
     track=("Artist X", "Track Y"),
     generator=None,
     uploader=None,
+    durations=None,  # optional {basename: duration} for multi-clip tests
 ):
     generator = generator or FakeGenerator()
     uploader = uploader or FakeUploader()
 
     async def fake_probe(path):
-        return {"duration": duration, "width": width, "height": height}
+        import os as _os
+
+        d = (durations or {}).get(_os.path.basename(path), duration)
+        return {"duration": d, "width": width, "height": height}
 
     async def fake_identify(path, dur):
         return track
@@ -108,6 +113,24 @@ async def _get_short(short_id):
         return (
             await session.execute(select(Short).where(Short.id == short_id))
         ).scalar_one()
+
+
+async def _block_quota():
+    """Exhaust today's shared YouTube quota so unmatched clips park as queued."""
+    async with async_session_factory() as session:
+        row = (
+            await session.execute(select(AppSettings).where(AppSettings.id == 1))
+        ).scalar_one_or_none()
+        if row is None:
+            row = AppSettings(id=1)
+            session.add(row)
+        sj = dict(row.settings_json or {})
+        sj[QUOTA_KEY] = {
+            "date": date.today().isoformat(),
+            "used": settings.YOUTUBE_DAILY_QUOTA_BUDGET,
+        }
+        row.settings_json = sj
+        await session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -300,9 +323,14 @@ class TestProcessShort:
             session.add(
                 Mix(
                     title="Existing short on channel",
-                    duration_seconds=44.5,  # within the 2s tolerance
+                    duration_seconds=44.5,  # within the 2.5s tolerance
                     youtube_video_id="ytEXIST",
                     youtube_url="https://www.youtube.com/watch?v=ytEXIST",
+                    # Published the day after the clip was recorded (2026-05-14)
+                    # — both the duration AND date gates are now required.
+                    metadata_json={
+                        "catalog": {"youtube": {"published_at": "2026-05-15T00:00:00Z"}}
+                    },
                 )
             )
             await session.commit()
@@ -317,11 +345,12 @@ class TestProcessShort:
             "Existing short on channel"
         )
 
-    async def test_ambiguous_catalog_match_does_not_skip(
+    async def test_undated_candidates_never_match(
         self, prepared_db, monkeypatch
     ):
-        # Two same-duration candidates and no usable published dates: better
-        # to upload-review than silently drop the clip.
+        # The date gate is mandatory: candidates without a published date (or
+        # a clip without a parseable recording date) never dedupe-match —
+        # better to upload-review than silently drop the clip.
         _patch_pipeline(monkeypatch, duration=45.0)
         async with async_session_factory() as session:
             for i in range(2):
@@ -344,6 +373,7 @@ class TestProcessShort:
         async with async_session_factory() as session:
             session.add(
                 Mix(
+                    # Months outside the 5-day window — fails the date gate.
                     title="Published before recording",
                     duration_seconds=45.0,
                     youtube_video_id="ytOLD",
@@ -485,6 +515,222 @@ class TestIngestAndScan:
 # ---------------------------------------------------------------------------
 # Queue drain + manual upload
 # ---------------------------------------------------------------------------
+
+
+class TestOneToOneDedupe:
+    """Regression suite for the many-to-one dedupe bug: the per-clip
+    duration±date match once linked 52 of 89 backlog clips onto just 3
+    distinct video ids. Dedupe must be strictly one-to-one."""
+
+    _MIX_META = {"catalog": {"youtube": {"published_at": "2026-06-01T20:00:00Z"}}}
+
+    async def _seed_channel_video(self, video_id="ytONE", duration=45.0):
+        async with async_session_factory() as session:
+            mix = Mix(
+                title="The real upload",
+                duration_seconds=duration,
+                youtube_video_id=video_id,
+                youtube_url=f"https://www.youtube.com/watch?v={video_id}",
+                metadata_json=self._MIX_META,
+            )
+            session.add(mix)
+            await session.commit()
+            return mix.id
+
+    def _write_clips(self, tmp_path, durations):
+        for name in durations:
+            (tmp_path / name).write_bytes(name.encode() * 200)
+
+    async def test_scan_links_at_most_one_clip_per_video(
+        self, prepared_db, tmp_path, monkeypatch
+    ):
+        """N similar-duration clips + 1 channel video -> exactly ONE clip is
+        skipped/linked (best score = duration_diff + 0.5*day_diff); the rest
+        continue through the pipeline (queued here — quota blocked)."""
+        durations = {
+            "Backtrack 2026-06-01 12-00-00.mp4": 45.2,  # best score
+            "Backtrack 2026-06-01 13-00-00.mp4": 45.6,
+            "Backtrack 2026-06-02 12-00-00.mp4": 46.0,
+        }
+        self._write_clips(tmp_path, durations)
+        _patch_pipeline(monkeypatch, durations=durations)
+        await _block_quota()
+        await self._seed_channel_video()
+
+        summary = await ShortsService(watch_path=str(tmp_path)).scan()
+
+        assert summary["ingested"] == 3
+        assert summary["catalog_matched"] == 1
+
+        async with async_session_factory() as session:
+            rows = (await session.execute(select(Short))).scalars().all()
+        linked = [r for r in rows if r.youtube_video_id == "ytONE"]
+        assert len(linked) == 1  # the video id claims exactly ONE clip
+        best = linked[0]
+        assert os.path.basename(best.file_path) == "Backtrack 2026-06-01 12-00-00.mp4"
+        assert best.status == "skipped"
+        assert "already on channel" in best.error
+        others = [r for r in rows if r.id != best.id]
+        assert len(others) == 2
+        assert all(r.status == "queued" for r in others)
+        assert all(r.youtube_video_id is None for r in others)
+
+    async def test_rescan_is_idempotent(self, prepared_db, tmp_path, monkeypatch):
+        """A second scan preserves existing links: no re-claiming, no status
+        churn, no duplicate rows."""
+        durations = {
+            "Backtrack 2026-06-01 12-00-00.mp4": 45.2,
+            "Backtrack 2026-06-01 13-00-00.mp4": 45.6,
+        }
+        self._write_clips(tmp_path, durations)
+        _patch_pipeline(monkeypatch, durations=durations)
+        await _block_quota()
+        await self._seed_channel_video()
+
+        service = ShortsService(watch_path=str(tmp_path))
+        await service.scan()
+
+        async def snapshot():
+            async with async_session_factory() as session:
+                rows = (await session.execute(select(Short))).scalars().all()
+            return {
+                os.path.basename(r.file_path): (r.status, r.youtube_video_id)
+                for r in rows
+            }
+
+        before = await snapshot()
+        assert before["Backtrack 2026-06-01 12-00-00.mp4"] == ("skipped", "ytONE")
+        assert before["Backtrack 2026-06-01 13-00-00.mp4"] == ("queued", None)
+
+        second = await service.scan()
+        assert second["already_known"] == 2
+        assert second["ingested"] == 0
+        assert second["catalog_matched"] == 1  # same link re-derived, not added
+        assert second["requeued"] == 0
+        assert await snapshot() == before
+
+    async def test_better_new_clip_reclaims_link_and_requeues_loser(
+        self, prepared_db, tmp_path, monkeypatch
+    ):
+        """A previously-skipped clip loses its link when a better-scoring new
+        clip claims the same video id, and re-enters the pipeline."""
+        durations = {"Backtrack 2026-06-01 12-00-00.mp4": 45.1}  # score ~0.27
+        self._write_clips(tmp_path, durations)
+        _patch_pipeline(monkeypatch, durations=durations)
+        await _block_quota()
+        mix_id = await self._seed_channel_video()
+
+        # Weaker earlier match (duration diff 1.8) currently holds the link.
+        loser_id = await _make_short(
+            path="/watch/shorts/Backtrack 2026-06-01 10-00-00.mp4",
+            status="skipped",
+            duration_seconds=46.8,
+            width=1080,
+            height=1920,
+            youtube_video_id="ytONE",
+            youtube_url="https://www.youtube.com/watch?v=ytONE",
+            error="already on channel (matched catalog mix 'The real upload')",
+            metadata_json={
+                "catalog_match": {"mix_id": mix_id, "mix_title": "The real upload"}
+            },
+        )
+
+        summary = await ShortsService(watch_path=str(tmp_path)).scan()
+        assert summary["catalog_matched"] == 1
+        assert summary["requeued"] == 1
+
+        async with async_session_factory() as session:
+            rows = (await session.execute(select(Short))).scalars().all()
+        winner = next(r for r in rows if r.id != loser_id)
+        loser = await _get_short(loser_id)
+        assert winner.status == "skipped"
+        assert winner.youtube_video_id == "ytONE"
+        # The loser went back through the pipeline (quota blocked -> queued)
+        assert loser.youtube_video_id is None
+        assert loser.status == "queued"
+        assert not (loser.metadata_json or {}).get("catalog_match")
+
+    async def test_watcher_path_never_double_claims(self, prepared_db, monkeypatch):
+        """Single-clip path (watcher/un-skip): a video id already held by any
+        other short row is off the table, so the clip proceeds to upload."""
+        _patch_pipeline(monkeypatch, duration=45.2)
+        async with async_session_factory() as session:
+            session.add(
+                Mix(
+                    title="The real upload",
+                    duration_seconds=45.0,
+                    youtube_video_id="ytONE",
+                    metadata_json={
+                        "catalog": {"youtube": {"published_at": "2026-05-15T00:00:00Z"}}
+                    },
+                )
+            )
+            await session.commit()
+        holder_id = await _make_short(
+            path="/watch/shorts/Backtrack 2026-05-14 20-00-00.mp4",
+            status="skipped",
+            duration_seconds=45.4,
+            youtube_video_id="ytONE",
+            metadata_json={"catalog_match": {"mix_id": "x", "mix_title": "The real upload"}},
+        )
+
+        # New clip would match ytONE on duration+date, but it is claimed.
+        short_id = await _make_short()  # Backtrack 2026-05-14 21-03-22.mp4
+        status = await ShortsService().process_short(short_id)
+        assert status == "uploaded"
+
+        holder = await _get_short(holder_id)
+        assert holder.status == "skipped"
+        assert holder.youtube_video_id == "ytONE"
+
+    async def test_dedupe_backlog_is_one_to_one_across_many_clips(
+        self, prepared_db, monkeypatch
+    ):
+        """Direct dedupe_backlog: 5 similar clips vs 2 channel videos -> 2
+        links max, best scores win, everyone else stays detected."""
+        _patch_pipeline(monkeypatch)
+        async with async_session_factory() as session:
+            for vid, dur in (("ytA", 45.0), ("ytB", 52.0)):
+                session.add(
+                    Mix(
+                        title=f"Upload {vid}",
+                        duration_seconds=dur,
+                        youtube_video_id=vid,
+                        metadata_json=self._MIX_META,
+                    )
+                )
+            await session.commit()
+
+        clip_specs = [
+            ("Backtrack 2026-06-01 12-00-00.mp4", 45.1),  # best for ytA
+            ("Backtrack 2026-06-01 13-00-00.mp4", 45.4),
+            ("Backtrack 2026-06-01 14-00-00.mp4", 46.1),
+            ("Backtrack 2026-06-01 15-00-00.mp4", 52.3),  # best for ytB
+            ("Backtrack 2026-06-01 16-00-00.mp4", 52.9),
+        ]
+        ids = {}
+        for name, dur in clip_specs:
+            ids[name] = await _make_short(
+                path=f"/watch/shorts/{name}",
+                status="detected",
+                duration_seconds=dur,
+                width=1080,
+                height=1920,
+            )
+
+        result = await ShortsService().dedupe_backlog()
+        assert result == {"linked": 2, "unlinked": 0}
+
+        async with async_session_factory() as session:
+            rows = (await session.execute(select(Short))).scalars().all()
+        by_name = {os.path.basename(r.file_path): r for r in rows}
+        assert by_name["Backtrack 2026-06-01 12-00-00.mp4"].youtube_video_id == "ytA"
+        assert by_name["Backtrack 2026-06-01 15-00-00.mp4"].youtube_video_id == "ytB"
+        claimed = [r.youtube_video_id for r in rows if r.youtube_video_id]
+        assert sorted(claimed) == ["ytA", "ytB"]  # each video claimed once
+        unmatched = [r for r in rows if r.youtube_video_id is None]
+        assert len(unmatched) == 3
+        assert all(r.status == "detected" for r in unmatched)
 
 
 class TestDrainAndManualUpload:
