@@ -211,6 +211,43 @@ class TestMetadataGeneration:
 
 
 class TestProcessShort:
+    async def test_no_session_held_across_ffprobe_and_shazam(
+        self, prepared_db, monkeypatch
+    ):
+        """Write-lock regression (same class as the catalog backfill bug):
+        process_short used to hold ONE session across the whole run, with the
+        dirty probe-field writes autoflushed by the catalog-dedupe SELECT and
+        then kept uncommitted across ffmpeg + Shazam — holding sqlite's single
+        write lock for the whole track-ID await. Both long awaits must now run
+        with ZERO connections checked out of the engine pool (no open
+        session/transaction anywhere)."""
+        from app.database import engine
+
+        checked_out = {}
+
+        async def probe_ffprobe(path):
+            checked_out["ffprobe"] = engine.pool.checkedout()
+            return {"duration": 45.0, "width": 1080, "height": 1920}
+
+        async def probe_identify(path, dur):
+            checked_out["identify"] = engine.pool.checkedout()
+            return ("Artist X", "Track Y")
+
+        monkeypatch.setattr(shorts_pipeline, "ffprobe_clip", probe_ffprobe)
+        monkeypatch.setattr(shorts_pipeline, "identify_track", probe_identify)
+        monkeypatch.setattr(
+            shorts_pipeline, "get_description_generator", lambda sj: FakeGenerator()
+        )
+
+        short_id = await _make_short()
+        status = await ShortsService().process_short(short_id, auto_upload=False)
+
+        assert status == "ready"
+        assert checked_out == {"ffprobe": 0, "identify": 0}
+        short = await _get_short(short_id)
+        assert short.track_artist == "Artist X"
+        assert (short.width, short.height) == (1080, 1920)
+
     async def test_vertical_clip_auto_uploads(self, prepared_db, monkeypatch):
         _, uploader = _patch_pipeline(monkeypatch)
         short_id = await _make_short()

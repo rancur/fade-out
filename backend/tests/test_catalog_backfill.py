@@ -486,6 +486,52 @@ class TestRunBackfill:
         async with async_session_factory() as session:
             assert (await session.execute(select(MixProposal))).scalars().all() == []
 
+    async def test_no_session_held_during_analysis(
+        self, prepared_db, audio_dir, monkeypatch
+    ):
+        """Write-lock regression (prod incident: 'database is locked' on
+        used_creative DELETEs while a backfill ran): the ~10-minute Shazam
+        analysis must run with ZERO connections checked out of the engine
+        pool. A session left open mid-transaction across the analyze await
+        would hold sqlite's single write lock for the whole fingerprinting
+        run and stall every other writer past the 30s busy timeout — and it
+        would show up here as a checked-out connection.
+
+        Also proves (a): audio_file_path is already committed (visible from a
+        separate connection) BEFORE the analysis starts.
+        """
+        import app.services.handlers as handlers_mod
+        from app.database import async_session_factory, engine
+        from app.models import Mix
+
+        (audio_dir / "set-2025-06-14.flac").write_bytes(b"x")
+        await _make_imported_mix(
+            "m1", "Friday Night Set",
+            youtube_video_id="vid1",
+            youtube_url="https://www.youtube.com/watch?v=vid1",
+        )
+
+        probe: dict = {}
+
+        async def _probe(audio_path, mix_id=None, progress_cb=None, analyzer=None):
+            probe["checked_out"] = engine.pool.checkedout()
+            # (a) the path-link commit must already be visible to a fresh
+            # connection — i.e. it happened in its own committed transaction.
+            async with async_session_factory() as session:
+                mix = await session.get(Mix, mix_id)
+                probe["audio_path_committed"] = mix.audio_file_path
+            return FakeResult(), list(TRACKLIST), "merged"
+
+        monkeypatch.setattr(handlers_mod, "analyze_audio_with_cue", _probe)
+
+        summary = await run_backfill()
+        assert summary["processed"] == 1
+        assert summary["failed"] == 0
+        # (b) no session/transaction open while the analyzer ran. The probe's
+        # own session is opened after sampling, so the expected count is 0.
+        assert probe["checked_out"] == 0
+        assert probe["audio_path_committed"] == str(audio_dir / "set-2025-06-14.flac")
+
 
 # ---------------------------------------------------------------------------
 # API endpoints
