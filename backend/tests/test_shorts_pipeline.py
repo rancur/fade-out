@@ -734,9 +734,11 @@ class TestOneToOneDedupe:
 
 
 class TestDrainAndManualUpload:
-    async def test_drain_uploads_oldest_first_up_to_cap(
+    async def test_drain_uploads_newest_first_up_to_cap(
         self, prepared_db, monkeypatch
     ):
+        """With a 60+ clip backlog, oldest-first made yesterday's clip wait
+        weeks — the drain must upload the freshest recordings first."""
         _, uploader = _patch_pipeline(monkeypatch)
         old = datetime.now(timezone.utc) - timedelta(days=3)
         ids = []
@@ -756,9 +758,36 @@ class TestDrainAndManualUpload:
 
         assert summary["uploaded"] == settings.SHORTS_DAILY_UPLOAD_CAP  # 3
         assert summary["remaining"] == 2
-        # Oldest first
+        # Newest first (detected_at fallback — no date token in these names)
         uploaded_titles = [c["title"] for c in uploader.calls]
-        assert uploaded_titles == ["Queued 0", "Queued 1", "Queued 2"]
+        assert uploaded_titles == ["Queued 4", "Queued 3", "Queued 2"]
+
+    async def test_drain_orders_by_recording_date_over_detected_at(
+        self, prepared_db, monkeypatch
+    ):
+        """The Backtrack filename timestamp is the recording date the code
+        tracks best; ingest order (detected_at) must not override it."""
+        _, uploader = _patch_pipeline(monkeypatch)
+        now = datetime.now(timezone.utc)
+        # Recorded LATEST but ingested a month ago...
+        await _make_short(
+            path="/watch/shorts/Backtrack 2026-07-19 21-00-00.mp4",
+            status="queued", title="Fresh recording",
+            description="d #shorts", tags=[],
+            detected_at=now - timedelta(days=30),
+        )
+        # ...vs recorded in May but ingested just now.
+        await _make_short(
+            path="/watch/shorts/Backtrack 2026-05-01 21-00-00.mp4",
+            status="queued", title="Archive recording",
+            description="d #shorts", tags=[],
+            detected_at=now,
+        )
+
+        await ShortsService().drain_queue()
+
+        titles = [c["title"] for c in uploader.calls]
+        assert titles == ["Fresh recording", "Archive recording"]
 
     async def test_manual_upload_bypasses_cap_but_not_budget(
         self, prepared_db, monkeypatch
@@ -850,6 +879,65 @@ class TestDrainAndManualUpload:
         stats = await service.stats()
         assert stats["daily_cap"] == 0
         assert stats["cap_reached"] is True
+
+
+class TestDrainMetadataGate:
+    """Regression suite for the metadata-less overnight uploads: repair-
+    requeued rows (status='queued', no title/description) were uploaded raw
+    by the drain. The drain must generate metadata first and never upload
+    without it."""
+
+    async def test_drain_generates_missing_metadata_before_upload(
+        self, prepared_db, monkeypatch
+    ):
+        gen, uploader = _patch_pipeline(monkeypatch)
+        # A repair-requeued row: queued, but analysis/metadata never ran.
+        short_id = await _make_short(status="queued")
+
+        summary = await ShortsService().drain_queue()
+
+        assert summary["uploaded"] == 1
+        short = await _get_short(short_id)
+        assert short.status == "uploaded"
+        # The missing phases ran before the upload...
+        assert short.duration_seconds == 45.0
+        assert short.track_artist == "Artist X"
+        assert short.title and short.description
+        assert gen.last_prompt is not None
+        # ...and the upload carried the generated metadata, not the raw file.
+        assert uploader.calls[0]["title"] == short.title
+        assert "#shorts" in short.description
+
+    async def test_generation_failure_leaves_clip_queued_and_drain_continues(
+        self, prepared_db, monkeypatch
+    ):
+        # The LLM breaks -> the (newer) metadata-less clip must NOT upload
+        # raw and must NOT wedge the drain for the (older) ready clip.
+        _, uploader = _patch_pipeline(
+            monkeypatch, generator=FakeGenerator(raw="not json at all")
+        )
+        bad_id = await _make_short(
+            path="/watch/shorts/Backtrack 2026-07-18 21-00-00.mp4",
+            status="queued",
+            duration_seconds=45.0, width=1080, height=1920,
+        )
+        good_id = await _make_short(
+            path="/watch/shorts/Backtrack 2026-07-01 21-00-00.mp4",
+            status="queued", title="Good clip",
+            description="d #shorts", tags=["dj"],
+            duration_seconds=44.0, width=1080, height=1920,
+        )
+
+        summary = await ShortsService().drain_queue()
+
+        bad = await _get_short(bad_id)
+        assert bad.status == "queued"  # still queued — never uploaded raw
+        assert "metadata generation failed" in bad.error
+        good = await _get_short(good_id)
+        assert good.status == "uploaded"
+        assert [c["title"] for c in uploader.calls] == ["Good clip"]
+        assert summary["uploaded"] == 1
+        assert summary["remaining"] == 1
 
 
 # ---------------------------------------------------------------------------

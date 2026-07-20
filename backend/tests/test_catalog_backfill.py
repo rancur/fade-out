@@ -659,3 +659,145 @@ class TestBackfillApi:
         import app.routers.catalog as catalog_router
 
         await asyncio.wait_for(catalog_router._backfill_task, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Boot auto-resume (container restart/deploy killed the run)
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillAutoResume:
+    @pytest.fixture(autouse=True)
+    def _fresh_task_state(self, monkeypatch):
+        import app.routers.catalog as catalog_router
+
+        monkeypatch.setattr(catalog_router, "_backfill_task", None)
+
+    @pytest.fixture
+    def stub_run(self, monkeypatch):
+        import app.services.catalog_backfill as backfill_mod
+
+        calls = []
+
+        async def fake_run(mix_ids=None):
+            calls.append(mix_ids)
+            return {"status": "ok"}
+
+        monkeypatch.setattr(backfill_mod, "run_backfill", fake_run)
+        return calls
+
+    async def _seed(self, last_status=None, extra=None):
+        from app.database import async_session_factory
+        from app.models import AppSettings
+        from app.services import app_config
+
+        sj = dict(extra or {})
+        if last_status is not None:
+            sj[LAST_BACKFILL_KEY] = {"status": last_status}
+        async with async_session_factory() as session:
+            row = await session.get(AppSettings, 1)
+            if row is None:
+                row = AppSettings(id=1)
+                session.add(row)
+            row.settings_json = sj
+            await session.commit()
+        app_config.invalidate_cache()
+
+    async def _kickoff(self):
+        import app.routers.catalog as catalog_router
+
+        return await catalog_router.kickoff_backfill_auto_resume(delay_seconds=0)
+
+    async def test_resumes_when_last_run_cancelled(self, prepared_db, stub_run):
+        import asyncio
+        import app.routers.catalog as catalog_router
+
+        await self._seed(last_status="cancelled")
+        assert await self._kickoff() is True
+        await asyncio.wait_for(catalog_router._backfill_task, timeout=5)
+        assert stub_run == [None]
+
+    async def test_resumes_when_last_run_interrupted_mid_run(
+        self, prepared_db, stub_run
+    ):
+        # "running" is the marker a killed container leaves behind (persisted
+        # at run start) — nothing can actually be running at boot.
+        import asyncio
+        import app.routers.catalog as catalog_router
+
+        await self._seed(last_status="running")
+        assert await self._kickoff() is True
+        await asyncio.wait_for(catalog_router._backfill_task, timeout=5)
+        assert stub_run == [None]
+
+    async def test_no_resume_when_last_run_completed(self, prepared_db, stub_run):
+        for status in ("ok", "partial", "failed"):
+            await self._seed(last_status=status)
+            assert await self._kickoff() is False
+        assert stub_run == []
+
+    async def test_no_resume_without_any_previous_run(self, prepared_db, stub_run):
+        await self._seed()
+        assert await self._kickoff() is False
+        assert stub_run == []
+
+    async def test_setting_false_disables_auto_resume(self, prepared_db, stub_run):
+        await self._seed(
+            last_status="cancelled", extra={"backfill_auto_resume": False}
+        )
+        assert await self._kickoff() is False
+        assert stub_run == []
+
+    async def test_manual_trigger_during_delay_wins(
+        self, prepared_db, stub_run, monkeypatch
+    ):
+        # A manual POST during the settle delay claims the task handle; the
+        # auto-resume must yield instead of double-running.
+        import asyncio
+        import app.routers.catalog as catalog_router
+
+        await self._seed(last_status="cancelled")
+        manual = asyncio.create_task(asyncio.sleep(0.05))
+        monkeypatch.setattr(catalog_router, "_backfill_task", manual)
+        assert await self._kickoff() is False
+        await manual
+        assert stub_run == []
+
+    async def test_run_persists_running_marker_at_start(
+        self, prepared_db, audio_dir, monkeypatch
+    ):
+        """The interrupted-run marker: while a mix is being analyzed, the
+        stored summary must already read status='running' — a kill at this
+        point is what the boot auto-resume detects."""
+        import app.services.handlers as handlers_mod
+        from app.database import async_session_factory
+        from app.models import AppSettings
+        from app.services.catalog_backfill import last_run_incomplete
+        from sqlalchemy import select
+
+        (audio_dir / "a-2025-06-14.flac").write_bytes(b"x")
+        await _make_imported_mix("m1", "Set One")
+
+        probe = {}
+
+        async def _fake(audio_path, mix_id=None, progress_cb=None, analyzer=None):
+            async with async_session_factory() as session:
+                row = (
+                    await session.execute(
+                        select(AppSettings).where(AppSettings.id == 1)
+                    )
+                ).scalar_one()
+                probe["mid_run_status"] = (
+                    row.settings_json[LAST_BACKFILL_KEY]["status"]
+                )
+            probe["mid_run_incomplete"] = await last_run_incomplete()
+            return FakeResult(), list(TRACKLIST), "merged"
+
+        monkeypatch.setattr(handlers_mod, "analyze_audio_with_cue", _fake)
+
+        summary = await run_backfill()
+        assert probe["mid_run_status"] == "running"
+        assert probe["mid_run_incomplete"] is True
+        # A run that reaches the end overwrites the marker.
+        assert summary["status"] == "ok"
+        assert await last_run_incomplete() is False

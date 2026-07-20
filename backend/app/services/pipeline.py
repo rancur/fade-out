@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 import time
@@ -38,6 +39,11 @@ MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 5
 VIDEO_POLL_INTERVAL = 300  # 5 minutes
 
+# Video-completeness gate (see check_video_complete): a stalled OBS→NAS sync
+# leaves a partial video the upload step must wait out, not upload.
+VIDEO_MIN_DURATION_RATIO = 0.9
+VIDEO_STABLE_SECONDS = 180
+
 
 class StepStatus(str, Enum):
     PENDING = "pending"
@@ -57,6 +63,76 @@ PROGRESS_DB_INTERVAL = 5.0
 
 
 StepHandler = Callable[[str, AsyncSession], Coroutine[Any, Any, Optional[dict]]]
+
+
+async def _ffprobe_container_duration(video_path: str) -> Optional[float]:
+    """Container duration in seconds via ffprobe, or None when it does not
+    parse — an unfinalized/truncated MKV reports ``duration=N/A``. Same
+    subprocess pattern as shorts_pipeline.ffprobe_clip (ffmpeg ships in the
+    container image)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-print_format", "json",
+            "-show_format", video_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _err = await proc.communicate()
+    except OSError:  # pragma: no cover - ffprobe missing from the image
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        raw = (json.loads(out.decode(errors="replace") or "{}").get("format") or {}).get(
+            "duration"
+        )
+        return float(raw) if raw is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+async def check_video_complete(
+    video_path: str, audio_duration: Optional[float]
+) -> Tuple[bool, str]:
+    """Is the video fully synced/finalized? Returns ``(complete, reason)``.
+
+    Prod incident this guards against: the OBS→NAS sync stalled mid-copy and
+    the paired MKV held 10m40s of a ~115-minute set (ffprobe duration=N/A,
+    decode ending "File ended prematurely") — which upload_youtube would have
+    happily published. Cheap gates, in order:
+
+    1. The container duration must parse — a truncated/unfinalized MKV
+       reports no duration at all.
+    2. When the mix knows its audio duration, the video must cover at least
+       ``VIDEO_MIN_DURATION_RATIO`` of it (a partial copy can still carry a
+       parseable duration).
+    3. The file must be untouched for ``VIDEO_STABLE_SECONDS`` — a fresh
+       mtime means it is still growing.
+
+    The probe is subprocess-only; callers keep it outside any DB write
+    transaction (the poll loop closes its session before calling this).
+    """
+    duration = await _ffprobe_container_duration(video_path)
+    if duration is None:
+        return False, (
+            "video unfinalized/truncated: no container duration "
+            f"({os.path.basename(video_path)})"
+        )
+    if audio_duration and duration < VIDEO_MIN_DURATION_RATIO * audio_duration:
+        return False, (
+            f"video {duration:.0f}s < 90% of audio {audio_duration:.0f}s — "
+            "likely partial sync"
+        )
+    try:
+        age = time.time() - os.path.getmtime(video_path)
+    except OSError as exc:
+        return False, f"video file unreadable: {exc}"
+    if age < VIDEO_STABLE_SECONDS:
+        return False, (
+            f"video file modified {age:.0f}s ago — still syncing "
+            f"(needs {VIDEO_STABLE_SECONDS}s of stability)"
+        )
+    return True, "ok"
 
 
 class PipelineOrchestrator:
@@ -426,20 +502,23 @@ class PipelineOrchestrator:
                 logger.info("Step %s completed for mix %s in %.1fs", step_name, mix_id, elapsed)
                 return True
 
-            except _VideoNotReady:
-                logger.info("Video not ready for mix %s at step %s, entering wait", mix_id, step_name)
+            except _VideoNotReady as not_ready:
+                logger.info(
+                    "Video not ready for mix %s at step %s (%s), entering wait",
+                    mix_id, step_name, not_ready,
+                )
                 await self._record_step(
                     mix_id, step_name, StepStatus.WAITING,
                     started_at=started_at, retry_count=attempt - 1,
                 )
-                resolved = await self._wait_for_video(mix_id)
+                resolved, wait_reason = await self._wait_for_video(mix_id)
                 if resolved:
-                    # Re-attempt after video found
+                    # Re-attempt after video found + complete
                     continue
                 else:
                     await self._record_step(
                         mix_id, step_name, StepStatus.FAILED,
-                        started_at=started_at, error="Video file never appeared",
+                        started_at=started_at, error=wait_reason,
                         retry_count=attempt - 1,
                     )
                     return False
@@ -502,17 +581,48 @@ class PipelineOrchestrator:
             )
         return await handler(mix_id, session)
 
-    async def _wait_for_video(self, mix_id: str, max_checks: int = 48) -> bool:
-        """Poll for video file availability (default: check every 5min up to 4 hours)."""
+    async def _wait_for_video(
+        self, mix_id: str, max_checks: Optional[int] = None
+    ) -> Tuple[bool, str]:
+        """Poll every 5min until the video exists AND passes the completeness
+        gate. Returns ``(resolved, last_reason)``.
+
+        ``max_checks`` resolves from the ``video_wait_max_checks`` setting
+        (default 96 = 8 hours of 5-minute polls) — a stalled OBS→NAS sync can
+        take hours to recover, and the whole point is to wait it out
+        autonomously. On exhaustion the caller fails the step with the last
+        gate reason so the UI shows WHY it was waiting.
+        """
+        if max_checks is None:
+            max_checks = int(await app_config.resolve("video_wait_max_checks"))
+        last_reason = "Video file never appeared"
         for i in range(max_checks):
             await asyncio.sleep(VIDEO_POLL_INTERVAL)
+            path: Optional[str] = None
+            audio_duration: Optional[float] = None
             async with async_session_factory() as session:
                 mix = await session.get(Mix, mix_id)
-                if mix and mix.video_file_path and os.path.exists(mix.video_file_path):
-                    logger.info("Video file found for mix %s: %s", mix_id, mix.video_file_path)
-                    return True
-            logger.debug("Video check %d/%d for mix %s -- not found yet", i + 1, max_checks, mix_id)
-        return False
+                if mix:
+                    path = mix.video_file_path
+                    audio_duration = mix.duration_seconds
+            if path and os.path.exists(path):
+                # Session above is closed — the ffprobe subprocess never runs
+                # inside a DB transaction.
+                complete, reason = await check_video_complete(path, audio_duration)
+                if complete:
+                    logger.info("Video file ready for mix %s: %s", mix_id, path)
+                    return True, "ok"
+                last_reason = reason
+                logger.info(
+                    "Video check %d/%d for mix %s — %s",
+                    i + 1, max_checks, mix_id, reason,
+                )
+            else:
+                logger.debug(
+                    "Video check %d/%d for mix %s -- not found yet",
+                    i + 1, max_checks, mix_id,
+                )
+        return False, last_reason
 
     # ------------------------------------------------------------------
     # Persistence helpers
@@ -680,7 +790,9 @@ async def sweep_interrupted_at_boot() -> dict:
 
 
 class _VideoNotReady(Exception):
-    """Raised by upload_youtube handler when video file is missing."""
+    """Raised by the upload_youtube handler when the video file is missing or
+    fails the completeness gate (still syncing / truncated). The orchestrator
+    parks the step in WAITING and polls via _wait_for_video."""
     pass
 
 

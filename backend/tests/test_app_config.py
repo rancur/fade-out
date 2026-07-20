@@ -138,6 +138,65 @@ class TestResolve:
         app_config.invalidate_cache()
         assert await app_config.resolve("shorts_daily_upload_cap") == 7
 
+    async def test_backfill_auto_resume_in_schema_and_roundtrips(
+        self, prepared_db
+    ):
+        # Boot auto-resume gate for the catalog tracklist backfill: bool,
+        # non-secret, default ON (no env attr — static fallback).
+        d = app_config.SCHEMA_BY_KEY["backfill_auto_resume"]
+        assert d.type == "bool"
+        assert d.category == "Advanced"
+        assert d.editable is True
+        assert d.key not in app_config.SECRET_JSON_KEYS
+        assert app_config.env_default(d) is True
+        assert app_config.validate_value(d, False) is False
+        with pytest.raises(ValueError):
+            app_config.validate_value(d, "false")
+
+        # Default resolves True without any DB row...
+        assert await app_config.resolve("backfill_auto_resume") is True
+
+        # ...and a DB-set False wins.
+        from app.database import async_session_factory
+        from app.models import AppSettings
+
+        async with async_session_factory() as session:
+            session.add(
+                AppSettings(id=1, settings_json={"backfill_auto_resume": False})
+            )
+            await session.commit()
+
+        app_config.invalidate_cache()
+        assert await app_config.resolve("backfill_auto_resume") is False
+
+    async def test_video_wait_max_checks_in_schema_and_roundtrips(
+        self, prepared_db
+    ):
+        # Wait ceiling for the upload step's video-sync polling: int,
+        # non-secret, default 96 (8 hours of 5-minute checks).
+        d = app_config.SCHEMA_BY_KEY["video_wait_max_checks"]
+        assert d.type == "int"
+        assert d.category == "Pipeline"
+        assert d.key not in app_config.SECRET_JSON_KEYS
+        assert app_config.env_default(d) == 96
+        assert app_config.validate_value(d, "12") == 12
+        with pytest.raises(ValueError):
+            app_config.validate_value(d, 0)  # below min
+
+        assert await app_config.resolve("video_wait_max_checks") == 96
+
+        from app.database import async_session_factory
+        from app.models import AppSettings
+
+        async with async_session_factory() as session:
+            session.add(
+                AppSettings(id=1, settings_json={"video_wait_max_checks": 288})
+            )
+            await session.commit()
+
+        app_config.invalidate_cache()
+        assert await app_config.resolve("video_wait_max_checks") == 288
+
     async def test_column_backed_resolution(self, prepared_db):
         from app.database import async_session_factory
         from app.models import AppSettings

@@ -17,7 +17,8 @@ that must be ignored). Every new stable ``.mp4``:
    encoded in ``SHORTS_METADATA_PROMPT`` below.
 4. **Upload** — ``videos.insert`` (1600 quota units) through the shared
    ``catalog_yt_quota`` daily ledger, capped at ``SHORTS_DAILY_UPLOAD_CAP``
-   per day so the backlog drains a few clips per day, oldest first. When the
+   per day so the backlog drains a few clips per day, newest recording
+   first (fresh clips are timelier for the Shorts algorithm). When the
    cap/budget is hit the short parks as ``queued`` and the periodic drain
    pass picks it up on a later day.
 
@@ -1319,32 +1320,110 @@ class ShortsService:
             await self._upload(session, short)
             return short.status
 
-    async def drain_queue(self) -> Dict[str, Any]:
-        """Upload queued shorts, OLDEST FIRST, while cap + quota allow.
+    @staticmethod
+    def _drain_order_key(short: Short) -> Tuple[datetime, str, str]:
+        """Sort key approximating the clip's recording moment.
 
-        Steady state this pushes SHORTS_DAILY_UPLOAD_CAP per day until the
-        backlog is gone.
+        The Backtrack filename embeds the recording timestamp — the best
+        signal the pipeline tracks — with ``detected_at`` (ingest time) as
+        the fallback for undated names. Sorted DESCENDING by the drain.
+        """
+        recorded = parse_recording_date(short.file_path or "")
+        if recorded is None:
+            recorded = (
+                short.detected_at.replace(tzinfo=None)
+                if short.detected_at is not None
+                else datetime.min
+            )
+        return (recorded, str(short.detected_at or ""), short.id)
+
+    async def _ensure_queued_metadata(self, short_id: str) -> bool:
+        """Metadata gate for the drain: title + description must exist BEFORE
+        a queued clip may upload. Returns True when the clip is uploadable.
+
+        A queued row can legitimately lack metadata (e.g. rows requeued by a
+        data-repair pass before generation ever ran) — those get the missing
+        analyze / track-ID / metadata phases here, reusing the same
+        short-session functions as process_short (no lock held across
+        ffprobe/Shazam/LLM). When generation fails the clip is parked back in
+        ``queued`` with the error recorded — never uploaded raw — so one bad
+        clip cannot wedge the drain.
+        """
+        async with async_session_factory() as session:
+            short = await self._load_short(session, short_id)
+            if short.title and short.description:
+                return True
+            needs_probe = short.duration_seconds is None
+
+        if needs_probe:
+            probe = await self._analyze_short(short_id)
+            if probe is None:
+                # Skipped (shape/length) stays terminal; an ffprobe failure
+                # goes back to queued (error kept) for a later drain pass.
+                async with async_session_factory() as session:
+                    short = await self._load_short(session, short_id)
+                    if short.status == "failed":
+                        short.status = "queued"
+                        await session.commit()
+                return False
+
+        await self._finish_short(short_id, auto_upload=False)
+
+        async with async_session_factory() as session:
+            short = await self._load_short(session, short_id)
+            if short.title and short.description:
+                short.status = "queued"  # back in line; the drain uploads next
+                await session.commit()
+                return True
+            # Generation failed (_finish_short recorded the error) — keep the
+            # clip queued so the next drain retries, and move on.
+            short.status = "queued"
+            await session.commit()
+            return False
+
+    async def drain_queue(self) -> Dict[str, Any]:
+        """Upload queued shorts, NEWEST RECORDING FIRST, while cap + quota allow.
+
+        Newest-first (Backtrack filename timestamp, ``detected_at`` fallback):
+        with a 60+ clip backlog, oldest-first would make a brand-new clip wait
+        weeks behind the archive, and recency matters to the Shorts algorithm.
+
+        Every clip passes the metadata gate (:meth:`_ensure_queued_metadata`)
+        before uploading — a queued row with no title/description is never
+        uploaded raw; missing metadata is generated first, and a generation
+        failure leaves that clip queued (error recorded) while the drain
+        continues. Steady state this pushes SHORTS_DAILY_UPLOAD_CAP per day
+        until the backlog is gone.
         """
         async with self._drain_lock:
             summary = {"uploaded": 0, "remaining": 0}
             async with async_session_factory() as session:
-                while True:
+                queued = (
+                    (await session.execute(select(Short).where(Short.status == "queued")))
+                    .scalars()
+                    .all()
+                )
+                ordered_ids = [
+                    s.id
+                    for s in sorted(queued, key=self._drain_order_key, reverse=True)
+                ]
+            for short_id in ordered_ids:
+                async with async_session_factory() as session:
                     allowed, _ = await self._can_upload(session)
-                    if not allowed:
-                        break
-                    short = (
-                        await session.execute(
-                            select(Short)
-                            .where(Short.status == "queued")
-                            .order_by(Short.detected_at.asc(), Short.id.asc())
-                            .limit(1)
-                        )
-                    ).scalar_one_or_none()
-                    if short is None:
-                        break
+                if not allowed:
+                    break
+                if not await self._ensure_queued_metadata(short_id):
+                    continue
+                async with async_session_factory() as session:
+                    short = await self._load_short(session, short_id)
+                    if short.status != "queued" or not (
+                        short.title and short.description
+                    ):
+                        continue
                     await self._upload(session, short)
                     if short.status == "uploaded":
                         summary["uploaded"] += 1
+            async with async_session_factory() as session:
                 summary["remaining"] = (
                     await session.execute(
                         select(sa_func.count())
