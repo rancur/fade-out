@@ -1,6 +1,19 @@
-"""Application settings endpoints."""
+"""Application settings endpoints.
+
+Two generations of API live here:
+
+* ``GET /api/settings`` + ``PUT /api/settings`` — the original column-based
+  singleton (kept for compatibility). ``settings_json`` is redacted on the way
+  out (secrets are never serialized) and secret keys already stored are
+  preserved when a client round-trips the redacted dict back.
+* ``GET /api/settings/schema`` + ``PUT /api/settings/values`` — the
+  introspected catalog (see ``services/app_config.py``): every setting with
+  label/help/type/category, DB-over-env resolution, per-type validation, and
+  write-only secrets (only ``has_value`` is ever returned).
+"""
 
 import json
+import logging
 import os
 import shutil
 from datetime import datetime
@@ -14,6 +27,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import AppSettings
+from app.services import app_config
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -52,6 +68,38 @@ class AppSettingsUpdate(BaseModel):
     settings_json: Optional[dict] = None
 
 
+class SettingOut(BaseModel):
+    key: str
+    label: str
+    help: str
+    type: str  # str | int | float | bool | enum | path | secret
+    category: str
+    value: Any = None  # always None for secrets
+    has_value: bool = False
+    default: Any = None  # always None for secrets
+    editable: bool = True
+    source: str = "default"  # db | env | default
+    choices: Optional[List[str]] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
+
+
+class SettingsSchemaResponse(BaseModel):
+    categories: List[str]
+    settings: List[SettingOut]
+
+
+class SettingsValuesUpdate(BaseModel):
+    """Partial update: only the keys present are written.
+
+    ``null`` clears the DB override (the setting falls back to its env
+    default). Secrets are write-only — send a new value to overwrite, ``null``
+    to clear; they are never echoed back.
+    """
+
+    values: Dict[str, Any]
+
+
 class BackupInfo(BaseModel):
     backup_id: str
     created_at: str
@@ -73,23 +121,132 @@ async def _get_or_create_settings(db: AsyncSession) -> AppSettings:
     return row
 
 
+def _legacy_out(row: AppSettings) -> AppSettingsOut:
+    """Serialize the singleton row with secrets stripped from settings_json."""
+    out = AppSettingsOut.model_validate(row)
+    out.settings_json = app_config.redact_settings_json(row.settings_json)
+    return out
+
+
 @router.get("", response_model=AppSettingsOut)
 async def get_settings(db: AsyncSession = Depends(get_db)):
-    """Get all application settings."""
+    """Get all application settings (settings_json secrets are redacted)."""
     row = await _get_or_create_settings(db)
-    return AppSettingsOut.model_validate(row)
+    return _legacy_out(row)
 
 
 @router.put("", response_model=AppSettingsOut)
 async def update_settings(body: AppSettingsUpdate, db: AsyncSession = Depends(get_db)):
-    """Update application settings."""
+    """Update application settings (legacy column-based API).
+
+    Secret keys already stored in ``settings_json`` survive a client
+    round-tripping the redacted GET payload back: any secret key absent from
+    the provided dict keeps its stored value.
+    """
     row = await _get_or_create_settings(db)
     update_data = body.model_dump(exclude_unset=True)
+
+    if "settings_json" in update_data:
+        provided = update_data.pop("settings_json") or {}
+        stored = dict(row.settings_json or {})
+        for key in app_config.SECRET_JSON_KEYS:
+            if key not in provided and key in stored:
+                provided[key] = stored[key]
+        row.settings_json = provided
+
     for key, value in update_data.items():
         setattr(row, key, value)
+
+    # Keep the settings_json mirror of column-backed keys in sync so services
+    # reading only settings_json (generators) see column edits from this API.
+    sj = dict(row.settings_json or {})
+    mirrored = False
+    for key in app_config.MIRRORED_COLUMN_KEYS:
+        d = app_config.SCHEMA_BY_KEY[key]
+        col_val = getattr(row, d.column, None)
+        if col_val is not None and sj.get(key) != col_val:
+            sj[key] = col_val
+            mirrored = True
+    if mirrored:
+        row.settings_json = sj
+
     await db.flush()
     await db.refresh(row)
-    return AppSettingsOut.model_validate(row)
+    app_config.invalidate_cache()
+    return _legacy_out(row)
+
+
+# ---------------------------------------------------------------------------
+# Introspected settings catalog (schema + values)
+# ---------------------------------------------------------------------------
+
+@router.get("/schema", response_model=SettingsSchemaResponse)
+async def get_settings_schema(db: AsyncSession = Depends(get_db)):
+    """Full settings catalog with resolved values (secrets masked)."""
+    row = await _get_or_create_settings(db)
+    return SettingsSchemaResponse(
+        categories=list(app_config.CATEGORIES),
+        settings=[SettingOut(**item) for item in app_config.describe(row)],
+    )
+
+
+@router.put("/values", response_model=SettingsSchemaResponse)
+async def update_settings_values(
+    body: SettingsValuesUpdate, db: AsyncSession = Depends(get_db)
+):
+    """Partial settings update with per-type validation.
+
+    * unknown keys and non-editable settings are rejected,
+    * secrets are write-only (stored, never echoed),
+    * ``null`` clears the DB override so the env default applies again,
+    * the app-config cache is invalidated so changes apply immediately.
+    """
+    if not body.values:
+        raise HTTPException(status_code=422, detail="No values provided")
+
+    row = await _get_or_create_settings(db)
+    sj = dict(row.settings_json or {})
+
+    for key, value in body.values.items():
+        d = app_config.SCHEMA_BY_KEY.get(key)
+        if d is None:
+            raise HTTPException(status_code=400, detail=f"Unknown setting: {key}")
+        if not d.editable:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{key}' is not editable at runtime (configured at deploy)",
+            )
+
+        clearing = value is None or (d.type == "secret" and value == "")
+        if clearing:
+            sj.pop(key, None)
+            if d.column is not None:
+                setattr(row, d.column, app_config.env_default(d))
+            continue
+
+        try:
+            validated = app_config.validate_value(d, value)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+        if d.column is not None:
+            setattr(row, d.column, validated)
+            if key in app_config.MIRRORED_COLUMN_KEYS:
+                sj[key] = validated
+        else:
+            sj[key] = validated
+
+    row.settings_json = sj
+    await db.flush()
+    await db.commit()
+    await db.refresh(row)
+
+    app_config.invalidate_cache()
+
+    return SettingsSchemaResponse(
+        categories=list(app_config.CATEGORIES),
+        settings=[SettingOut(**item) for item in app_config.describe(row)],
+    )
 
 
 @router.post("/backup", response_model=BackupInfo)
@@ -153,4 +310,5 @@ async def restore_backup(backup_id: str, db: AsyncSession = Depends(get_db)):
             setattr(row, key, value)
 
     await db.flush()
-    return AppSettingsOut.model_validate(row)
+    app_config.invalidate_cache()
+    return _legacy_out(row)
