@@ -812,6 +812,45 @@ class TestDrainAndManualUpload:
         assert stats["cap_reached"] is False
         assert stats["quota_budget"] == settings.YOUTUBE_DAILY_QUOTA_BUDGET
 
+    async def test_quota_gate_honors_db_budget_override(self, prepared_db):
+        # The env budget (8000) would allow one more upload; a DB-set budget
+        # must win (same resolution as catalog_apply), so 1000 blocks it.
+        async with async_session_factory() as session:
+            session.add(
+                AppSettings(
+                    id=1, settings_json={"youtube_daily_quota_budget": 1000}
+                )
+            )
+            await session.commit()
+
+        service = ShortsService()
+        async with async_session_factory() as session:
+            ok, reason = await service._can_upload(session)
+        assert ok is False
+        assert "quota budget reached (0/1000 units)" in reason
+
+        stats = await service.stats()
+        assert stats["quota_budget"] == 1000
+
+    async def test_daily_cap_honors_db_override(self, prepared_db):
+        # The env cap (3) would allow an upload with 0 uploaded today; a
+        # DB-set cap of 0 must win.
+        async with async_session_factory() as session:
+            session.add(
+                AppSettings(id=1, settings_json={"shorts_daily_upload_cap": 0})
+            )
+            await session.commit()
+
+        service = ShortsService()
+        async with async_session_factory() as session:
+            ok, reason = await service._can_upload(session)
+        assert ok is False
+        assert "daily cap reached (0/0)" in reason
+
+        stats = await service.stats()
+        assert stats["daily_cap"] == 0
+        assert stats["cap_reached"] is True
+
 
 # ---------------------------------------------------------------------------
 # Serialization

@@ -1,10 +1,16 @@
-"""Tests for pure handler helpers (no DB / network)."""
+"""Tests for handler helpers and pipeline-step lock hygiene (no network)."""
 
+from datetime import date
 from types import SimpleNamespace
 
+from sqlalchemy import select
+
 import app.services.handlers as handlers_mod
-from app.models import Mix
+from app.database import async_session_factory
+from app.models import AppSettings, Mix, UsedCreative
 from app.services.handlers import (
+    YT_QUOTA_KEY,
+    YT_UPLOAD_QUOTA_COST,
     _ensure_tracklist_section,
     _sc_token_persister,
     _title_from_filename,
@@ -56,51 +62,59 @@ class TestTitleFromFilename:
         assert _title_from_filename("midnight groove.flac") == "Midnight Groove"
 
 
-class _FakeSession:
-    def __init__(self):
-        self.flushed = False
-
-    async def flush(self):
-        self.flushed = True
-
-
 class _FakeAppSettings:
     def __init__(self, settings_json=None):
         self.settings_json = settings_json
 
 
-class TestScTokenPersister:
-    async def test_persists_rotated_pair_and_reassigns_dict(self):
-        original = {"soundcloud_refresh_token": "old-rt", "other_key": "keep"}
-        app_settings = _FakeAppSettings(settings_json=original)
-        session = _FakeSession()
+async def _seed_app_settings(settings_json):
+    async with async_session_factory() as session:
+        session.add(AppSettings(id=1, settings_json=settings_json))
+        await session.commit()
 
-        persist = _sc_token_persister(session, app_settings)
+
+async def _load_settings_json():
+    async with async_session_factory() as session:
+        row = await session.get(AppSettings, 1)
+        return dict(row.settings_json or {}) if row else None
+
+
+class TestScTokenPersister:
+    """The persister must commit in its OWN session — flushing rotated tokens
+    on the pipeline session held the sqlite write lock for the entire
+    multi-GB upload when a refresh fired at upload start."""
+
+    async def test_persists_rotated_pair_via_own_session(self, prepared_db):
+        await _seed_app_settings(
+            {"soundcloud_refresh_token": "old-rt", "other_key": "keep"}
+        )
+
+        # Only the None-check reads the caller's snapshot; the write goes
+        # through a fresh session so no caller session/flush is involved.
+        persist = _sc_token_persister(_FakeAppSettings(settings_json={}))
         await persist("new-at", "new-rt")
 
-        assert app_settings.settings_json["soundcloud_access_token"] == "new-at"
-        assert app_settings.settings_json["soundcloud_refresh_token"] == "new-rt"
-        assert app_settings.settings_json["other_key"] == "keep"
-        # The dict must be REASSIGNED (new object) so SQLAlchemy detects the
-        # JSON column change; in-place mutation would be silently dropped.
-        assert app_settings.settings_json is not original
-        assert session.flushed is True
+        # Visible from a brand-new session with no commit by the caller —
+        # i.e. the persister committed durably on its own.
+        sj = await _load_settings_json()
+        assert sj["soundcloud_access_token"] == "new-at"
+        assert sj["soundcloud_refresh_token"] == "new-rt"
+        assert sj["other_key"] == "keep"
 
-    async def test_missing_refresh_token_keeps_existing(self):
-        app_settings = _FakeAppSettings(
-            settings_json={"soundcloud_refresh_token": "old-rt"}
-        )
-        persist = _sc_token_persister(_FakeSession(), app_settings)
+    async def test_missing_refresh_token_keeps_existing(self, prepared_db):
+        await _seed_app_settings({"soundcloud_refresh_token": "old-rt"})
+
+        persist = _sc_token_persister(_FakeAppSettings(settings_json={}))
         await persist("new-at", None)
 
-        assert app_settings.settings_json["soundcloud_access_token"] == "new-at"
-        assert app_settings.settings_json["soundcloud_refresh_token"] == "old-rt"
+        sj = await _load_settings_json()
+        assert sj["soundcloud_access_token"] == "new-at"
+        assert sj["soundcloud_refresh_token"] == "old-rt"
 
-    async def test_no_app_settings_is_noop(self):
-        session = _FakeSession()
-        persist = _sc_token_persister(session, None)
+    async def test_no_app_settings_is_noop(self, prepared_db):
+        persist = _sc_token_persister(None)
         await persist("new-at", "new-rt")  # must not raise
-        assert session.flushed is False
+        assert await _load_settings_json() is None
 
 
 class TestEnsureTracklistSection:
@@ -183,3 +197,150 @@ class TestRereadTitleConsistency:
         assert mix.description_youtube == "Enjoy Published Title tonight."
         assert out["tracks_found"] == 3
         assert out["descriptions_updated"] == {"youtube": False, "soundcloud": False}
+
+
+async def _add_mix(**kwargs):
+    defaults = dict(title="Mix")
+    defaults.update(kwargs)
+    async with async_session_factory() as session:
+        mix = Mix(**defaults)
+        session.add(mix)
+        await session.commit()
+        return mix.id
+
+
+class TestGenerateArtLockHygiene:
+    """The uniqueness design phase must be COMMITTED before any art
+    generation starts — holding the pipeline session's write txn across the
+    minutes-long fal polls starved every other writer past the 30s busy
+    timeout."""
+
+    async def test_uniqueness_claims_committed_before_generation(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        from app.config import settings as app_settings_cfg
+        from app.services.art_generator import ArtGenerator
+
+        monkeypatch.setattr(
+            app_settings_cfg, "OUTPUT_COVER_ART_PATH", str(tmp_path / "covers")
+        )
+        monkeypatch.setattr(
+            app_settings_cfg, "OUTPUT_THUMBNAILS_PATH", str(tmp_path / "thumbs")
+        )
+        # No LLM: the hook falls back to the genre motif (no OpenAI call).
+        monkeypatch.setattr(app_settings_cfg, "OPENAI_API_KEY", "")
+
+        mix_id = await _add_mix(title="Desert Heat", genres=["house"])
+
+        seen = {}
+
+        async def _claims_from_fresh_session():
+            # A brand-new session sees only COMMITTED rows — pending/flushed
+            # writes on the handler's sessions are invisible here.
+            async with async_session_factory() as check:
+                rows = (
+                    await check.execute(
+                        select(UsedCreative).where(UsedCreative.mix_id == mix_id)
+                    )
+                ).scalars().all()
+                return {r.kind for r in rows}
+
+        async def fake_cover(self, **kwargs):
+            seen["claims_at_cover_start"] = await _claims_from_fresh_session()
+            return kwargs["output_path"]
+
+        async def fake_thumb(self, **kwargs):
+            seen["claims_at_thumb_start"] = await _claims_from_fresh_session()
+            return kwargs["output_path"]
+
+        monkeypatch.setattr(ArtGenerator, "generate_cover_art", fake_cover)
+        monkeypatch.setattr(ArtGenerator, "generate_youtube_thumbnail", fake_thumb)
+
+        async with async_session_factory() as session:
+            out = await handlers_mod.handle_generate_art(mix_id, session)
+            await session.commit()
+
+        # Hook + scene claims were durable before the first generation began.
+        assert seen["claims_at_cover_start"] == {"hook", "scene"}
+        assert seen["claims_at_thumb_start"] == {"hook", "scene"}
+        assert out["cover_art_path"].endswith(f"{mix_id}.jpg")
+        assert out["thumbnail_path"].endswith(f"{mix_id}.jpg")
+
+        async with async_session_factory() as session:
+            mix = await session.get(Mix, mix_id)
+            assert mix.cover_art_path == out["cover_art_path"]
+            assert mix.thumbnail_path == out["thumbnail_path"]
+
+
+class TestUploadYoutubeQuotaLedger:
+    """The main pipeline's videos.insert (1600 units) must be charged to the
+    shared catalog_yt_quota ledger — only shorts and catalog-apply charged it
+    before, so the day's spend was undercounted."""
+
+    async def _run_upload(self, tmp_path, monkeypatch):
+        from app.services.youtube_uploader import YouTubeUploader
+
+        video = tmp_path / "mix.mp4"
+        video.write_bytes(b"video")
+        mix_id = await _add_mix(
+            title="Quota Mix", video_file_path=str(video), genres=["house"]
+        )
+
+        async def fake_upload(self, **kwargs):
+            return {
+                "video_url": "https://www.youtube.com/watch?v=abc123def45",
+                "video_id": "abc123def45",
+                "playlist_id": None,
+            }
+
+        monkeypatch.setattr(YouTubeUploader, "upload", fake_upload)
+
+        async with async_session_factory() as session:
+            out = await handlers_mod.handle_upload_youtube(mix_id, session)
+            await session.commit()
+        return out
+
+    async def test_successful_upload_charges_1600_units(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        await _seed_app_settings({"youtube_refresh_token": "tok"})
+
+        out = await self._run_upload(tmp_path, monkeypatch)
+
+        assert out["video_id"] == "abc123def45"
+        sj = await _load_settings_json()
+        assert sj[YT_QUOTA_KEY] == {
+            "date": date.today().isoformat(),
+            "used": YT_UPLOAD_QUOTA_COST,
+        }
+
+    async def test_charge_accumulates_on_todays_ledger(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        await _seed_app_settings(
+            {
+                "youtube_refresh_token": "tok",
+                YT_QUOTA_KEY: {"date": date.today().isoformat(), "used": 3200},
+            }
+        )
+
+        await self._run_upload(tmp_path, monkeypatch)
+
+        sj = await _load_settings_json()
+        assert sj[YT_QUOTA_KEY]["used"] == 3200 + YT_UPLOAD_QUOTA_COST
+
+    async def test_skipped_upload_charges_nothing(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        await _seed_app_settings({"youtube_refresh_token": "tok"})
+        mix_id = await _add_mix(
+            title="Already Up", youtube_url="https://youtu.be/abc123def45"
+        )
+
+        async with async_session_factory() as session:
+            out = await handlers_mod.handle_upload_youtube(mix_id, session)
+            await session.commit()
+
+        assert out["skipped"] is True
+        sj = await _load_settings_json()
+        assert YT_QUOTA_KEY not in sj
