@@ -159,7 +159,9 @@ async def ai_budget(db: AsyncSession = Depends(get_db)):
     spent = result.scalar() or 0.0
     spent = round(spent, 4)
 
-    budget = settings.AI_MONTHLY_BUDGET_USD
+    from app.services import app_config
+
+    budget = float(await app_config.resolve("ai_monthly_budget_usd"))
     remaining = round(max(budget - spent, 0.0), 4)
     percentage = round((spent / budget * 100) if budget > 0 else 0.0, 2)
 

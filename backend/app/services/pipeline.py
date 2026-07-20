@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import async_session_factory
 from app.models import Mix, PipelineStep
+from app.services import app_config
 
 logger = logging.getLogger(__name__)
 
@@ -285,8 +286,8 @@ class PipelineOrchestrator:
                     await self._mark_failed(mix_id, step_name)
                     return
 
-                # Draft mode pause after generate_art
-                if settings.DRAFT_MODE and step_name == "generate_art":
+                # Draft mode pause after generate_art (DB setting, env fallback)
+                if step_name == "generate_art" and await app_config.resolve("draft_mode"):
                     logger.info("DRAFT_MODE: pausing pipeline for mix %s after generate_art", mix_id)
                     await self._set_mix_status(mix_id, "draft_review", step_name)
                     await self._emit("draft_ready", mix_id)

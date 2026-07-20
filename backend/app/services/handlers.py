@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import AppSettings, BrandSettings, Mix
+from app.services import app_config
 from app.services.pipeline import PipelineOrchestrator, VideoNotReady
 
 logger = logging.getLogger(__name__)
@@ -291,7 +292,9 @@ async def analyze_audio_with_cue(
 
     merged = merge_detections(
         detection_sources,
-        name_confidence_threshold=settings.DETECTION_NAME_CONFIDENCE_THRESHOLD,
+        name_confidence_threshold=float(
+            await app_config.resolve("detection_name_confidence_threshold")
+        ),
     )
 
     final_tracklist = merged.tracklist if merged.tracklist else result.tracklist
@@ -915,7 +918,7 @@ async def handle_cross_link(
     # cross-links only ever landed in the DB and the published descriptions
     # never carried them. Each push is best-effort: a failure is logged loudly
     # but never fails the pipeline's final step. Uses existing OAuth tokens.
-    if settings.CROSS_LINK_PUSH_ENABLED:
+    if await app_config.resolve("cross_link_push_enabled"):
         app_settings = await _get_app_settings(session)
         sj = (app_settings.settings_json or {}) if app_settings else {}
 

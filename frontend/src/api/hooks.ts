@@ -388,6 +388,52 @@ export function useUpdateSettings() {
   })
 }
 
+// ---------- Settings catalog (schema + values) ----------
+
+export type SettingType = 'str' | 'int' | 'float' | 'bool' | 'enum' | 'path' | 'secret'
+export type SettingValue = string | number | boolean | null
+
+export interface SettingItem {
+  key: string
+  label: string
+  help: string
+  type: SettingType
+  category: string
+  /** Resolved effective value. Always null for secrets (write-only). */
+  value: SettingValue
+  has_value: boolean
+  default: SettingValue
+  editable: boolean
+  source: 'db' | 'env' | 'default'
+  choices: string[] | null
+  min: number | null
+  max: number | null
+}
+
+export interface SettingsSchema {
+  categories: string[]
+  settings: SettingItem[]
+}
+
+export function useSettingsSchema() {
+  return useQuery({
+    queryKey: ['settings', 'schema'],
+    queryFn: () => client.get<SettingsSchema>('/settings/schema').then((r) => r.data),
+  })
+}
+
+export function useUpdateSettingValues() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (values: Record<string, SettingValue>) =>
+      client.put<SettingsSchema>('/settings/values', { values }).then((r) => r.data),
+    onSuccess: (data) => {
+      qc.setQueryData(['settings', 'schema'], data)
+      qc.invalidateQueries({ queryKey: ['settings'] })
+    },
+  })
+}
+
 // ---------- Brand ----------
 
 export function useBrand() {
