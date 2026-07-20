@@ -112,6 +112,32 @@ class TestResolve:
         app_config.invalidate_cache()
         assert await app_config.resolve("youtube_daily_quota_budget") == 777
 
+    async def test_shorts_daily_upload_cap_in_schema_and_roundtrips(
+        self, prepared_db
+    ):
+        # Runtime-editable (env-only before): int, non-secret, env fallback 3.
+        d = app_config.SCHEMA_BY_KEY["shorts_daily_upload_cap"]
+        assert d.type == "int"
+        assert d.env_attr == "SHORTS_DAILY_UPLOAD_CAP"
+        assert app_config.validate_value(d, "5") == 5
+
+        assert (
+            await app_config.resolve("shorts_daily_upload_cap")
+            == env_settings.SHORTS_DAILY_UPLOAD_CAP
+        )
+
+        from app.database import async_session_factory
+        from app.models import AppSettings
+
+        async with async_session_factory() as session:
+            session.add(
+                AppSettings(id=1, settings_json={"shorts_daily_upload_cap": 7})
+            )
+            await session.commit()
+
+        app_config.invalidate_cache()
+        assert await app_config.resolve("shorts_daily_upload_cap") == 7
+
     async def test_column_backed_resolution(self, prepared_db):
         from app.database import async_session_factory
         from app.models import AppSettings

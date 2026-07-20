@@ -3,17 +3,24 @@
 import logging
 import os
 import re
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import async_session_factory
 from app.models import AppSettings, BrandSettings, Mix
 from app.services import app_config
 from app.services.pipeline import PipelineOrchestrator, VideoNotReady
 
 logger = logging.getLogger(__name__)
+
+# YouTube Data API cost of one videos.insert, charged to the shared daily
+# ledger. Key + cost MUST stay in sync with shorts_pipeline / catalog_apply.
+YT_QUOTA_KEY = "catalog_yt_quota"
+YT_UPLOAD_QUOTA_COST = 1600
 
 
 # ---------------------------------------------------------------------------
@@ -48,26 +55,62 @@ async def _get_app_settings(session: AsyncSession) -> Optional[AppSettings]:
     return await session.get(AppSettings, 1)
 
 
-def _sc_token_persister(session: AsyncSession, app_settings: Optional[AppSettings]):
+def _sc_token_persister(app_settings: Optional[AppSettings]):
     """Callback that persists rotated SoundCloud tokens into app_settings.
 
     SoundCloud rotates the refresh token on every refresh — losing the new
     pair strands the app with an invalid_grant on the next refresh.
+
+    Persists in its OWN short session, committed immediately: a token refresh
+    fires at upload start, and flushing on the caller's long-lived pipeline
+    session would hold sqlite's single write lock for the entire multi-GB
+    upload. The row is re-fetched fresh so a concurrent settings_json write
+    (e.g. the quota ledger) is never clobbered with a stale copy.
     """
     async def persist(access_token: str, refresh_token: Optional[str]) -> None:
         if app_settings is None:
             logger.warning("No app_settings row; refreshed SC tokens not persisted")
             return
-        # Reassign the dict so SQLAlchemy sees the JSON column as changed
-        sj = dict(app_settings.settings_json or {})
-        sj["soundcloud_access_token"] = access_token
-        if refresh_token:
-            sj["soundcloud_refresh_token"] = refresh_token
-        app_settings.settings_json = sj
-        await session.flush()
+        async with async_session_factory() as own_session:
+            row = await own_session.get(AppSettings, 1)
+            if row is None:
+                logger.warning(
+                    "No app_settings row; refreshed SC tokens not persisted"
+                )
+                return
+            # Reassign the dict so SQLAlchemy sees the JSON column as changed
+            sj = dict(row.settings_json or {})
+            sj["soundcloud_access_token"] = access_token
+            if refresh_token:
+                sj["soundcloud_refresh_token"] = refresh_token
+            row.settings_json = sj
+            await own_session.commit()
         logger.info("Persisted rotated SoundCloud tokens to app_settings")
 
     return persist
+
+
+async def _record_yt_upload_quota() -> None:
+    """Charge one videos.insert (1600 units) to the shared daily quota ledger.
+
+    The main pipeline's YouTube upload consumes the same daily API quota the
+    shorts and catalog-apply jobs budget against, so it is charged to the same
+    ``catalog_yt_quota`` ledger (same convention as
+    ``shorts_pipeline._record_quota``). Record-only — the mix upload is never
+    gated on the budget. Runs in its own short committed session.
+    """
+    async with async_session_factory() as session:
+        row = await session.get(AppSettings, 1)
+        if row is None:
+            row = AppSettings(id=1)
+            session.add(row)
+        sj = dict(row.settings_json or {})
+        quota = sj.get(YT_QUOTA_KEY) or {}
+        today = date.today().isoformat()
+        used = int(quota.get("used", 0)) if quota.get("date") == today else 0
+        sj[YT_QUOTA_KEY] = {"date": today, "used": used + YT_UPLOAD_QUOTA_COST}
+        row.settings_json = sj
+        await session.commit()
 
 
 def extract_youtube_video_id(url: str) -> str:
@@ -359,7 +402,16 @@ async def handle_analyze(
 async def handle_generate_description(
     mix_id: str, session: AsyncSession
 ) -> Optional[dict]:
-    """Generate descriptions, YouTube title, and tags."""
+    """Generate descriptions, YouTube title, and tags.
+
+    Lock hygiene: the creative-title draw flushes AIUsage + used_creative rows
+    (sqlite's single write lock is taken at first flush and held to COMMIT),
+    so it runs in its OWN short session committed before the remaining LLM
+    calls — otherwise the lock would be held across ~10-40s of OpenAI awaits,
+    starving every other writer past the 30s busy timeout. The follow-up LLM
+    calls track usage in a short session committed after each call, and the
+    caller's pipeline session only receives the cheap final field updates.
+    """
     mix = await _get_mix(mix_id, session)
     brand = await _get_brand_settings(session)
 
@@ -388,55 +440,63 @@ async def handle_generate_description(
     desc_gen = DescriptionGenerator(db_settings_json=sj)
     tag_gen = TagGenerator()
 
-    # Generate a creative SoundCloud title
+    # Generate a creative SoundCloud title. Its uniqueness claim + usage rows
+    # are committed in a short session of their own before any further await.
     raw_filename = Path(mix.audio_file_path).stem if mix.audio_file_path else "mix"
-    creative_title = await desc_gen.generate_creative_title(
-        genres=genres,
-        vibes=vibes,
-        tracklist=tracklist,
-        filename=raw_filename,
-        session=session,
-        mix_id=mix_id,
-    )
+    async with async_session_factory() as title_session:
+        creative_title = await desc_gen.generate_creative_title(
+            genres=genres,
+            vibes=vibes,
+            tracklist=tracklist,
+            filename=raw_filename,
+            session=title_session,
+            mix_id=mix_id,
+        )
+        await title_session.commit()
     mix.title = creative_title
 
-    # Generate all content
-    sc_desc = await desc_gen.generate_soundcloud_description(
-        mix_title=mix.title,
-        genres=genres,
-        vibes=vibes,
-        tracklist=tracklist,
-        energy_profile=energy_profile,
-        bpm_range=bpm_range,
-        duration_seconds=duration,
-        session=session,
-        mix_id=mix_id,
-        brand_settings=brand,
-    )
+    # Generate all content. Usage rows land in a short session committed right
+    # after each call, so no dirty session is held across an LLM await.
+    async with async_session_factory() as usage_session:
+        sc_desc = await desc_gen.generate_soundcloud_description(
+            mix_title=mix.title,
+            genres=genres,
+            vibes=vibes,
+            tracklist=tracklist,
+            energy_profile=energy_profile,
+            bpm_range=bpm_range,
+            duration_seconds=duration,
+            session=usage_session,
+            mix_id=mix_id,
+            brand_settings=brand,
+        )
+        await usage_session.commit()
 
-    yt_offset = mix.youtube_timestamp_offset or 0.0
-    yt_desc = await desc_gen.generate_youtube_description(
-        mix_title=mix.title,
-        genres=genres,
-        vibes=vibes,
-        tracklist=tracklist,
-        energy_profile=energy_profile,
-        bpm_range=bpm_range,
-        duration_seconds=duration,
-        session=session,
-        mix_id=mix_id,
-        brand_settings=brand,
-        youtube_timestamp_offset=yt_offset,
-    )
+        yt_offset = mix.youtube_timestamp_offset or 0.0
+        yt_desc = await desc_gen.generate_youtube_description(
+            mix_title=mix.title,
+            genres=genres,
+            vibes=vibes,
+            tracklist=tracklist,
+            energy_profile=energy_profile,
+            bpm_range=bpm_range,
+            duration_seconds=duration,
+            session=usage_session,
+            mix_id=mix_id,
+            brand_settings=brand,
+            youtube_timestamp_offset=yt_offset,
+        )
+        await usage_session.commit()
 
-    yt_title = await desc_gen.generate_youtube_title(
-        genres=genres,
-        vibes=vibes,
-        bpm_range=bpm_range,
-        duration_seconds=duration,
-        session=session,
-        mix_id=mix_id,
-    )
+        yt_title = await desc_gen.generate_youtube_title(
+            genres=genres,
+            vibes=vibes,
+            bpm_range=bpm_range,
+            duration_seconds=duration,
+            session=usage_session,
+            mix_id=mix_id,
+        )
+        await usage_session.commit()
 
     tags = tag_gen.generate(
         genres=genres,
@@ -468,7 +528,18 @@ async def handle_generate_description(
 async def handle_generate_art(
     mix_id: str, session: AsyncSession
 ) -> Optional[dict]:
-    """Generate cover art and YouTube thumbnail."""
+    """Generate cover art and YouTube thumbnail.
+
+    Lock hygiene: the uniqueness design draw DELETEs the mix's previous claims
+    and flushes new ones — sqlite's single write lock is taken at the first
+    flush and held to COMMIT — while each fal.ai generation can poll for up to
+    5 minutes. Holding the pipeline session across the generations starved
+    every other writer (shorts, backfill, activity log, catalog apply) past
+    the 30s busy timeout. So the design phase runs in its OWN short session
+    committed before any fal call, each generation's AIUsage row is committed
+    in a short session right after the call, and the caller's pipeline session
+    only receives the cheap final path updates.
+    """
     mix = await _get_mix(mix_id, session)
     brand = await _get_brand_settings(session)
 
@@ -492,36 +563,48 @@ async def handle_generate_art(
 
     # Uniqueness engine: a per-mix hook + varied scene, enforced unique by the
     # registry (releases this mix's own previous claims first) so no two
-    # thumbnails ever share hook text or a near-identical scene.
-    design = await thumbnail_design.unique_design_for_mix(mix, session, sj_art)
+    # thumbnails ever share hook text or a near-identical scene. Runs in its
+    # own short session, committed BEFORE any fal call; the Mix is re-fetched
+    # inside that session (never cross-attach ORM objects between sessions).
+    async with async_session_factory() as design_session:
+        design_mix = await _get_mix(mix_id, design_session)
+        design = await thumbnail_design.unique_design_for_mix(
+            design_mix, design_session, sj_art
+        )
+        await design_session.commit()
 
-    cover_result = await art_gen.generate_cover_art(
-        mix_title=mix.title,
-        genres=genres,
-        vibes=vibes,
-        output_path=cover_path,
-        session=session,
-        mix_id=mix_id,
-        brand_settings=brand,
-        hook_text=design["hook"],
-        scene_text=design["scene"],
-    )
+    # The generations run with no dirty session held: each call's AIUsage row
+    # is added after the image comes back and committed immediately.
+    async with async_session_factory() as art_session:
+        cover_result = await art_gen.generate_cover_art(
+            mix_title=mix.title,
+            genres=genres,
+            vibes=vibes,
+            output_path=cover_path,
+            session=art_session,
+            mix_id=mix_id,
+            brand_settings=brand,
+            hook_text=design["hook"],
+            scene_text=design["scene"],
+        )
+        await art_session.commit()
 
-    thumb_result = await art_gen.generate_youtube_thumbnail(
-        mix_title=mix.title_youtube or mix.title,
-        genres=genres,
-        vibes=vibes,
-        output_path=thumb_path,
-        cover_art_path=cover_path,
-        session=session,
-        mix_id=mix_id,
-        brand_settings=brand,
-        video_file_path=mix.video_file_path,
-        energy_profile=mix.energy_profile or [],
-        duration_seconds=mix.duration_seconds or 0.0,
-        hook_text=design["hook"],
-        scene_text=design["scene"],
-    )
+        thumb_result = await art_gen.generate_youtube_thumbnail(
+            mix_title=mix.title_youtube or mix.title,
+            genres=genres,
+            vibes=vibes,
+            output_path=thumb_path,
+            cover_art_path=cover_path,
+            session=art_session,
+            mix_id=mix_id,
+            brand_settings=brand,
+            video_file_path=mix.video_file_path,
+            energy_profile=mix.energy_profile or [],
+            duration_seconds=mix.duration_seconds or 0.0,
+            hook_text=design["hook"],
+            scene_text=design["scene"],
+        )
+        await art_session.commit()
 
     mix.cover_art_path = cover_result
     mix.thumbnail_path = thumb_result
@@ -589,7 +672,7 @@ async def handle_upload_soundcloud(
     sj_sc = (app_settings.settings_json or {}) if app_settings else {}
     uploader = SoundCloudUploader(
         db_settings_json=sj_sc,
-        on_tokens_refreshed=_sc_token_persister(session, app_settings),
+        on_tokens_refreshed=_sc_token_persister(app_settings),
         mix_id=mix_id,
     )
     await _emit_activity(
@@ -634,7 +717,7 @@ async def handle_verify_soundcloud(
     sj_v = (app_settings_v.settings_json or {}) if app_settings_v else {}
     uploader = SoundCloudUploader(
         db_settings_json=sj_v,
-        on_tokens_refreshed=_sc_token_persister(session, app_settings_v),
+        on_tokens_refreshed=_sc_token_persister(app_settings_v),
     )
     verified = await uploader.verify_upload(mix.soundcloud_url)
 
@@ -719,6 +802,17 @@ async def handle_upload_youtube(
     mix.youtube_url = result["video_url"]
     if result.get("playlist_id"):
         mix.youtube_playlist_id = result["playlist_id"]
+
+    # Charge the videos.insert to the shared daily quota ledger so shorts /
+    # catalog-apply budgeting sees the real spend. Best-effort: a ledger
+    # failure must never fail an upload that already succeeded.
+    try:
+        await _record_yt_upload_quota()
+    except Exception:  # pragma: no cover - defensive
+        logger.warning(
+            "Failed to record YouTube upload quota for mix %s", mix_id,
+            exc_info=True,
+        )
 
     await _emit_activity(
         "info", "upload_result", f"YouTube upload succeeded: {result['video_url']}",
@@ -949,7 +1043,7 @@ async def handle_cross_link(
 
                 sc_uploader = SoundCloudUploader(
                     db_settings_json=sj,
-                    on_tokens_refreshed=_sc_token_persister(session, app_settings),
+                    on_tokens_refreshed=_sc_token_persister(app_settings),
                     mix_id=mix_id,
                 )
                 await sc_uploader.update_description(sc_url, mix.description_soundcloud)
@@ -1059,7 +1153,7 @@ async def handle_reread_tracklist(mix_id: str, session: AsyncSession) -> Optiona
 
             sc = SoundCloudUploader(
                 db_settings_json=sj,
-                on_tokens_refreshed=_sc_token_persister(session, app_settings),
+                on_tokens_refreshed=_sc_token_persister(app_settings),
             )
             await sc.update_description(mix.soundcloud_url, mix.description_soundcloud)
             updated["soundcloud"] = True
