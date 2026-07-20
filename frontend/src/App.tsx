@@ -12,6 +12,7 @@ import Upgrade from './pages/Upgrade'
 import CatalogPage from './pages/CatalogPage'
 import CatalogMixEditor from './pages/CatalogMixEditor'
 import ReviewQueue from './pages/ReviewQueue'
+import ShortsPage from './pages/ShortsPage'
 
 export default function App() {
   return (
@@ -23,6 +24,7 @@ export default function App() {
         <Route path="/catalog" element={<CatalogPage />} />
         <Route path="/catalog/review" element={<ReviewQueue />} />
         <Route path="/catalog/:id" element={<CatalogMixEditor />} />
+        <Route path="/shorts" element={<ShortsPage />} />
         <Route path="/activity" element={<ActivityPage />} />
         <Route path="/brand" element={<BrandSettings />} />
         <Route path="/settings" element={<AppSettings />} />
