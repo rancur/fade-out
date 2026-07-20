@@ -91,6 +91,7 @@ class ArtGenerator:
         mix_id: Optional[str] = None,
         brand_settings: Optional[BrandSettings] = None,
         hook_text: Optional[str] = None,
+        scene_text: Optional[str] = None,
     ) -> str:
         """Generate 1400x1400 SoundCloud cover art (brand design system).
 
@@ -98,13 +99,14 @@ class ArtGenerator:
         focal subject + eye, square composition with the upper third kept for
         text) and the deterministic pixel-font overlay is composed on top with
         the text centered in the upper third. ``hook_text`` overrides the
-        motif's default <=3-word hook. Returns the saved file path.
+        motif's default <=3-word hook and ``scene_text`` overrides the motif's
+        base scene (per-mix uniqueness engine). Returns the saved file path.
         """
         genre_key = thumbnail_design.resolve_genre_key(genres)
         motif = thumbnail_design.GENRE_MOTIFS[genre_key]
         hook = hook_text or str(motif["hook"])
         prompt = thumbnail_design.build_scene_prompt(
-            genre_key, brand_settings, aspect="square"
+            genre_key, brand_settings, aspect="square", scene_override=scene_text
         )
         logger.info("Generating cover art for '%s' (%s): %s",
                     mix_title, genre_key, prompt[:120])
@@ -144,6 +146,7 @@ class ArtGenerator:
         energy_profile: Optional[List[Dict[str, Any]]] = None,
         duration_seconds: float = 0.0,
         hook_text: Optional[str] = None,
+        scene_text: Optional[str] = None,
     ) -> str:
         """Generate a 1280x720 YouTube thumbnail. Returns the saved file path.
 
@@ -156,7 +159,8 @@ class ArtGenerator:
              timestamp, if the AI providers fail.
           3. FALLBACK -- letterboxed cover art as a last resort.
         The brand overlay (``compose_thumbnail``) runs in every case;
-        ``hook_text`` overrides the motif's default <=3-word hook.
+        ``hook_text`` overrides the motif's default <=3-word hook and
+        ``scene_text`` overrides the motif's base scene (per-mix uniqueness).
         """
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
@@ -167,7 +171,7 @@ class ArtGenerator:
 
         # 1. Primary: brand design system scene + overlay.
         prompt = thumbnail_design.build_scene_prompt(
-            genre_key, brand_settings, aspect="wide"
+            genre_key, brand_settings, aspect="wide", scene_override=scene_text
         )
         image_url = await self._generate_with_fal(
             prompt, width=1280, height=720, session=session, mix_id=mix_id,
