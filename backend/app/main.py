@@ -117,12 +117,25 @@ async def lifespan(app: FastAPI):
     shorts_service = get_shorts_service()
     await shorts_service.start_watcher()
 
+    # Backfill self-heal: if the last tracklist backfill never completed (a
+    # restart/deploy killed it mid-run), restart it after a short settle
+    # delay. Gated by the backfill_auto_resume setting; safe because the
+    # backfill skips mixes that already have tracklists.
+    backfill_resume_task = asyncio.create_task(
+        catalog.kickoff_backfill_auto_resume()
+    )
+
     await activity_log.info("service_started", "fade-out started; watching for drops.")
 
     logger.info("Fade-Out is running.")
     yield
     logger.info("Fade-Out shutting down.")
     await shorts_service.stop_watcher()
+    backfill_resume_task.cancel()
+    try:
+        await backfill_resume_task
+    except asyncio.CancelledError:
+        pass
     retention_task.cancel()
     try:
         await retention_task

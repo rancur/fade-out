@@ -155,6 +155,15 @@ SETTINGS_SCHEMA: Tuple[SettingDef, ...] = (
         type="int", category="Pipeline", env_attr="PAIRING_WAIT_SECONDS", editable=False,
     ),
     SettingDef(
+        key="video_wait_max_checks",
+        label="Video wait ceiling (5-min polls)",
+        help="How many 5-minute polls the YouTube upload step waits for the "
+             "paired video to appear AND finish syncing before failing "
+             "(96 = 8 hours). A stalled OBS→NAS sync can take hours to recover.",
+        type="int", category="Pipeline", fallback=96,
+        min_value=1, max_value=2016,
+    ),
+    SettingDef(
         key="max_concurrent_pipelines",
         label="Max concurrent pipelines",
         help="Upper bound on pipelines processing at once. Read at startup — "
@@ -334,6 +343,15 @@ SETTINGS_SCHEMA: Tuple[SettingDef, ...] = (
         help="Push reciprocal YouTube/SoundCloud links into the LIVE published "
              "descriptions at the cross_link step (best-effort, never fails a run).",
         type="bool", category="Advanced", env_attr="CROSS_LINK_PUSH_ENABLED",
+    ),
+    SettingDef(
+        key="backfill_auto_resume",
+        label="Backfill auto-resume",
+        help="Restart an interrupted catalog tracklist backfill shortly after "
+             "boot (a deploy or container restart kills the run mid-way). Safe "
+             "to leave on: the backfill skips mixes that already have "
+             "tracklists.",
+        type="bool", category="Advanced", fallback=True,
     ),
     SettingDef(
         key="mixcloud_enabled",
