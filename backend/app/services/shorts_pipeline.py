@@ -75,7 +75,7 @@ from watchdog.observers import Observer
 from app.config import settings
 from app.database import async_session_factory
 from app.models import AIUsage, AppSettings, BrandSettings, Mix, Short
-from app.services import activity_log
+from app.services import activity_log, app_config
 from app.services.description_generator import DescriptionGenerator, price_for_model
 from app.services.file_watcher import (
     _compute_file_hash,
@@ -1186,7 +1186,11 @@ class ShortsService:
     # ------------------------------------------------------------------
 
     async def _quota_state(self, session) -> Tuple[int, int, Dict[str, Any]]:
-        """Return (used_today, budget, settings_json) from the shared ledger."""
+        """Return (used_today, budget, settings_json) from the shared ledger.
+
+        The budget resolves through app_config so a DB-set override is
+        honored (same as catalog_apply) — not just the env default.
+        """
         row = (
             await session.execute(select(AppSettings).where(AppSettings.id == 1))
         ).scalar_one_or_none()
@@ -1194,7 +1198,8 @@ class ShortsService:
         quota = sj.get(QUOTA_KEY) or {}
         today = date.today().isoformat()
         used = int(quota.get("used", 0)) if quota.get("date") == today else 0
-        return used, settings.YOUTUBE_DAILY_QUOTA_BUDGET, sj
+        budget = int(await app_config.resolve("youtube_daily_quota_budget"))
+        return used, budget, sj
 
     async def _uploads_today(self, session) -> int:
         midnight = datetime.combine(date.today(), dt_time.min)
@@ -1211,9 +1216,10 @@ class ShortsService:
     ) -> Tuple[bool, str]:
         """Cap + shared-quota gate for one more videos.insert (1600 units)."""
         uploaded_today = await self._uploads_today(session)
-        if not ignore_cap and uploaded_today >= settings.SHORTS_DAILY_UPLOAD_CAP:
+        daily_cap = int(await app_config.resolve("shorts_daily_upload_cap"))
+        if not ignore_cap and uploaded_today >= daily_cap:
             return False, (
-                f"daily cap reached ({uploaded_today}/{settings.SHORTS_DAILY_UPLOAD_CAP})"
+                f"daily cap reached ({uploaded_today}/{daily_cap})"
             )
         used, budget, _ = await self._quota_state(session)
         if used + YT_SHORT_UPLOAD_COST > budget:
@@ -1362,10 +1368,11 @@ class ShortsService:
                 )
             ).all()
             counts = {status: n for status, n in counts_rows}
+        daily_cap = int(await app_config.resolve("shorts_daily_upload_cap"))
         return {
             "uploaded_today": uploaded_today,
-            "daily_cap": settings.SHORTS_DAILY_UPLOAD_CAP,
-            "cap_reached": uploaded_today >= settings.SHORTS_DAILY_UPLOAD_CAP,
+            "daily_cap": daily_cap,
+            "cap_reached": uploaded_today >= daily_cap,
             "queued": counts.get("queued", 0),
             "quota_used": used,
             "quota_budget": budget,
