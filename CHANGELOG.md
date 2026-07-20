@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.2.0 — 2026-07-19
+
+### YouTube Shorts auto-uploader
+- New Shorts tab: watches the Vertical Backtrack folder, verifies 9:16 ≤3-min
+  clips, Shazams the drop, writes algorithm-optimized titles/descriptions/
+  hashtags (hook-first titles, ≤15 hashtags incl. #shorts), and uploads via the
+  API — quota-budgeted at 3/day with an oldest-first backlog queue and a
+  channel-dedupe scan for clips already uploaded.
+
+### Uniqueness engine
+- No repeated creative anywhere: a registry (titles / thumbnail hooks / scene
+  descriptors) with similarity guards backs every generator. Thumbnail hook
+  text is now drafted per mix (never a shared genre label like "ALL VIBES"),
+  scenes get deterministic per-mix variation, and titles are enforced unique
+  across the pipeline, catalog improve, and apply.
+
+### Settings overhaul
+- Schema-driven Settings page: 34 settings across Paths/Pipeline/AI/YouTube/
+  SoundCloud/Activity/Advanced editable in-app (DB-over-env with cached
+  resolve), secrets strictly write-only, effective watch/output paths shown
+  with deploy hints. Fixed a legacy endpoint that leaked stored secrets.
+
 ## v2.1.0 — 2026-07-19
 
 The discoverability release.
