@@ -480,11 +480,17 @@ async def handle_generate_art(
     cover_path = os.path.join(cover_dir, f"{mix_id}.jpg")
     thumb_path = os.path.join(thumb_dir, f"{mix_id}.jpg")
 
+    from app.services import thumbnail_design
     from app.services.art_generator import ArtGenerator
 
     app_settings_art = await _get_app_settings(session)
     sj_art = (app_settings_art.settings_json or {}) if app_settings_art else {}
     art_gen = ArtGenerator(db_settings_json=sj_art)
+
+    # Uniqueness engine: a per-mix hook + varied scene, enforced unique by the
+    # registry (releases this mix's own previous claims first) so no two
+    # thumbnails ever share hook text or a near-identical scene.
+    design = await thumbnail_design.unique_design_for_mix(mix, session, sj_art)
 
     cover_result = await art_gen.generate_cover_art(
         mix_title=mix.title,
@@ -494,6 +500,8 @@ async def handle_generate_art(
         session=session,
         mix_id=mix_id,
         brand_settings=brand,
+        hook_text=design["hook"],
+        scene_text=design["scene"],
     )
 
     thumb_result = await art_gen.generate_youtube_thumbnail(
@@ -508,6 +516,8 @@ async def handle_generate_art(
         video_file_path=mix.video_file_path,
         energy_profile=mix.energy_profile or [],
         duration_seconds=mix.duration_seconds or 0.0,
+        hook_text=design["hook"],
+        scene_text=design["scene"],
     )
 
     mix.cover_art_path = cover_result
@@ -516,6 +526,7 @@ async def handle_generate_art(
     return {
         "cover_art_path": cover_result,
         "thumbnail_path": thumb_result,
+        "hook_text": design["hook"].replace("\n", " "),
     }
 
 
