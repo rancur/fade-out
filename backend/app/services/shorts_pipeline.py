@@ -702,27 +702,51 @@ class ShortsService:
     # Analyze + metadata
     # ------------------------------------------------------------------
 
+    async def _load_short(self, session, short_id: str) -> Short:
+        short = (
+            await session.execute(select(Short).where(Short.id == short_id))
+        ).scalar_one_or_none()
+        if short is None:
+            raise RuntimeError(f"Short {short_id} not found")
+        return short
+
     async def process_short(self, short_id: str, auto_upload: bool = True) -> str:
         """Run analyze -> catalog dedupe -> track ID -> metadata -> (upload).
 
         Returns the resulting status string.
-        """
-        async with async_session_factory() as session:
-            short = (
-                await session.execute(select(Short).where(Short.id == short_id))
-            ).scalar_one_or_none()
-            if short is None:
-                raise RuntimeError(f"Short {short_id} not found")
 
+        Session discipline (same pattern as catalog_playlists._save_placement
+        and catalog_backfill._backfill_one): sqlite holds its single write
+        lock from the first flushed write until COMMIT, so a session must
+        NEVER be held — least of all with dirty writes pending — across the
+        long awaits in here (ffprobe subprocess, ffmpeg + Shazam track ID).
+        Previously one session spanned this whole method and the probe-field
+        writes stayed dirty (autoflushed by the catalog-dedupe SELECT) across
+        ``identify_track``, blocking every other writer for the duration.
+        Each phase now opens its own short-lived session and commits
+        immediately; the analysis awaits run with no session open at all.
+        """
+        # Phase 1: claim the row (short session, commit, close).
+        async with async_session_factory() as session:
+            short = await self._load_short(session, short_id)
             short.status = "analyzing"
             short.error = None
             await session.commit()
+            file_path = short.file_path
 
-            try:
-                probe = await ffprobe_clip(short.file_path)
-            except Exception as exc:
+        # Phase 2: probe — no session held across the subprocess.
+        try:
+            probe = await ffprobe_clip(file_path)
+        except Exception as exc:
+            async with async_session_factory() as session:
+                short = await self._load_short(session, short_id)
                 return await self._fail(session, short, f"ffprobe failed: {exc}")
 
+        # Phase 3: store probe results, eligibility gates, catalog dedupe.
+        # (The dedupe SELECT autoflushes the dirty probe fields — that write
+        # lock spans only this quick local query and the immediate commit.)
+        async with async_session_factory() as session:
+            short = await self._load_short(session, short_id)
             short.duration_seconds = probe["duration"]
             short.width = probe["width"]
             short.height = probe["height"]
@@ -746,7 +770,7 @@ class ShortsService:
             # channel (imported by catalog sync). Match by duration + date and
             # link the existing video instead of double-uploading.
             matched = await self._match_catalog(
-                session, probe["duration"], parse_recording_date(short.file_path)
+                session, probe["duration"], parse_recording_date(file_path)
             )
             if matched is not None:
                 short.youtube_video_id = matched.youtube_video_id
@@ -762,8 +786,16 @@ class ShortsService:
                     f"already on channel (matched catalog mix '{matched.title}')",
                     event="shorts_skipped",
                 )
+            await session.commit()
 
-            artist, title = await identify_track(short.file_path, probe["duration"])
+        # Phase 4: track ID — ffmpeg extract + Shazam with NO session open.
+        artist, title = await identify_track(file_path, probe["duration"])
+
+        # Phase 5: persist track ID, metadata, status, optional upload. The
+        # LLM/upload awaits below run with all prior writes committed (only a
+        # WAL-safe read transaction may be open across them).
+        async with async_session_factory() as session:
+            short = await self._load_short(session, short_id)
             short.track_artist = artist
             short.track_title = title
             await session.commit()
