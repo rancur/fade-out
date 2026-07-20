@@ -357,6 +357,20 @@ async def _backfill_one(mix_id: str, file_info: Dict[str, Any], reason: str) -> 
     """Analyze one matched (mix, file) pair and draft the description refresh.
 
     Returns ``{"tracks_found": n, "proposals_created": n}``.
+
+    Session discipline (same pattern as catalog_playlists._save_placement):
+    sqlite holds its single write lock from the first flushed write until
+    COMMIT, and Shazam fingerprinting a 2-hour set takes ~10 minutes — a
+    session held across the analysis would block every other writer (activity
+    log, used_creative claims, concurrent jobs) for the whole run. So:
+
+    (a) ``audio_file_path`` is assigned + committed in its OWN short session
+        BEFORE the analysis;
+    (b) ``analyze_audio_with_cue`` runs with NO session held (it takes no
+        session — its activity events open their own short-lived ones);
+    (c) results + proposals are written in a FRESH short session afterward.
+
+    Regression-guarded by ``test_no_session_held_during_analysis``.
     """
     from app.services import handlers
 
@@ -369,6 +383,7 @@ async def _backfill_one(mix_id: str, file_info: Dict[str, Any], reason: str) -> 
         context={"reason": reason},
     )
 
+    # (a) short session: link the audio file, commit, close.
     async with async_session_factory() as session:
         mix = await session.get(Mix, mix_id)
         if mix is None:
@@ -376,10 +391,12 @@ async def _backfill_one(mix_id: str, file_info: Dict[str, Any], reason: str) -> 
         mix.audio_file_path = file_info["path"]
         await session.commit()
 
+    # (b) the long analysis runs with no session (and no txn) open.
     result, tracklist, source = await handlers.analyze_audio_with_cue(
         file_info["path"], mix_id=mix_id
     )
 
+    # (c) fresh short session: persist results + draft proposals.
     proposals_created = 0
     async with async_session_factory() as session:
         mix = await session.get(Mix, mix_id)
