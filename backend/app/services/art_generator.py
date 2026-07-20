@@ -74,7 +74,8 @@ class ArtGenerator:
     def __init__(self, db_settings_json: Optional[Dict[str, Any]] = None) -> None:
         sj = db_settings_json or {}
         self._fal_api_key = sj.get("fal_api_key") or settings.FAL_API_KEY
-        self._fal_model = settings.FAL_MODEL
+        # DB-configured model (Settings page) wins; env is the fallback.
+        self._fal_model = sj.get("image_gen_model") or settings.FAL_MODEL
         self._openai_api_key = sj.get("openai_api_key") or settings.OPENAI_API_KEY
 
     # ------------------------------------------------------------------

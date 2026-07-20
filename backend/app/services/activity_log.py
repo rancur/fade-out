@@ -203,12 +203,12 @@ async def prune(
     Returns {"deleted_by_age": n, "deleted_by_cap": m}. Best-effort — never
     raises (it runs from a background task).
     """
-    from app.config import settings as app_settings
+    from app.services import app_config
 
     if retention_days is None:
-        retention_days = app_settings.ACTIVITY_RETENTION_DAYS
+        retention_days = int(await app_config.resolve("activity_retention_days"))
     if max_rows is None:
-        max_rows = app_settings.ACTIVITY_MAX_ROWS
+        max_rows = int(await app_config.resolve("activity_max_rows"))
 
     result = {"deleted_by_age": 0, "deleted_by_cap": 0}
     try:

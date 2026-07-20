@@ -204,7 +204,8 @@ class DescriptionGenerator:
         sj = db_settings_json or {}
         api_key = sj.get("openai_api_key") or settings.OPENAI_API_KEY
         self._client = openai.AsyncOpenAI(api_key=api_key)
-        self._model = settings.OPENAI_MODEL
+        # DB-configured model (Settings page) wins; env is the fallback.
+        self._model = sj.get("llm_model") or settings.OPENAI_MODEL
 
     async def _create_completion(
         self, prompt: str, max_tokens: int, temperature: float
