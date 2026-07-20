@@ -6,14 +6,14 @@ the Shazam track ID, the LLM-generated title/description/tags, the YouTube
 upload result, and a status lifecycle
 (detected|analyzing|ready|queued|uploading|uploaded|failed|skipped).
 
-MERGE-ORDER NOTE: ``down_revision`` points at ``0006_add_uniqueness_registry``
+MERGE-ORDER NOTE: ``down_revision`` points at ``0006_add_used_creative``
 which lives in the parallel uniqueness-registry PR and is NOT present on this
 branch. That PR must merge FIRST — until it does, the alembic chain on this
 branch alone is intentionally dangling (the migration tests skip with a clear
 reason instead of failing).
 
 Revision ID: 0007_add_shorts
-Revises: 0006_add_uniqueness_registry
+Revises: 0006_add_used_creative
 Create Date: 2026-07-19
 """
 from typing import Sequence, Union
@@ -22,7 +22,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision: str = "0007_add_shorts"
-down_revision: Union[str, None] = "0006_add_uniqueness_registry"
+down_revision: Union[str, None] = "0006_add_used_creative"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

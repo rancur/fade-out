@@ -425,8 +425,9 @@ class TestRegenThumbnailsEndpoint:
 
         received = {}
 
-        async def fake_run(mix_ids=None):
+        async def fake_run(mix_ids=None, force_unique=True):
             received["mix_ids"] = mix_ids
+            received["force_unique"] = force_unique
             return {}
 
         monkeypatch.setattr(thumbs_mod, "run_regen_thumbnails", fake_run)
@@ -437,6 +438,7 @@ class TestRegenThumbnailsEndpoint:
         assert resp.json()["status"] == "started"
         await asyncio.sleep(0)
         assert received["mix_ids"] == ["a"]
+        assert received["force_unique"] is True  # uniqueness engine on by default
 
         status = await client.get("/api/catalog/regen-thumbnails/status")
         assert status.status_code == 200
@@ -451,7 +453,7 @@ class TestRegenThumbnailsEndpoint:
 
         received = {}
 
-        async def fake_run(mix_ids=None):
+        async def fake_run(mix_ids=None, force_unique=True):
             received["mix_ids"] = mix_ids
             return {}
 
@@ -476,7 +478,7 @@ class TestRegenThumbnailsEndpoint:
 
         release = asyncio.Event()
 
-        async def slow_run(mix_ids=None):
+        async def slow_run(mix_ids=None, force_unique=True):
             await release.wait()
             return {}
 
@@ -563,7 +565,7 @@ class TestOrganizePlaylistsEndpoint:
 
         release = asyncio.Event()
 
-        async def slow_run(mix_ids=None):
+        async def slow_run(mix_ids=None, force_unique=True):
             await release.wait()
             return {}
 

@@ -164,12 +164,16 @@ RULES:
 - Do NOT just list genres -- weave them into something evocative
 - One title only, no alternatives, no explanation
 
+TITLES ALREADY IN USE — every one of these is FORBIDDEN, and do not write
+anything close to them:
+{used_titles_block}
+
 MIX DATA:
 - Raw filename: {filename}
 - Genres: {genres}
 - Vibes: {vibes}
 {tracklist_hint}
-
+{retry_feedback}
 Return ONLY the title, nothing else.\
 """
 
@@ -204,7 +208,8 @@ class DescriptionGenerator:
         sj = db_settings_json or {}
         api_key = sj.get("openai_api_key") or settings.OPENAI_API_KEY
         self._client = openai.AsyncOpenAI(api_key=api_key)
-        self._model = settings.OPENAI_MODEL
+        # DB-configured model (Settings page) wins; env is the fallback.
+        self._model = sj.get("llm_model") or settings.OPENAI_MODEL
 
     async def _create_completion(
         self, prompt: str, max_tokens: int, temperature: float
@@ -339,7 +344,16 @@ class DescriptionGenerator:
         session: Optional[AsyncSession] = None,
         mix_id: Optional[str] = None,
     ) -> str:
-        """Generate a creative, artistic mix title for SoundCloud."""
+        """Generate a creative, artistic mix title for SoundCloud.
+
+        Uniqueness is system-enforced when a ``session`` is provided: recent
+        already-used titles are fed into the prompt, every draft is checked
+        against the ``used_creative`` registry (exact + fuzzy), collisions
+        retry with feedback, a stubborn collision gets a deterministic
+        volume-numeral suffix, and the accepted title is claimed.
+        """
+        from app.services import uniqueness
+
         # Build a tracklist hint (first few artists for inspiration)
         tracklist_hint = ""
         if tracklist:
@@ -347,31 +361,85 @@ class DescriptionGenerator:
             if artists:
                 tracklist_hint = f"- Key artists: {', '.join(artists[:6])}"
 
-        prompt = CREATIVE_TITLE_PROMPT.format(
-            brand_name=settings.BRAND_NAME,
-            filename=filename,
-            genres=", ".join(genres),
-            vibes=", ".join(vibes),
-            tracklist_hint=tracklist_hint,
-        )
-
-        response, text = await self._create_completion(
-            prompt, max_tokens=80, temperature=0.9,
-        )
-
-        title = text.strip('"').strip("'")
-
-        # Enforce 60-char limit
-        if len(title) > 60:
-            title = title[:57] + "..."
-
-        # Track usage
-        if session and mix_id:
-            await self._track_usage(
-                session, mix_id, "creative_title",
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
+        used_titles: List[str] = []
+        if session is not None:
+            used_titles = await uniqueness.recent_values(
+                session, uniqueness.KIND_TITLE, limit=40
             )
+
+        title = ""
+        rejected: List[str] = []
+        for attempt in range(3):
+            used_block = (
+                "\n".join(f"- {t}" for t in [*used_titles, *rejected]) or "(none)"
+            )
+            feedback = ""
+            if rejected:
+                feedback = (
+                    f'\nYOUR PREVIOUS ATTEMPT "{rejected[-1]}" WAS REJECTED: that '
+                    "title is already used. Produce a COMPLETELY different title "
+                    "— different words, different structure.\n"
+                )
+            prompt = CREATIVE_TITLE_PROMPT.format(
+                brand_name=settings.BRAND_NAME,
+                filename=filename,
+                genres=", ".join(genres),
+                vibes=", ".join(vibes),
+                tracklist_hint=tracklist_hint,
+                used_titles_block=used_block,
+                retry_feedback=feedback,
+            )
+
+            response, text = await self._create_completion(
+                prompt, max_tokens=80, temperature=0.9,
+            )
+
+            title = text.strip('"').strip("'")
+
+            # Enforce 60-char limit
+            if len(title) > 60:
+                title = title[:57] + "..."
+
+            # Track usage
+            if session and mix_id:
+                await self._track_usage(
+                    session, mix_id, "creative_title",
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                )
+
+            if session is None or not await uniqueness.is_taken(
+                session, uniqueness.KIND_TITLE, title, exclude_mix_id=mix_id
+            ):
+                break
+            rejected.append(title)
+            logger.info(
+                "Creative title %r already taken (attempt %d); retrying",
+                title, attempt + 1,
+            )
+        else:
+            # Hard guarantee: deterministic volume-numeral suffix until free.
+            base = title
+            for n, numeral in enumerate(
+                ("II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"), start=2
+            ):
+                candidate = f"{base[:60 - len(numeral) - 1].rstrip()} {numeral}"
+                # Exact-only: "Base II" must not fuzzy-collide with "Base".
+                if not await uniqueness.is_taken(
+                    session, uniqueness.KIND_TITLE, candidate,
+                    exclude_mix_id=mix_id, fuzzy=False,
+                ):
+                    title = candidate
+                    break
+            else:
+                suffix = (mix_id or "X")[:4].upper()
+                title = f"{base[:60 - len(suffix) - 1].rstrip()} {suffix}"
+            logger.warning(
+                "Creative title kept colliding; accepted suffixed title %r", title
+            )
+
+        if session is not None:
+            await uniqueness.claim(session, uniqueness.KIND_TITLE, title, mix_id)
 
         logger.info("Generated creative title: %s", title)
         return title
