@@ -236,6 +236,44 @@ async def sync_status(db: AsyncSession = Depends(get_db)):
 
 # --- Tracklist backfill ---
 
+# Post-boot settle delay before an auto-resumed backfill starts, so the file
+# watchers, DB init, and the rest of startup are done competing for sqlite.
+BACKFILL_AUTO_RESUME_DELAY_SECONDS = 60.0
+
+
+async def kickoff_backfill_auto_resume(
+    delay_seconds: float = BACKFILL_AUTO_RESUME_DELAY_SECONDS,
+) -> bool:
+    """Boot self-heal: restart a backfill the last shutdown killed mid-run.
+
+    Called from the app lifespan as a background task. Fires only when the
+    ``backfill_auto_resume`` setting is on AND the persisted last-run summary
+    never reached completion (status ``running``/``cancelled`` — see
+    ``catalog_backfill.last_run_incomplete``). The restart goes through the
+    same ``_backfill_task`` handle as the manual endpoint, so single-flight
+    and ``/backfill-status`` reporting keep working. Returns True when a
+    resume was started.
+    """
+    global _backfill_task
+    from app.services import activity_log, app_config
+    from app.services.catalog_backfill import last_run_incomplete, run_backfill
+
+    if not bool(await app_config.resolve("backfill_auto_resume")):
+        return False
+    if not await last_run_incomplete():
+        return False
+    await asyncio.sleep(delay_seconds)
+    if _backfill_task and not _backfill_task.done():
+        return False  # manually (re)triggered during the settle delay
+    logger.info("Auto-resuming interrupted tracklist backfill")
+    await activity_log.info(
+        "catalog_backfill",
+        "Last tracklist backfill never completed (restart/deploy) — "
+        "auto-resuming.",
+    )
+    _backfill_task = _spawn("backfill", run_backfill())
+    return True
+
 
 @router.post("/backfill-tracklists", status_code=202)
 async def trigger_backfill(body: Optional[BackfillBody] = None):

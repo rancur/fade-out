@@ -13,7 +13,11 @@ from app.config import settings
 from app.database import async_session_factory
 from app.models import AppSettings, BrandSettings, Mix
 from app.services import app_config
-from app.services.pipeline import PipelineOrchestrator, VideoNotReady
+from app.services.pipeline import (
+    PipelineOrchestrator,
+    VideoNotReady,
+    check_video_complete,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -768,6 +772,26 @@ async def handle_upload_youtube(
         raise VideoNotReady(
             f"Video file not available: {mix.video_file_path!r}"
         )
+
+    # Completeness gate: existing is NOT enough. A stalled OBS→NAS sync
+    # leaves a partial file (prod incident: an MKV holding 10m40s of a
+    # ~115-minute set, ffprobe duration=N/A, "File ended prematurely") and
+    # this handler would have uploaded it. Never upload a partial video —
+    # raise VideoNotReady so the orchestrator's 5-minute poll re-checks until
+    # the sync finishes, or the wait ceiling fails the step with this same
+    # reason. The probe is subprocess-only and nothing has been written on
+    # this session yet, so no write transaction spans it.
+    complete, incomplete_reason = await check_video_complete(
+        mix.video_file_path, mix.duration_seconds
+    )
+    if not complete:
+        await _emit_activity(
+            "warn", "video_incomplete",
+            f"YouTube upload waiting on video sync: {incomplete_reason}",
+            mix_id=mix_id, platform="youtube",
+            context={"video_file_path": mix.video_file_path},
+        )
+        raise VideoNotReady(incomplete_reason)
 
     from app.services.tag_generator import TagGenerator
     from app.services.youtube_uploader import YouTubeUploader
