@@ -192,6 +192,29 @@ class ActivityEvent(Base):
     context = Column(JSON, nullable=True)  # arbitrary structured detail
 
 
+class UsedCreative(Base):
+    """Uniqueness registry: every creative value the system has ever committed.
+
+    One row per claimed title / thumbnail hook / scene descriptor, so nothing
+    creative is ever repeated across the catalog ("EVERYTHING unique" — Will).
+    ``value_normalized`` (lowercased, punctuation-stripped, series prefix
+    removed for titles) is the comparison key; ``value_raw`` keeps the original
+    for display. ``mix_id`` ties a claim to its mix so regeneration can release
+    and re-claim without colliding with the mix's own previous values.
+    """
+
+    __tablename__ = "used_creative"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    kind = Column(String, nullable=False, index=True)  # title | hook | scene
+    value_normalized = Column(String, nullable=False, index=True)
+    value_raw = Column(Text, nullable=False)
+    mix_id = Column(
+        String, ForeignKey("mixes.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class AppSettings(Base):
     __tablename__ = "app_settings"
 
