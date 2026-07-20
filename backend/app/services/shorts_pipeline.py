@@ -22,10 +22,14 @@ that must be ignored). Every new stable ``.mp4``:
    pass picks it up on a later day.
 
 Backlog import: ``scan()`` ingests every not-yet-seen file in the folder.
-Because ~23 of the existing clips are already on the channel, the analyze
-step runs a dedupe pass against catalog mixes with duration <= 185s (synced
-YouTube uploads): a duration+date match becomes ``skipped`` with the existing
-``youtube_video_id`` linked (the user can un-skip to force an upload).
+Because some of the existing clips are already on the channel, the scan runs
+a ONE-TO-ONE dedupe pass against catalog mixes with duration <= 185s (synced
+YouTube uploads): pairs are scored ``duration_diff + 0.5 * day_diff`` (both
+gates required — see the DEDUPE_* constants) and assigned greedily, each
+channel video claiming at most one clip and vice versa. A matched clip
+becomes ``skipped`` with the existing ``youtube_video_id`` linked (the user
+can un-skip to force an upload); a re-scan re-derives the links, so a
+better-scoring clip can take a video id from an earlier weaker match.
 
 ---------------------------------------------------------------------------
 YouTube Shorts algorithm playbook (researched 2026-07) — encoded in the
@@ -96,12 +100,22 @@ SHAZAM_CLIP_SECONDS = 12
 SHAZAM_TRANSIENT_RETRIES = 2
 SHAZAM_RETRY_BACKOFF = 1.5
 
-# Catalog dedupe: a backlog clip counts as "already on the channel" when a
-# catalog mix with a YouTube id has (a) duration within this tolerance and
-# (b) a compatible date (published on/after the recording date when both are
-# known). 2s absorbs container/rounding differences between the local mp4 and
-# what YouTube reports for the same upload.
-DEDUPE_DURATION_TOLERANCE = 2.0
+# Catalog dedupe: a backlog clip counts as "already on the channel" only when
+# a catalog mix with a YouTube id matches BOTH gates:
+#   * duration within DEDUPE_DURATION_TOLERANCE (absorbs container/rounding
+#     differences between the local mp4 and what YouTube reports), AND
+#   * |published_at - recording date| within DEDUPE_MAX_DAY_DIFF days (both
+#     dates are required — a clip with no parseable recording date or a mix
+#     with no published date never dedupe-matches).
+# Pair quality is scored ``duration_diff + DEDUPE_DAY_WEIGHT * day_diff``
+# (lower = better) and assignment is strictly ONE-TO-ONE: each channel video
+# claims at most one clip and vice versa, best score first. The per-clip
+# duration±date test alone once matched 52 of 89 backlog clips onto just 3
+# distinct video ids (dozens of similar-length Backtrack clips all "matched"
+# the same few uploads) — hence the one-to-one greedy assignment.
+DEDUPE_DURATION_TOLERANCE = 2.5
+DEDUPE_MAX_DAY_DIFF = 5.0
+DEDUPE_DAY_WEIGHT = 0.5
 # Only mixes at/below this duration are Short-shaped candidates (185 gives 5s
 # of slack over the 180s Shorts ceiling for YouTube's rounded durations).
 DEDUPE_MAX_MIX_DURATION = 185.0
@@ -173,6 +187,48 @@ def parse_recording_date(file_path: str) -> Optional[datetime]:
         return datetime(*(int(g) for g in m.groups()))
     except ValueError:
         return None
+
+
+def _mix_published_at(mix: Mix) -> Optional[datetime]:
+    """Naive-UTC YouTube published_at from a mix's catalog metadata, or None."""
+    raw = (
+        ((mix.metadata_json or {}).get("catalog") or {})
+        .get("youtube", {})
+        .get("published_at")
+    )
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(
+            tzinfo=None
+        )
+    except ValueError:
+        return None
+
+
+def _match_score(
+    clip_duration: float, recorded_at: Optional[datetime], mix: Mix
+) -> Optional[float]:
+    """Score a (clip, channel-video) dedupe pair; None = not a valid pair.
+
+    Both gates are required: duration diff <= DEDUPE_DURATION_TOLERANCE and
+    |published - recorded| <= DEDUPE_MAX_DAY_DIFF (so both dates must exist).
+    Lower score = better match: duration_diff + DEDUPE_DAY_WEIGHT * day_diff.
+    """
+    if mix.duration_seconds is None:
+        return None
+    duration_diff = abs(mix.duration_seconds - clip_duration)
+    if duration_diff > DEDUPE_DURATION_TOLERANCE:
+        return None
+    if recorded_at is None:
+        return None
+    published = _mix_published_at(mix)
+    if published is None:
+        return None
+    day_diff = abs((published - recorded_at).total_seconds()) / 86400.0
+    if day_diff > DEDUPE_MAX_DAY_DIFF:
+        return None
+    return duration_diff + DEDUPE_DAY_WEIGHT * day_diff
 
 
 # ---------------------------------------------------------------------------
@@ -619,11 +675,21 @@ class ShortsService:
     async def scan(self) -> Dict[str, Any]:
         """Backlog import: ingest + process every not-yet-seen .mp4 in the folder.
 
-        Files are processed oldest-first (the Backtrack filename embeds the
-        recording timestamp, so a name sort is a date sort). Auto-upload
-        respects the daily cap, so a large backlog lands mostly ``queued``
-        (or ``skipped`` via the catalog dedupe) and drains over the following
-        days. Summary persists in AppSettings.settings_json[LAST_SCAN_KEY].
+        Three phases, so the catalog dedupe sees the WHOLE backlog at once:
+
+        1. Ingest + analyze (ffprobe/eligibility) every new file, oldest first
+           (the Backtrack filename embeds the recording timestamp, so a name
+           sort is a date sort).
+        2. One-to-one catalog dedupe across all analyzed clips — including
+           previously catalog-skipped rows, whose links are re-derived so a
+           better-scoring new clip can claim a video id (the loser re-enters
+           the pipeline). Per-clip matching here once linked 52 clips to only
+           3 distinct video ids; see :meth:`dedupe_backlog`.
+        3. Track-ID + metadata + upload for everything left unmatched.
+           Auto-upload respects the daily cap, so a large backlog lands
+           mostly ``queued`` and drains over the following days.
+
+        Summary persists in AppSettings.settings_json[LAST_SCAN_KEY].
         """
         async with self._scan_lock:
             summary: Dict[str, Any] = {
@@ -633,6 +699,7 @@ class ShortsService:
                 "already_known": 0,
                 "ingested": 0,
                 "catalog_matched": 0,
+                "requeued": 0,
                 "errors": [],
             }
             await self._persist_scan_summary(summary)
@@ -651,6 +718,7 @@ class ShortsService:
                 await self._persist_scan_summary(summary)
                 return summary
 
+            # Phase 1: ingest + analyze (no dedupe, no upload yet).
             for f in files:
                 summary["files_seen"] += 1
                 try:
@@ -663,11 +731,43 @@ class ShortsService:
                     continue
                 summary["ingested"] += 1
                 try:
-                    status = await self.process_short(short_id)
-                    if status == "skipped":
-                        summary["catalog_matched"] += 1
+                    await self._analyze_short(short_id, leave_pending=True)
                 except Exception as exc:
                     summary["errors"].append(f"{f.name}: {exc}")
+                await self._persist_scan_summary(summary)
+
+            # Phase 2: global one-to-one dedupe against the channel catalog.
+            try:
+                dedupe = await self.dedupe_backlog()
+                summary["catalog_matched"] = dedupe["linked"]
+                summary["requeued"] = dedupe["unlinked"]
+            except Exception as exc:
+                summary["errors"].append(f"dedupe: {exc}")
+            await self._persist_scan_summary(summary)
+
+            # Phase 3: finish every analyzed-but-unmatched clip (status
+            # ``detected`` with probe data), oldest first — including rows a
+            # better clip just unlinked in phase 2.
+            async with async_session_factory() as session:
+                pending_ids = (
+                    (
+                        await session.execute(
+                            select(Short.id)
+                            .where(
+                                Short.status == "detected",
+                                Short.duration_seconds.isnot(None),
+                            )
+                            .order_by(Short.detected_at.asc(), Short.id.asc())
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+            for short_id in pending_ids:
+                try:
+                    await self._finish_short(short_id)
+                except Exception as exc:
+                    summary["errors"].append(f"{short_id}: {exc}")
                 await self._persist_scan_summary(summary)
 
             summary["status"] = "ok" if not summary["errors"] else "partial"
@@ -678,7 +778,8 @@ class ShortsService:
                 (
                     f"Shorts scan finished: {summary['ingested']} ingested, "
                     f"{summary['already_known']} already known, "
-                    f"{summary['catalog_matched']} matched to existing channel uploads."
+                    f"{summary['catalog_matched']} matched to existing channel "
+                    f"uploads, {summary['requeued']} requeued."
                 ),
                 platform="youtube",
                 context=summary,
@@ -713,65 +814,23 @@ class ShortsService:
     async def process_short(self, short_id: str, auto_upload: bool = True) -> str:
         """Run analyze -> catalog dedupe -> track ID -> metadata -> (upload).
 
-        Returns the resulting status string.
-
-        Session discipline (same pattern as catalog_playlists._save_placement
-        and catalog_backfill._backfill_one): sqlite holds its single write
-        lock from the first flushed write until COMMIT, so a session must
-        NEVER be held — least of all with dirty writes pending — across the
-        long awaits in here (ffprobe subprocess, ffmpeg + Shazam track ID).
-        Previously one session spanned this whole method and the probe-field
-        writes stayed dirty (autoflushed by the catalog-dedupe SELECT) across
-        ``identify_track``, blocking every other writer for the duration.
-        Each phase now opens its own short-lived session and commits
-        immediately; the analysis awaits run with no session open at all.
+        Returns the resulting status string. This is the single-clip path
+        (watcher drops, un-skip); the backlog ``scan()`` runs the same steps
+        but batches the dedupe across all clips at once.
         """
-        # Phase 1: claim the row (short session, commit, close).
-        async with async_session_factory() as session:
-            short = await self._load_short(session, short_id)
-            short.status = "analyzing"
-            short.error = None
-            await session.commit()
-            file_path = short.file_path
-
-        # Phase 2: probe — no session held across the subprocess.
-        try:
-            probe = await ffprobe_clip(file_path)
-        except Exception as exc:
+        probe = await self._analyze_short(short_id)
+        if probe is None:
+            # Terminal in analysis (skipped for shape/length, or failed).
             async with async_session_factory() as session:
                 short = await self._load_short(session, short_id)
-                return await self._fail(session, short, f"ffprobe failed: {exc}")
+                return short.status
 
-        # Phase 3: store probe results, eligibility gates, catalog dedupe.
-        # (The dedupe SELECT autoflushes the dirty probe fields — that write
-        # lock spans only this quick local query and the immediate commit.)
+        # Catalog dedupe for one clip: one-to-one is enforced by excluding
+        # every video id already claimed by any other short row, so a burst
+        # of similar-length clips can never all link the same channel video.
         async with async_session_factory() as session:
             short = await self._load_short(session, short_id)
-            short.duration_seconds = probe["duration"]
-            short.width = probe["width"]
-            short.height = probe["height"]
-
-            # Shorts eligibility: vertical (h > w) and <= 180s. The 3-minute
-            # ceiling has applied since 2024-10-15; a longer or landscape file
-            # would upload as a regular video, so it is skipped, not failed.
-            if probe["height"] <= probe["width"]:
-                return await self._skip(
-                    session, short,
-                    f"not vertical ({probe['width']}x{probe['height']})",
-                )
-            if probe["duration"] <= 0 or probe["duration"] > settings.SHORTS_MAX_DURATION_SECONDS:
-                return await self._skip(
-                    session, short,
-                    f"duration {probe['duration']:.0f}s outside the Shorts limit "
-                    f"({settings.SHORTS_MAX_DURATION_SECONDS:.0f}s max)",
-                )
-
-            # Backlog dedupe: ~23 of the existing clips are already on the
-            # channel (imported by catalog sync). Match by duration + date and
-            # link the existing video instead of double-uploading.
-            matched = await self._match_catalog(
-                session, probe["duration"], parse_recording_date(file_path)
-            )
+            matched = await self._match_catalog(session, short)
             if matched is not None:
                 short.youtube_video_id = matched.youtube_video_id
                 short.youtube_url = matched.youtube_url or (
@@ -786,14 +845,85 @@ class ShortsService:
                     f"already on channel (matched catalog mix '{matched.title}')",
                     event="shorts_skipped",
                 )
+
+        return await self._finish_short(short_id, auto_upload=auto_upload)
+
+    async def _analyze_short(
+        self, short_id: str, leave_pending: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """ffprobe + eligibility gates. Returns the probe dict, or None when
+        the clip is terminal (skipped for shape/length, or failed).
+
+        ``leave_pending=True`` (scan phase 1) parks an eligible clip back in
+        ``detected`` so the batch dedupe + finish phases pick it up later.
+
+        Session discipline (same pattern as catalog_playlists._save_placement
+        and catalog_backfill._backfill_one): sqlite holds its single write
+        lock from the first flushed write until COMMIT, so a session is NEVER
+        held across the ffprobe subprocess; each phase opens its own
+        short-lived session and commits immediately.
+        """
+        # Claim the row (short session, commit, close).
+        async with async_session_factory() as session:
+            short = await self._load_short(session, short_id)
+            short.status = "analyzing"
+            short.error = None
             await session.commit()
+            file_path = short.file_path
 
-        # Phase 4: track ID — ffmpeg extract + Shazam with NO session open.
-        artist, title = await identify_track(file_path, probe["duration"])
+        # Probe — no session held across the subprocess.
+        try:
+            probe = await ffprobe_clip(file_path)
+        except Exception as exc:
+            async with async_session_factory() as session:
+                short = await self._load_short(session, short_id)
+                await self._fail(session, short, f"ffprobe failed: {exc}")
+                return None
 
-        # Phase 5: persist track ID, metadata, status, optional upload. The
-        # LLM/upload awaits below run with all prior writes committed (only a
-        # WAL-safe read transaction may be open across them).
+        # Store probe results + eligibility gates.
+        async with async_session_factory() as session:
+            short = await self._load_short(session, short_id)
+            short.duration_seconds = probe["duration"]
+            short.width = probe["width"]
+            short.height = probe["height"]
+
+            # Shorts eligibility: vertical (h > w) and <= 180s. The 3-minute
+            # ceiling has applied since 2024-10-15; a longer or landscape file
+            # would upload as a regular video, so it is skipped, not failed.
+            if probe["height"] <= probe["width"]:
+                await self._skip(
+                    session, short,
+                    f"not vertical ({probe['width']}x{probe['height']})",
+                )
+                return None
+            if probe["duration"] <= 0 or probe["duration"] > settings.SHORTS_MAX_DURATION_SECONDS:
+                await self._skip(
+                    session, short,
+                    f"duration {probe['duration']:.0f}s outside the Shorts limit "
+                    f"({settings.SHORTS_MAX_DURATION_SECONDS:.0f}s max)",
+                )
+                return None
+
+            if leave_pending:
+                short.status = "detected"  # analyzed; awaiting dedupe + finish
+            await session.commit()
+        return probe
+
+    async def _finish_short(self, short_id: str, auto_upload: bool = True) -> str:
+        """Track ID + metadata + (upload) for an already-analyzed clip."""
+        async with async_session_factory() as session:
+            short = await self._load_short(session, short_id)
+            short.status = "analyzing"
+            await session.commit()
+            file_path = short.file_path
+            duration = short.duration_seconds or 0.0
+
+        # Track ID — ffmpeg extract + Shazam with NO session open.
+        artist, title = await identify_track(file_path, duration)
+
+        # Persist track ID, metadata, status, optional upload. The LLM/upload
+        # awaits below run with all prior writes committed (only a WAL-safe
+        # read transaction may be open across them).
         async with async_session_factory() as session:
             short = await self._load_short(session, short_id)
             short.track_artist = artist
@@ -880,19 +1010,9 @@ class ShortsService:
             )
             return serialize_short(short)
 
-    async def _match_catalog(
-        self, session, duration: float, recorded_at: Optional[datetime]
-    ) -> Optional[Mix]:
-        """Find the catalog mix this clip most likely already exists as.
-
-        Candidates: synced YouTube uploads (youtube_video_id set) that are
-        Short-shaped (duration <= 185s) within DEDUPE_DURATION_TOLERANCE of
-        the clip. When several durations collide and the recording date is
-        known, the candidate published closest AFTER the recording wins; an
-        unresolvable ambiguity matches nothing (better to double-check than
-        silently drop a clip).
-        """
-        rows = (
+    async def _short_shaped_mixes(self, session) -> List[Mix]:
+        """Channel uploads that could be Shorts (YouTube id + duration <= 185s)."""
+        return list(
             (
                 await session.execute(
                     select(Mix).where(
@@ -905,44 +1025,161 @@ class ShortsService:
             .scalars()
             .all()
         )
-        candidates = [
-            m for m in rows
-            if abs((m.duration_seconds or 0) - duration) <= DEDUPE_DURATION_TOLERANCE
-        ]
-        if not candidates:
-            return None
-        if len(candidates) == 1:
-            return candidates[0]
-        if recorded_at is None:
-            return None  # ambiguous with no date signal
 
-        def _published(m: Mix) -> Optional[datetime]:
-            raw = (
-                ((m.metadata_json or {}).get("catalog") or {})
-                .get("youtube", {})
-                .get("published_at")
-            )
-            if not raw:
-                return None
-            try:
-                return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(
-                    tzinfo=None
+    async def _match_catalog(self, session, short: Short) -> Optional[Mix]:
+        """Best available catalog match for ONE clip, one-to-one enforced.
+
+        Every video id already held by any other short row — an earlier
+        catalog-dedupe link OR one of our own uploads — is off the table, so
+        this path can never pile a second clip onto the same channel video.
+        Among the remaining candidates the lowest ``_match_score`` wins
+        (duration diff + 0.5x day diff; both gates required).
+        """
+        claimed = set(
+            (
+                await session.execute(
+                    select(Short.youtube_video_id).where(
+                        Short.youtube_video_id.isnot(None),
+                        Short.id != short.id,
+                    )
                 )
-            except ValueError:
-                return None
+            )
+            .scalars()
+            .all()
+        )
+        recorded_at = parse_recording_date(short.file_path)
+        best: Optional[Mix] = None
+        best_score: Optional[float] = None
+        for mix in await self._short_shaped_mixes(session):
+            if mix.youtube_video_id in claimed:
+                continue
+            score = _match_score(short.duration_seconds or 0.0, recorded_at, mix)
+            if score is not None and (best_score is None or score < best_score):
+                best, best_score = mix, score
+        return best
 
-        dated = [
-            (m, _published(m)) for m in candidates
-        ]
-        # Published on/after the recording day (1-day slack for timezones).
-        plausible = [
-            (m, p) for m, p in dated
-            if p is not None and p >= recorded_at.replace(hour=0, minute=0, second=0)
-        ]
-        if not plausible:
-            return None
-        plausible.sort(key=lambda mp: mp[1])
-        return plausible[0][0]
+    async def dedupe_backlog(self) -> Dict[str, int]:
+        """Rebuild clip <-> channel-video links, strictly one-to-one.
+
+        Pool: every analyzed clip still awaiting processing (``detected``
+        with probe data) plus every previously catalog-skipped clip — the
+        latter are re-derived, so a better-scoring clip can claim a video id
+        away from an earlier weaker match, and the loser drops back to
+        ``detected`` for normal processing.
+
+        Assignment is greedy, best (lowest) score first; ties prefer an
+        existing link, then older clips, so re-scans are idempotent. Video
+        ids held by shorts OUTSIDE the pool (our own uploads, manual links)
+        are never up for grabs. Mirrors catalog_match's never-double-assign
+        rule: each video id claims at most one clip and vice versa. (The old
+        per-clip match linked 52 of 89 backlog clips to just 3 distinct
+        video ids — dozens of similar-length clips matching the same few
+        uploads.)
+        """
+        linked = unlinked = 0
+        async with async_session_factory() as session:
+            all_shorts = list(
+                (await session.execute(select(Short))).scalars().all()
+            )
+
+            def _is_catalog_skip(s: Short) -> bool:
+                return s.status == "skipped" and bool(
+                    (s.metadata_json or {}).get("catalog_match")
+                )
+
+            pool = [
+                s for s in all_shorts
+                if s.duration_seconds is not None
+                and (s.status == "detected" or _is_catalog_skip(s))
+            ]
+            pool_ids = {s.id for s in pool}
+            claimed_elsewhere = {
+                s.youtube_video_id
+                for s in all_shorts
+                if s.youtube_video_id and s.id not in pool_ids
+            }
+            candidates = [
+                m for m in await self._short_shaped_mixes(session)
+                if m.youtube_video_id not in claimed_elsewhere
+            ]
+
+            # All valid (clip, video) pairs, scored. Sort key: score, then
+            # keep-existing-link, then clip age/id — deterministic, so a
+            # re-scan with unchanged inputs reproduces the same assignment.
+            pairs: List[tuple] = []
+            for clip in pool:
+                recorded_at = parse_recording_date(clip.file_path)
+                for mix in candidates:
+                    score = _match_score(clip.duration_seconds, recorded_at, mix)
+                    if score is None:
+                        continue
+                    keeps_existing = (
+                        0 if clip.youtube_video_id == mix.youtube_video_id else 1
+                    )
+                    pairs.append(
+                        (
+                            score,
+                            keeps_existing,
+                            str(clip.detected_at or ""),
+                            clip.id,
+                            mix.youtube_video_id,
+                            clip,
+                            mix,
+                        )
+                    )
+            pairs.sort(key=lambda p: p[:5])
+
+            taken_clips: set = set()
+            taken_videos: set = set()
+            assignment: Dict[str, Mix] = {}
+            for score, _, _, clip_id, video_id, clip, mix in pairs:
+                if clip_id in taken_clips or video_id in taken_videos:
+                    continue
+                taken_clips.add(clip_id)
+                taken_videos.add(video_id)
+                assignment[clip_id] = mix
+
+            for clip in pool:
+                mix = assignment.get(clip.id)
+                if mix is not None:
+                    clip.status = "skipped"
+                    clip.youtube_video_id = mix.youtube_video_id
+                    clip.youtube_url = mix.youtube_url or (
+                        f"https://www.youtube.com/shorts/{mix.youtube_video_id}"
+                    )
+                    clip.error = (
+                        f"already on channel (matched catalog mix '{mix.title}')"
+                    )
+                    clip.metadata_json = {
+                        **(clip.metadata_json or {}),
+                        "catalog_match": {"mix_id": mix.id, "mix_title": mix.title},
+                    }
+                    linked += 1
+                elif _is_catalog_skip(clip):
+                    # Lost its link (a better clip claimed the video, or the
+                    # old link no longer passes the gates) — back into the
+                    # pipeline for normal processing.
+                    clip.status = "detected"
+                    clip.youtube_video_id = None
+                    clip.youtube_url = None
+                    clip.error = None
+                    md = dict(clip.metadata_json or {})
+                    md.pop("catalog_match", None)
+                    clip.metadata_json = md or None
+                    unlinked += 1
+            await session.commit()
+
+        if linked or unlinked:
+            await activity_log.info(
+                "shorts_dedupe",
+                (
+                    f"Shorts catalog dedupe: {linked} clips linked one-to-one "
+                    f"to existing channel uploads, {unlinked} requeued."
+                ),
+                platform="youtube",
+                context={"linked": linked, "unlinked": unlinked},
+            )
+        return {"linked": linked, "unlinked": unlinked}
 
     # ------------------------------------------------------------------
     # Upload + quota
