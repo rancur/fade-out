@@ -24,6 +24,21 @@ import pytest
 import pytest_asyncio
 
 
+@pytest.fixture(autouse=True)
+def _reset_app_config_cache():
+    """Drop the app-config snapshot cache around every test.
+
+    ``app.services.app_config`` caches the AppSettings row for 60s; without
+    this, a value resolved in one test would leak into the next (and into
+    tests that monkeypatch env settings expecting the fallback path).
+    """
+    from app.services import app_config
+
+    app_config.invalidate_cache()
+    yield
+    app_config.invalidate_cache()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _cleanup_test_db():
     """Remove this process's DB (and its WAL/SHM journals) after the run."""

@@ -28,14 +28,14 @@ def _config(db_url: Optional[str] = None) -> Config:
     return cfg
 
 
-# 0007_add_shorts revises "0006_add_uniqueness_registry", which lives in the
+# 0007_add_shorts revises "0006_add_used_creative", which lives in the
 # parallel uniqueness-registry PR and is not present on this branch. Until
 # that PR merges (it merges FIRST by agreement) the chain is intentionally
 # dangling, so chain-walking tests skip with this reason instead of failing.
 # 0007 itself is still covered standalone below.
 _CHAIN_SKIP_REASON = (
     "migration chain incomplete on this branch: 0007_add_shorts revises "
-    "0006_add_uniqueness_registry from the parallel uniqueness PR "
+    "0006_add_used_creative from the parallel uniqueness PR "
     "(merge order: 0006 first)"
 )
 
@@ -58,7 +58,7 @@ def test_revision_chain_is_linear():
     assert "0003_add_activity_events" in rev_ids
     assert "0004_step_progress_and_dedupe" in rev_ids
     assert "0005_add_catalog_and_proposals" in rev_ids
-    assert "0006_add_uniqueness_registry" in rev_ids
+    assert "0006_add_used_creative" in rev_ids
     assert "0007_add_shorts" in rev_ids
 
     heads = script.get_heads()
@@ -103,6 +103,16 @@ def test_upgrade_head_builds_schema_with_mixcloud_url():
             "status", "created_by", "error", "created_at", "updated_at", "applied_at",
         }.issubset(proposal_cols)
 
+        # added by 0006
+        assert "used_creative" in tables
+        uc_cols = {c["name"] for c in insp.get_columns("used_creative")}
+        assert {
+            "id", "kind", "value_normalized", "value_raw", "mix_id", "created_at",
+        }.issubset(uc_cols)
+        uc_indexes = {i["name"] for i in insp.get_indexes("used_creative")}
+        assert "ix_used_creative_value_normalized" in uc_indexes
+        assert "ix_used_creative_kind" in uc_indexes
+
         # added by 0007
         assert "shorts" in tables
         short_cols = {c["name"] for c in insp.get_columns("shorts")}
@@ -113,6 +123,74 @@ def test_upgrade_head_builds_schema_with_mixcloud_url():
             "uploaded_at", "metadata_json",
         }.issubset(short_cols)
         sync_engine.dispose()
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def test_0006_seeds_registry_from_titles_and_proposals():
+    """0006 backfills used_creative with existing mix titles plus
+    approved/applying/applied title proposals — normalized, series prefix
+    stripped, deduped — and never seeds hooks or scenes."""
+    from alembic import command
+    from sqlalchemy import create_engine, text
+
+    tmp = os.path.join(
+        tempfile.gettempdir(), f"fadeout_migration_uniq_seed_test_{os.getpid()}.db"
+    )
+    if os.path.exists(tmp):
+        os.remove(tmp)
+
+    url = f"sqlite+aiosqlite:///{tmp}"
+    cfg = _config(db_url=url)
+    try:
+        command.upgrade(cfg, "0005_add_catalog_and_proposals")
+
+        sync_engine = create_engine(f"sqlite:///{tmp}")
+        with sync_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO mixes (id, title, source, title_locked) VALUES "
+                    "('m1', 'Desert Frequencies Vol. III', 'pipeline', 0), "
+                    "('m2', 'Will See Wednesdays: Golden Hour', 'imported', 0), "
+                    "('m3', 'desert frequencies vol iii', 'imported', 0), "  # dupe of m1 after normalization
+                    "('m4', '', 'imported', 0)"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO mix_proposals "
+                    "(id, mix_id, platform, field, proposed_value, status, created_by) VALUES "
+                    "('p1', 'm1', 'both', 'title', 'Freight Train Techno', 'applied', 'ai'), "
+                    "('p2', 'm2', 'both', 'title', 'Neon Cactus After Dark', 'approved', 'ai'), "
+                    "('p3', 'm3', 'both', 'title', 'Rejected Junk Title', 'rejected', 'ai'), "
+                    "('p4', 'm3', 'both', 'title', 'Draft Only Title', 'draft', 'ai'), "
+                    "('p5', 'm1', 'both', 'description', 'Not A Title', 'applied', 'ai')"
+                )
+            )
+
+        command.upgrade(cfg, "head")
+
+        with sync_engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT kind, value_normalized, value_raw, mix_id FROM used_creative")
+            ).fetchall()
+        sync_engine.dispose()
+
+        assert all(r[0] == "title" for r in rows)  # no hooks/scenes seeded
+        normalized = {r[1] for r in rows}
+        assert "desert frequencies vol iii" in normalized
+        # series prefix stripped before comparison
+        assert "golden hour" in normalized
+        assert "freight train techno" in normalized
+        assert "neon cactus after dark" in normalized
+        # rejected/draft proposals, non-title fields, empty titles: not seeded
+        assert "rejected junk title" not in normalized
+        assert "draft only title" not in normalized
+        assert "not a title" not in normalized
+        # dedup: m1's title and m3's normalized twin land as ONE row
+        assert len([r for r in rows if r[1] == "desert frequencies vol iii"]) == 1
+        assert len(rows) == 4
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -241,7 +319,7 @@ def test_migration_0004_dedupes_duplicate_step_rows():
 
 def test_0007_add_shorts_schema_standalone():
     """0007 cannot run through the chain pre-merge (its down_revision,
-    0006_add_uniqueness_registry, lives in the parallel uniqueness PR), so
+    0006_add_used_creative, lives in the parallel uniqueness PR), so
     exercise its upgrade()/downgrade() directly against a scratch DB via an
     Operations context. This test keeps working after the chains merge."""
     import importlib.util
@@ -257,7 +335,7 @@ def test_0007_add_shorts_schema_standalone():
 
     assert module.revision == "0007_add_shorts"
     # String constant by agreement with the uniqueness PR (merge order: 0006 first).
-    assert module.down_revision == "0006_add_uniqueness_registry"
+    assert module.down_revision == "0006_add_used_creative"
 
     tmp = os.path.join(tempfile.gettempdir(), f"fadeout_shorts_migration_test_{os.getpid()}.db")
     if os.path.exists(tmp):

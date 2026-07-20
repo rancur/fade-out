@@ -221,7 +221,9 @@ async def _apply_to_soundcloud(
 async def run_apply() -> Dict[str, Any]:
     """Apply all approved proposals sequentially. Returns a run summary."""
     summary: Dict[str, Any] = {"applied": 0, "failed": 0, "queued": 0, "paused": False}
-    budget = settings.YOUTUBE_DAILY_QUOTA_BUDGET
+    from app.services import app_config
+
+    budget = int(await app_config.resolve("youtube_daily_quota_budget"))
     today = date.today().isoformat()
 
     async with async_session_factory() as session:
@@ -341,6 +343,18 @@ async def run_apply() -> Dict[str, Any]:
                     proposal.applied_at = datetime.now(timezone.utc)
                     proposal.error = None
                     summary["applied"] += 1
+                    if proposal.field == "title" and proposal.proposed_value:
+                        # Uniqueness engine: a title that reached a platform is
+                        # permanently claimed (idempotent — drafting usually
+                        # claimed it already).
+                        from app.services import uniqueness
+
+                        await uniqueness.claim(
+                            session,
+                            uniqueness.KIND_TITLE,
+                            proposal.proposed_value,
+                            proposal.mix_id,
+                        )
                 except Exception as exc:
                     logger.exception(
                         "Failed to apply proposal %s (%s/%s)",

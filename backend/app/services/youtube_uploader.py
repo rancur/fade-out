@@ -356,7 +356,11 @@ class YouTubeUploader:
     ) -> Optional[str]:
         """Add video to appropriate genre playlist, creating if needed."""
         import asyncio
-        playlist_name = f"{settings.YOUTUBE_DEFAULT_PLAYLIST_PREFIX} | {genre.title()} Mixes"
+
+        from app.services import app_config
+
+        prefix = await app_config.resolve("youtube_default_playlist_prefix")
+        playlist_name = f"{prefix} | {genre.title()} Mixes"
 
         try:
             # Search existing playlists

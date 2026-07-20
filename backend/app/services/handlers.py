@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import AppSettings, BrandSettings, Mix
+from app.services import app_config
 from app.services.pipeline import PipelineOrchestrator, VideoNotReady
 
 logger = logging.getLogger(__name__)
@@ -291,7 +292,9 @@ async def analyze_audio_with_cue(
 
     merged = merge_detections(
         detection_sources,
-        name_confidence_threshold=settings.DETECTION_NAME_CONFIDENCE_THRESHOLD,
+        name_confidence_threshold=float(
+            await app_config.resolve("detection_name_confidence_threshold")
+        ),
     )
 
     final_tracklist = merged.tracklist if merged.tracklist else result.tracklist
@@ -480,11 +483,17 @@ async def handle_generate_art(
     cover_path = os.path.join(cover_dir, f"{mix_id}.jpg")
     thumb_path = os.path.join(thumb_dir, f"{mix_id}.jpg")
 
+    from app.services import thumbnail_design
     from app.services.art_generator import ArtGenerator
 
     app_settings_art = await _get_app_settings(session)
     sj_art = (app_settings_art.settings_json or {}) if app_settings_art else {}
     art_gen = ArtGenerator(db_settings_json=sj_art)
+
+    # Uniqueness engine: a per-mix hook + varied scene, enforced unique by the
+    # registry (releases this mix's own previous claims first) so no two
+    # thumbnails ever share hook text or a near-identical scene.
+    design = await thumbnail_design.unique_design_for_mix(mix, session, sj_art)
 
     cover_result = await art_gen.generate_cover_art(
         mix_title=mix.title,
@@ -494,6 +503,8 @@ async def handle_generate_art(
         session=session,
         mix_id=mix_id,
         brand_settings=brand,
+        hook_text=design["hook"],
+        scene_text=design["scene"],
     )
 
     thumb_result = await art_gen.generate_youtube_thumbnail(
@@ -508,6 +519,8 @@ async def handle_generate_art(
         video_file_path=mix.video_file_path,
         energy_profile=mix.energy_profile or [],
         duration_seconds=mix.duration_seconds or 0.0,
+        hook_text=design["hook"],
+        scene_text=design["scene"],
     )
 
     mix.cover_art_path = cover_result
@@ -516,6 +529,7 @@ async def handle_generate_art(
     return {
         "cover_art_path": cover_result,
         "thumbnail_path": thumb_result,
+        "hook_text": design["hook"].replace("\n", " "),
     }
 
 
@@ -904,7 +918,7 @@ async def handle_cross_link(
     # cross-links only ever landed in the DB and the published descriptions
     # never carried them. Each push is best-effort: a failure is logged loudly
     # but never fails the pipeline's final step. Uses existing OAuth tokens.
-    if settings.CROSS_LINK_PUSH_ENABLED:
+    if await app_config.resolve("cross_link_push_enabled"):
         app_settings = await _get_app_settings(session)
         sj = (app_settings.settings_json or {}) if app_settings else {}
 

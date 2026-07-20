@@ -31,7 +31,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.database import async_session_factory
 from app.models import BrandSettings, Mix, MixProposal
-from app.services import activity_log
+from app.services import activity_log, thumbnail_design
 from app.services.art_generator import ArtGenerator
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,19 @@ RAID_TRAIN_RE = re.compile(r"raid.?train", re.IGNORECASE)
 # Factory hook (monkeypatchable in tests).
 def get_art_generator(db_settings_json: Optional[Dict[str, Any]]) -> ArtGenerator:
     return ArtGenerator(db_settings_json)
+
+
+async def _unique_design(mix, session, sj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Per-mix unique hook + scene via the uniqueness engine, committed before
+    the long-running fal generation so sqlite's write lock is never held across
+    that await. Never fails the regen — None falls back to motif defaults."""
+    try:
+        design = await thumbnail_design.unique_design_for_mix(mix, session, sj)
+        await session.commit()
+        return design
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Unique design generation failed for mix %s", mix.id)
+        return None
 
 
 def _on_platform(mix: Mix) -> bool:
@@ -67,8 +80,15 @@ async def _has_open_thumbnail_proposal(session, mix_id: str, platform: str) -> b
 
 async def run_regen_thumbnails(
     mix_ids: Union[List[str], str, None],
+    force_unique: bool = True,
 ) -> Dict[str, Any]:
-    """Regenerate brand-design art for the targeted mixes. Returns the summary."""
+    """Regenerate brand-design art for the targeted mixes. Returns the summary.
+
+    ``force_unique`` (default on) routes every render through the uniqueness
+    engine: a per-mix LLM hook and hash-varied scene, both enforced unique by
+    the ``used_creative`` registry (the mix's own previous claims are released
+    first). ``False`` restores the legacy fixed per-genre motif hook/scene.
+    """
     from app.services.catalog_sync import _get_settings_row
 
     started_at = datetime.now(timezone.utc)
@@ -120,6 +140,12 @@ async def run_regen_thumbnails(
                 genres = mix.genres or ["electronic"]
                 vibes = mix.vibes or []
 
+                design: Optional[Dict[str, Any]] = None
+                if force_unique:
+                    design = await _unique_design(mix, session, sj)
+                hook_text = design["hook"] if design else None
+                scene_text = design["scene"] if design else None
+
                 made_any = False
                 try:
                     if mix.youtube_video_id:
@@ -137,6 +163,8 @@ async def run_regen_thumbnails(
                                 session=session,
                                 mix_id=mix.id,
                                 brand_settings=brand,
+                                hook_text=hook_text,
+                                scene_text=scene_text,
                             )
                             session.add(
                                 MixProposal(
@@ -175,6 +203,8 @@ async def run_regen_thumbnails(
                                 session=session,
                                 mix_id=mix.id,
                                 brand_settings=brand,
+                                hook_text=hook_text,
+                                scene_text=scene_text,
                             )
                             session.add(
                                 MixProposal(
