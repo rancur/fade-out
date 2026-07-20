@@ -15,12 +15,14 @@ import {
   ChevronLeft,
   ChevronRight,
   Radio,
+  Smartphone,
 } from 'lucide-react'
 
 const nav = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/mixes', icon: Music2, label: 'Mixes' },
   { to: '/catalog', icon: Library, label: 'Catalog' },
+  { to: '/shorts', icon: Smartphone, label: 'Shorts' },
   { to: '/activity', icon: Activity, label: 'Activity' },
   { to: '/brand', icon: Palette, label: 'Brand' },
   { to: '/settings', icon: Settings, label: 'Settings' },

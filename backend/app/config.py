@@ -68,6 +68,28 @@ class Settings(BaseSettings):
     # units; the true daily cap is 10k, so 8k leaves headroom for uploads.
     YOUTUBE_DAILY_QUOTA_BUDGET: int = 8000
 
+    # --- YouTube Shorts (vertical clip auto-uploader) ---
+    # Watches SHORTS_WATCH_PATH (read-only mount of the OBS Backtrack folder)
+    # for stable vertical .mp4 clips and runs them through the shorts pipeline:
+    # ffprobe -> Shazam track ID -> LLM metadata -> videos.insert. The watcher
+    # arms itself only when SHORTS_ENABLED is true AND the path exists, so the
+    # feature is a no-op on hosts without the mount.
+    SHORTS_ENABLED: bool = True
+    SHORTS_WATCH_PATH: str = "/watch/shorts"
+    # videos.insert costs 1600 YouTube quota units. 3 uploads/day = 4800 units
+    # against the shared catalog_yt_quota ledger (YOUTUBE_DAILY_QUOTA_BUDGET,
+    # default 8000), leaving headroom for catalog writes and full-mix uploads.
+    # A steady 3/day also matches the Shorts-algorithm cadence guidance of
+    # 3-5 posts per week minimum without flooding the feed; the backlog drains
+    # a few clips per day, oldest first.
+    SHORTS_DAILY_UPLOAD_CAP: int = 3
+    # Shorts accept vertical/square video up to 3 minutes (limit raised from
+    # 60s on 2024-10-15). Anything longer is a regular video, not a Short.
+    SHORTS_MAX_DURATION_SECONDS: float = 180.0
+    # How often the background drain pass retries queued shorts (quota/cap
+    # frees up at midnight Pacific; a 30-min cadence picks that up promptly).
+    SHORTS_DRAIN_INTERVAL_SECONDS: int = 1800
+
     # --- Mixcloud ---
     # Mixcloud is an optional third publishing target that mirrors the
     # SoundCloud/YouTube uploader pattern. It needs an OAuth access token Will

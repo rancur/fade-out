@@ -192,6 +192,41 @@ class ActivityEvent(Base):
     context = Column(JSON, nullable=True)  # arbitrary structured detail
 
 
+class Short(Base):
+    """A vertical clip (OBS Backtrack recording) destined for YouTube Shorts.
+
+    Rows are created by the shorts watcher (new stable ``.mp4`` drops in
+    ``SHORTS_WATCH_PATH``) or by the backlog scan endpoint, then move through
+    the pipeline: detected -> analyzing -> ready -> (queued) -> uploading ->
+    uploaded, with ``failed`` (error captured, retryable) and ``skipped``
+    (not a Short candidate, or already on the channel via the catalog dedupe
+    pass — ``youtube_video_id`` links the existing upload) as terminal-ish
+    states the user can act on.
+    """
+
+    __tablename__ = "shorts"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    file_path = Column(String, nullable=False)
+    file_hash = Column(String, nullable=True, index=True)  # first-10MB MD5 dedupe key
+    title = Column(String, nullable=True)
+    description = Column(Text, nullable=True)
+    tags = Column(JSON, nullable=True)  # list of tags
+    track_artist = Column(String, nullable=True)  # Shazam result (may be None)
+    track_title = Column(String, nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    youtube_video_id = Column(String, nullable=True, index=True)
+    youtube_url = Column(String, nullable=True)
+    # detected | analyzing | ready | queued | uploading | uploaded | failed | skipped
+    status = Column(String, default="detected", nullable=False, index=True)
+    error = Column(Text, nullable=True)
+    detected_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    uploaded_at = Column(DateTime, nullable=True)
+    metadata_json = Column(JSON, nullable=True)
+
+
 class UsedCreative(Base):
     """Uniqueness registry: every creative value the system has ever committed.
 
