@@ -242,6 +242,12 @@ export function useLiveEvents() {
         if (typeof ev === 'string' && ev.startsWith('catalog')) {
           qc.invalidateQueries({ queryKey: ['catalog'] })
         }
+        // Shorts pipeline events (shorts_detected / shorts_ready /
+        // shorts_uploaded / shorts_queued / shorts_scan / ...) mean the
+        // shorts list or its stats changed — refresh those caches live.
+        if (typeof ev === 'string' && ev.startsWith('shorts')) {
+          qc.invalidateQueries({ queryKey: ['shorts'] })
+        }
       }),
     ]
     return () => unsubs.forEach((u) => u())
@@ -918,6 +924,164 @@ export function useCatalogImprove() {
         .then((r) => r.data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['catalog'] })
+    },
+  })
+}
+
+// ---------- Shorts ----------
+
+export type ShortStatus =
+  | 'detected'
+  | 'analyzing'
+  | 'ready'
+  | 'queued'
+  | 'uploading'
+  | 'uploaded'
+  | 'failed'
+  | 'skipped'
+
+export interface ShortItem {
+  id: string
+  file_path: string
+  filename: string
+  file_hash: string | null
+  title: string | null
+  description: string | null
+  tags: string[] | null
+  track_artist: string | null
+  track_title: string | null
+  duration_seconds: number | null
+  width: number | null
+  height: number | null
+  youtube_video_id: string | null
+  youtube_url: string | null
+  status: ShortStatus | string
+  error: string | null
+  detected_at: string | null
+  uploaded_at: string | null
+  metadata_json: Record<string, unknown> | null
+}
+
+export interface ShortsStats {
+  uploaded_today: number
+  daily_cap: number
+  cap_reached: boolean
+  queued: number
+  quota_used: number
+  quota_budget: number
+  status_counts: Record<string, number>
+  watcher_active: boolean
+  watch_path: string
+}
+
+export interface ShortsScanSummary {
+  started_at: string
+  finished_at?: string
+  status: 'running' | 'ok' | 'partial' | 'failed' | string
+  files_seen: number
+  already_known: number
+  ingested: number
+  catalog_matched: number
+  errors: string[]
+}
+
+export interface ShortsScanStatus {
+  running: boolean
+  last_scan: ShortsScanSummary | null
+}
+
+export interface ShortsParams {
+  page?: number
+  page_size?: number
+  status?: string
+  q?: string
+  sort?: 'newest' | 'oldest'
+}
+
+export function useShorts(params?: ShortsParams) {
+  const wsConnected = useWsConnected()
+  return useQuery({
+    queryKey: ['shorts', 'list', params],
+    queryFn: () => client.get<Paginated<ShortItem>>('/shorts', { params }).then((r) => r.data),
+    // WS shorts_* activity events invalidate this live; poll when degraded
+    refetchInterval: wsConnected ? false : 5000,
+  })
+}
+
+export function useShortsStats() {
+  const wsConnected = useWsConnected()
+  return useQuery({
+    queryKey: ['shorts', 'stats'],
+    queryFn: () => client.get<ShortsStats>('/shorts/stats').then((r) => r.data),
+    refetchInterval: wsConnected ? false : 5000,
+  })
+}
+
+export function useShortsScanStatus() {
+  return useQuery({
+    queryKey: ['shorts', 'scan-status'],
+    queryFn: () => client.get<ShortsScanStatus>('/shorts/scan/status').then((r) => r.data),
+    // Poll while a scan is in flight so the UI notices completion
+    refetchInterval: (query) => (query.state.data?.running ? 2_000 : false),
+  })
+}
+
+export function useStartShortsScan() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () =>
+      client.post<{ status: 'started' | 'already_running' }>('/shorts/scan').then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['shorts'] })
+    },
+  })
+}
+
+export function useUploadShort() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => client.post(`/shorts/${id}/upload`).then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['shorts'] })
+    },
+  })
+}
+
+export function useSkipShort() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, skip }: { id: string; skip: boolean }) =>
+      client.post<ShortItem>(`/shorts/${id}/${skip ? 'skip' : 'unskip'}`).then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['shorts'] })
+    },
+  })
+}
+
+export interface ShortUpdateBody {
+  title?: string
+  description?: string
+  tags?: string[]
+}
+
+export function useUpdateShort() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...body }: ShortUpdateBody & { id: string }) =>
+      client.put<ShortItem>(`/shorts/${id}`, body).then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['shorts'] })
+    },
+  })
+}
+
+export function useRegenerateShortMetadata() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) =>
+      client.post(`/shorts/${id}/regenerate-metadata`).then((r) => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['shorts'] })
     },
   })
 }
