@@ -136,6 +136,10 @@ class BackfillBody(BaseModel):
 
 class RegenThumbsBody(BaseModel):
     mix_ids: Any = None  # list of ids | "all" | "raid-trains"
+    # Uniqueness engine (default ON): per-mix LLM hook + hash-varied scene,
+    # enforced unique via the used_creative registry. False = legacy fixed
+    # per-genre motif hook/scene.
+    force_unique: bool = True
 
 
 class OrganizePlaylistsBody(BaseModel):
@@ -283,9 +287,12 @@ async def trigger_regen_thumbnails(body: RegenThumbsBody):
     """Regenerate brand-design thumbnails/covers in the background.
 
     ``mix_ids`` is a list of mix ids, ``"all"`` (every cataloged mix), or
-    ``"raid-trains"`` (title-matched raid trains). Renders land in the
-    ``/output`` art paths and become APPROVED thumbnail proposals — the apply
-    worker pushes them (not auto-run). Single-flight.
+    ``"raid-trains"`` (title-matched raid trains). ``force_unique`` (default
+    ``true``) routes every render through the uniqueness engine — a per-mix
+    hook + varied scene enforced unique by the ``used_creative`` registry;
+    ``false`` restores the legacy fixed per-genre motif look. Renders land in
+    the ``/output`` art paths and become APPROVED thumbnail proposals — the
+    apply worker pushes them (not auto-run). Single-flight.
     """
     global _regen_thumbs_task
     from app.services.catalog_thumbnails import run_regen_thumbnails
@@ -301,7 +308,9 @@ async def trigger_regen_thumbnails(body: RegenThumbsBody):
 
     if _regen_thumbs_task and not _regen_thumbs_task.done():
         return {"status": "already_running"}
-    _regen_thumbs_task = _spawn("regen_thumbs", run_regen_thumbnails(mix_ids))
+    _regen_thumbs_task = _spawn(
+        "regen_thumbs", run_regen_thumbnails(mix_ids, force_unique=body.force_unique)
+    )
     return {"status": "started"}
 
 
@@ -317,6 +326,18 @@ async def regen_thumbnails_status(db: AsyncSession = Depends(get_db)):
         "running": bool(_regen_thumbs_task and not _regen_thumbs_task.done()),
         "last_regen": last,
     }
+
+
+# --- Uniqueness registry observability ---
+
+
+@router.get("/uniqueness/stats")
+async def uniqueness_stats(db: AsyncSession = Depends(get_db)):
+    """Per-kind claim counts + the most recent claims from the uniqueness
+    registry (titles / thumbnail hooks / scene descriptors)."""
+    from app.services import uniqueness
+
+    return await uniqueness.stats(db)
 
 
 # --- Playlist organization ---
