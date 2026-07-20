@@ -180,6 +180,61 @@ class YouTubeUploader:
             "playlist_id": playlist_id,
         }
 
+    async def upload_short(
+        self,
+        file_path: str,
+        title: str,
+        description: str,
+        tags: List[str],
+    ) -> Dict[str, Any]:
+        """Upload a vertical clip as a YouTube Short.
+
+        A Short is a plain ``videos.insert`` (1600 quota units) — YouTube
+        classifies it as a Short from the video itself (vertical/square and
+        <= 3 minutes; the limit moved from 60s to 3 min on 2024-10-15), not
+        from any API flag. No custom thumbnail is set: the Shorts player uses
+        a frame from the video. Uploaded public immediately — Shorts get
+        their distribution from the feed's test-audience phase in the first
+        hours, so premiere scheduling adds nothing for them.
+
+        Returns {"video_id": str, "video_url": str} (a /shorts/ URL).
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Short file not found: {file_path}")
+
+        youtube = self._get_service()
+        body: Dict[str, Any] = {
+            "snippet": {
+                "title": title[:100],  # YouTube max 100 chars
+                "description": description[:5000],
+                "tags": tags[:500],
+                "categoryId": CATEGORY_MUSIC,
+            },
+            "status": {
+                "privacyStatus": "public",
+                "selfDeclaredMadeForKids": False,
+            },
+        }
+        media = MediaFileUpload(
+            file_path,
+            mimetype="video/mp4",
+            resumable=True,
+            chunksize=10 * 1024 * 1024,
+        )
+
+        import asyncio
+
+        insert_request = youtube.videos().insert(
+            part="snippet,status",
+            body=body,
+            media_body=media,
+        )
+        response = await asyncio.to_thread(self._resumable_upload, insert_request)
+        video_id = response["id"]
+        video_url = f"https://www.youtube.com/shorts/{video_id}"
+        logger.info("Short uploaded: %s (%s)", video_url, video_id)
+        return {"video_id": video_id, "video_url": video_url}
+
     def _resumable_upload(self, request, progress_cb=None, loop=None) -> dict:
         """Execute a resumable upload, handling retries.
 
