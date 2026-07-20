@@ -14,6 +14,9 @@ services:
       - /volume1/music/DJ Will See:/watch/audio:ro
       - /volume1/twitch/Recordings:/watch/video:ro
       - /volume1/homes/willcurran/djctl/cue-sheets:/watch/djctl-cue:ro
+      # Vertical OBS Backtrack clips for the Shorts auto-uploader (READ-ONLY —
+      # the pipeline only ever reads the source recordings)
+      - /volume1/twitch/Vertical Backtrack:/watch/shorts:ro
       # Output folders on NAS
       - /volume1/homes/willcurran/will-see/youtube-thumbnails:/output/thumbnails
       - /volume1/homes/willcurran/will-see/soundcloud-cover-art:/output/cover-art

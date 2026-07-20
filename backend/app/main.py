@@ -24,6 +24,7 @@ from app.routers import (
     notifications,
     pipeline,
     settings as settings_router,
+    shorts,
     system,
     upgrade,
     ws,
@@ -34,6 +35,7 @@ from app.services.handlers import register_all_handlers
 from app.services.ingest import IngestCoordinator
 from app.services.notification_service import get_notification_service
 from app.services.pipeline import PipelineOrchestrator, sweep_interrupted_at_boot
+from app.services.shorts_pipeline import get_shorts_service
 
 logger = logging.getLogger("fadeout")
 
@@ -109,11 +111,18 @@ async def lifespan(app: FastAPI):
         settings.WATCH_AUDIO_PATH,
         settings.WATCH_VIDEO_PATH,
     )
+    # Shorts watcher: vertical Backtrack clips auto-become YouTube Shorts.
+    # start_watcher() no-ops (returns False) when SHORTS_ENABLED is off or the
+    # watch mount does not exist, so this is safe on hosts without the volume.
+    shorts_service = get_shorts_service()
+    await shorts_service.start_watcher()
+
     await activity_log.info("service_started", "fade-out started; watching for drops.")
 
     logger.info("Fade-Out is running.")
     yield
     logger.info("Fade-Out shutting down.")
+    await shorts_service.stop_watcher()
     retention_task.cancel()
     try:
         await retention_task
@@ -153,6 +162,7 @@ app.include_router(settings_router.router)
 app.include_router(brand.router)
 app.include_router(ai_usage.router)
 app.include_router(notifications.router)
+app.include_router(shorts.router)
 app.include_router(upgrade.router)
 app.include_router(ws.router)
 
