@@ -295,6 +295,13 @@ class TestUploadYoutubeQuotaLedger:
 
         monkeypatch.setattr(YouTubeUploader, "upload", fake_upload)
 
+        # The completeness gate would reject this fake video file (no real
+        # container, fresh mtime) — these tests exercise the quota ledger.
+        async def _always_complete(path, audio_duration):
+            return True, "ok"
+
+        monkeypatch.setattr(handlers_mod, "check_video_complete", _always_complete)
+
         async with async_session_factory() as session:
             out = await handlers_mod.handle_upload_youtube(mix_id, session)
             await session.commit()
@@ -344,3 +351,214 @@ class TestUploadYoutubeQuotaLedger:
         assert out["skipped"] is True
         sj = await _load_settings_json()
         assert YT_QUOTA_KEY not in sj
+
+
+class TestVideoCompletenessGate:
+    """Regression suite for the partial-sync incident: the NAS sync from the
+    OBS machine stalled mid-copy, leaving an MKV with 10m40s of a ~115-minute
+    set (ffprobe duration=N/A, decode ending "File ended prematurely") — and
+    upload_youtube would have published it. The handler must verify the video
+    is complete and otherwise raise VideoNotReady so the orchestrator's
+    5-minute poll loop waits out the sync."""
+
+    async def _make_video_mix(self, tmp_path, audio_duration=6900.0, mtime_age=600):
+        import os
+        import time
+
+        video = tmp_path / "mix.mkv"
+        video.write_bytes(b"video")
+        old = time.time() - mtime_age
+        os.utime(video, (old, old))
+        mix_id = await _add_mix(
+            title="Partial Sync Mix",
+            video_file_path=str(video),
+            duration_seconds=audio_duration,
+            genres=["house"],
+        )
+        return mix_id
+
+    def _fake_probe(self, monkeypatch, duration):
+        import app.services.pipeline as pipeline_mod
+
+        async def fake(path):
+            return duration
+
+        monkeypatch.setattr(pipeline_mod, "_ffprobe_container_duration", fake)
+
+    def _fake_uploader(self, monkeypatch):
+        from app.services.youtube_uploader import YouTubeUploader
+
+        calls = []
+
+        async def fake_upload(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "video_url": "https://www.youtube.com/watch?v=abc123def45",
+                "video_id": "abc123def45",
+                "playlist_id": None,
+            }
+
+        monkeypatch.setattr(YouTubeUploader, "upload", fake_upload)
+        return calls
+
+    async def test_unfinalized_video_raises_video_not_ready(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        import pytest
+        from app.models import ActivityEvent
+        from app.services.pipeline import VideoNotReady
+
+        await _seed_app_settings({"youtube_refresh_token": "tok"})
+        mix_id = await self._make_video_mix(tmp_path)
+        self._fake_probe(monkeypatch, None)  # duration=N/A — truncated MKV
+        upload_calls = self._fake_uploader(monkeypatch)
+
+        async with async_session_factory() as session:
+            with pytest.raises(VideoNotReady, match="no container duration"):
+                await handlers_mod.handle_upload_youtube(mix_id, session)
+
+        assert upload_calls == []  # the partial video never reached YouTube
+        # The rejection reason lands in the activity log so the UI shows
+        # why the step is waiting.
+        async with async_session_factory() as session:
+            events = (
+                (
+                    await session.execute(
+                        select(ActivityEvent).where(
+                            ActivityEvent.event == "video_incomplete"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert any("no container duration" in e.message for e in events)
+
+    async def test_partial_duration_raises_video_not_ready(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        import pytest
+        from app.services.pipeline import VideoNotReady
+
+        await _seed_app_settings({"youtube_refresh_token": "tok"})
+        # 640s of video against a 6900s set — the live incident's shape.
+        mix_id = await self._make_video_mix(tmp_path, audio_duration=6900.0)
+        self._fake_probe(monkeypatch, 640.0)
+        upload_calls = self._fake_uploader(monkeypatch)
+
+        async with async_session_factory() as session:
+            with pytest.raises(VideoNotReady, match="likely partial sync"):
+                await handlers_mod.handle_upload_youtube(mix_id, session)
+        assert upload_calls == []
+
+    async def test_still_growing_file_raises_video_not_ready(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        import pytest
+        from app.services.pipeline import VideoNotReady
+
+        await _seed_app_settings({"youtube_refresh_token": "tok"})
+        # Full duration, but the file was touched seconds ago — still syncing.
+        mix_id = await self._make_video_mix(tmp_path, mtime_age=5)
+        self._fake_probe(monkeypatch, 6900.0)
+        upload_calls = self._fake_uploader(monkeypatch)
+
+        async with async_session_factory() as session:
+            with pytest.raises(VideoNotReady, match="still syncing"):
+                await handlers_mod.handle_upload_youtube(mix_id, session)
+        assert upload_calls == []
+
+    async def test_complete_video_uploads(self, prepared_db, monkeypatch, tmp_path):
+        await _seed_app_settings({"youtube_refresh_token": "tok"})
+        mix_id = await self._make_video_mix(tmp_path, audio_duration=6900.0)
+        self._fake_probe(monkeypatch, 6890.0)  # >= 90% of the audio
+        upload_calls = self._fake_uploader(monkeypatch)
+
+        async with async_session_factory() as session:
+            out = await handlers_mod.handle_upload_youtube(mix_id, session)
+            await session.commit()
+
+        assert out["video_id"] == "abc123def45"
+        assert len(upload_calls) == 1
+
+    async def test_unknown_audio_duration_skips_ratio_gate(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        # An imported/odd mix may not know its audio duration — the ratio
+        # gate cannot apply, but the parse + stability gates still do.
+        await _seed_app_settings({"youtube_refresh_token": "tok"})
+        mix_id = await self._make_video_mix(tmp_path, audio_duration=None)
+        self._fake_probe(monkeypatch, 640.0)
+        self._fake_uploader(monkeypatch)
+
+        async with async_session_factory() as session:
+            out = await handlers_mod.handle_upload_youtube(mix_id, session)
+            await session.commit()
+        assert out["video_id"] == "abc123def45"
+
+
+class TestWaitForVideoCeiling:
+    """_wait_for_video re-checks the completeness gate every poll and takes
+    its ceiling from the video_wait_max_checks setting (default 96 = 8h) —
+    a stalled NAS sync can take hours to recover."""
+
+    async def test_ceiling_resolves_from_settings_and_fails_with_reason(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        import app.services.pipeline as pipeline_mod
+        from app.services import app_config
+        from app.services.pipeline import PipelineOrchestrator
+
+        await _seed_app_settings({"video_wait_max_checks": 2})
+        app_config.invalidate_cache()
+
+        video = tmp_path / "mix.mkv"
+        video.write_bytes(b"v")
+        mix_id = await _add_mix(
+            title="Waiting Mix", video_file_path=str(video), duration_seconds=100.0
+        )
+
+        monkeypatch.setattr(pipeline_mod, "VIDEO_POLL_INTERVAL", 0)
+        checks = []
+
+        async def fake_check(path, audio_duration):
+            checks.append(path)
+            return False, "video 640s < 90% of audio 6900s — likely partial sync"
+
+        monkeypatch.setattr(pipeline_mod, "check_video_complete", fake_check)
+
+        resolved, reason = await PipelineOrchestrator()._wait_for_video(mix_id)
+        assert resolved is False
+        assert len(checks) == 2  # ceiling came from the DB setting, not 48
+        assert "likely partial sync" in reason  # the step fails with WHY
+
+    async def test_resolves_once_video_completes(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        import app.services.pipeline as pipeline_mod
+        from app.services.pipeline import PipelineOrchestrator
+
+        video = tmp_path / "mix.mkv"
+        video.write_bytes(b"v")
+        mix_id = await _add_mix(
+            title="Recovering Mix", video_file_path=str(video), duration_seconds=100.0
+        )
+
+        monkeypatch.setattr(pipeline_mod, "VIDEO_POLL_INTERVAL", 0)
+        results = iter(
+            [
+                (False, "video file modified 5s ago — still syncing"),
+                (True, "ok"),
+            ]
+        )
+
+        async def fake_check(path, audio_duration):
+            return next(results)
+
+        monkeypatch.setattr(pipeline_mod, "check_video_complete", fake_check)
+
+        resolved, reason = await PipelineOrchestrator()._wait_for_video(
+            mix_id, max_checks=5
+        )
+        assert resolved is True
+        assert reason == "ok"

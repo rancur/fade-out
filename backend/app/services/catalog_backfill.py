@@ -25,6 +25,13 @@ Progress lands in ``catalog_backfill`` activity events; the run summary
 (including the unmatched-mixes report) persists under
 ``AppSettings.settings_json["catalog_last_backfill"]``. A stored cancel flag
 (``catalog_backfill_cancel``) is honored between mixes.
+
+The summary is persisted as ``running`` when the run STARTS, so a container
+restart/deploy that kills the process mid-run is detectable afterward:
+:func:`last_run_incomplete` + the boot-time auto-resume hook
+(``routers.catalog.kickoff_backfill_auto_resume``, gated by the
+``backfill_auto_resume`` setting) restart it automatically — safe because the
+backfill is idempotent (mixes that already have tracklists are skipped).
 """
 
 import asyncio
@@ -50,6 +57,14 @@ logger = logging.getLogger(__name__)
 
 LAST_BACKFILL_KEY = "catalog_last_backfill"
 BACKFILL_CANCEL_KEY = "catalog_backfill_cancel"
+
+# Last-run statuses that mean the run never made it to the end of the match
+# list: "running" is the boot-time marker a container restart/deploy leaves
+# behind (a live run can only exist inside this process), "cancelled" covers
+# both the stored cancel flag and a shutdown that cancelled the task between
+# mixes. "ok"/"partial"/"failed" all ran to completion and are NOT resumed —
+# auto-restarting a "failed" run would just loop the same crash.
+INCOMPLETE_STATUSES = frozenset({"running", "cancelled"})
 
 AUDIO_EXTENSIONS = {".flac", ".mp3", ".mp4", ".m4a", ".wav", ".aiff", ".ogg"}
 
@@ -323,6 +338,29 @@ async def _clear_cancel() -> None:
             await session.commit()
 
 
+async def _persist_summary(summary: Dict[str, Any]) -> None:
+    """Store the run summary under ``LAST_BACKFILL_KEY`` (own short session)."""
+    async with async_session_factory() as session:
+        settings_row = await _get_settings_row(session)
+        merged = dict(settings_row.settings_json or {})
+        merged[LAST_BACKFILL_KEY] = summary
+        settings_row.settings_json = merged
+        await session.commit()
+
+
+async def last_run_incomplete() -> bool:
+    """True when the stored last-run summary shows the run never completed.
+
+    Feeds the boot auto-resume (``routers.catalog.kickoff_backfill_auto_resume``):
+    a summary stuck in ``running`` means a restart/deploy killed the process
+    mid-backfill, ``cancelled`` means it stopped between mixes.
+    """
+    async with async_session_factory() as session:
+        row = await _get_settings_row(session)
+        last = (row.settings_json or {}).get(LAST_BACKFILL_KEY) or {}
+    return last.get("status") in INCOMPLETE_STATUSES
+
+
 # ---------------------------------------------------------------------------
 # Backfill run
 # ---------------------------------------------------------------------------
@@ -472,6 +510,14 @@ async def run_backfill(mix_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     await _clear_cancel()
     await activity_log.info("catalog_backfill", "Tracklist backfill started.")
 
+    # Persist the "running" summary up front: if a restart/deploy kills this
+    # process mid-run, the stored status stays "running" and the boot
+    # auto-resume can tell the run never completed.
+    try:
+        await _persist_summary(summary)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Failed to persist backfill start marker")
+
     try:
         async with async_session_factory() as session:
             query = select(Mix).where(Mix.source == "imported")
@@ -553,12 +599,7 @@ async def run_backfill(mix_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     await _clear_cancel()
 
     try:
-        async with async_session_factory() as session:
-            settings_row = await _get_settings_row(session)
-            merged = dict(settings_row.settings_json or {})
-            merged[LAST_BACKFILL_KEY] = summary
-            settings_row.settings_json = merged
-            await session.commit()
+        await _persist_summary(summary)
     except Exception:  # pragma: no cover - defensive
         logger.exception("Failed to persist backfill summary")
 
