@@ -353,6 +353,24 @@ def title_diversity_problem(title: str, used_titles: List[str]) -> Optional[str]
     return None
 
 
+async def _title_problem(
+    session, title: str, used_titles: List[str], mix_id: Optional[str] = None
+) -> Optional[str]:
+    """The in-run diversity guard plus the persistent uniqueness registry:
+    why a drafted title can't be accepted, or None when it's clear."""
+    problem = title_diversity_problem(title, used_titles)
+    if problem:
+        return problem
+    if session is not None:
+        from app.services import uniqueness
+
+        if await uniqueness.is_taken(
+            session, uniqueness.KIND_TITLE, title, exclude_mix_id=mix_id
+        ):
+            return "is already claimed in the uniqueness registry"
+    return None
+
+
 async def draft_with_diversity_guard(
     mix: Mix, generator, session, used_titles: List[str]
 ) -> Optional[Dict[str, Any]]:
@@ -364,7 +382,7 @@ async def draft_with_diversity_guard(
     )
     if not draft:
         return None
-    problem = title_diversity_problem(draft["title"], used_titles)
+    problem = await _title_problem(session, draft["title"], used_titles, mix.id)
     if not problem:
         return draft
 
@@ -377,7 +395,9 @@ async def draft_with_diversity_guard(
         mix, generator, session, used_titles=used_titles, retry_feedback=feedback
     )
     if retry:
-        retry_problem = title_diversity_problem(retry["title"], used_titles)
+        retry_problem = await _title_problem(
+            session, retry["title"], used_titles, mix.id
+        )
         if not retry_problem:
             return retry
         draft, problem = retry, retry_problem
@@ -614,6 +634,13 @@ async def run_improve(mix_ids: Optional[Any] = None) -> Dict[str, Any]:
                 summary["skipped"] += 1
                 continue
             used_titles.append(draft["title"])
+            # Hard uniqueness: claim the accepted title in the registry so no
+            # other flow (pipeline, series, later improve runs) can reuse it.
+            from app.services import uniqueness
+
+            await uniqueness.claim(
+                session, uniqueness.KIND_TITLE, draft["title"], mix.id
+            )
             for proposal in _draft_proposals_for_mix(mix, draft):
                 session.add(proposal)
                 summary["proposals_drafted"] += 1
