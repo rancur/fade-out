@@ -64,14 +64,23 @@ async def _resolve_youtube_publish_mode(
 ) -> str:
     """Effective publish mode for a YouTube mix upload.
 
-    ``youtube_publish_mode`` (immediate | scheduled | premiere) resolved via
-    app_config wins whenever it is explicitly set in settings_json. When it
-    is not set, legacy ``premiere_mode`` values that change privacy
-    (``instant`` / the ``unlisted`` safety flag) are honored so existing
-    deployments keep their behavior; otherwise the schema default
-    (scheduled) applies.
+    ``youtube_publish_mode`` (immediate | scheduled) resolved via app_config
+    wins whenever it is explicitly set in settings_json. When it is not set,
+    legacy ``premiere_mode`` values that change privacy (``instant`` / the
+    ``unlisted`` safety flag) are honored so existing deployments keep their
+    behavior; otherwise the schema default (scheduled) applies.
+
+    A stored ``premiere`` value (written by builds that offered the mode
+    before it was dropped — the Data API cannot create Premieres) is coerced
+    to ``scheduled``, which is what it always did in practice.
     """
     publish_mode = await app_config.resolve("youtube_publish_mode")
+    if publish_mode == "premiere":
+        logger.info(
+            "stored youtube_publish_mode 'premiere' is no longer supported; "
+            "using 'scheduled'"
+        )
+        publish_mode = "scheduled"
 
     sj = (app_settings.settings_json or {}) if app_settings else {}
     if not sj.get("youtube_publish_mode"):
