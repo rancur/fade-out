@@ -460,7 +460,10 @@ async def handle_generate_description(
         if bpms:
             bpm_range = [min(bpms), max(bpms)]
 
-    from app.services.description_generator import DescriptionGenerator
+    from app.services.description_generator import (
+        DescriptionGenerator,
+        derive_title_identity,
+    )
     from app.services.tag_generator import TagGenerator
 
     app_settings = await _get_app_settings(session)
@@ -470,7 +473,16 @@ async def handle_generate_description(
 
     # Generate a creative SoundCloud title. Its uniqueness claim + usage rows
     # are committed in a short session of their own before any further await.
+    #
+    # Series / raid-train episodes MUST stay recognizable (live incident
+    # 2026-07-20: a raid-train file shipped under a fully abstract title and
+    # the owner could not find his own uploads): the identity derived from the
+    # source filename becomes a mandatory prefix on both platform titles, and
+    # only the hook after it is creative.
     raw_filename = Path(mix.audio_file_path).stem if mix.audio_file_path else "mix"
+    identity = derive_title_identity(raw_filename)
+    if identity:
+        logger.info("Source file carries series identity: %s", identity)
     async with async_session_factory() as title_session:
         creative_title = await desc_gen.generate_creative_title(
             genres=genres,
@@ -479,6 +491,7 @@ async def handle_generate_description(
             filename=raw_filename,
             session=title_session,
             mix_id=mix_id,
+            identity=identity,
         )
         await title_session.commit()
     mix.title = creative_title
@@ -523,6 +536,7 @@ async def handle_generate_description(
             duration_seconds=duration,
             session=usage_session,
             mix_id=mix_id,
+            identity=identity,
         )
         await usage_session.commit()
 
