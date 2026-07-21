@@ -59,6 +59,30 @@ async def _get_app_settings(session: AsyncSession) -> Optional[AppSettings]:
     return await session.get(AppSettings, 1)
 
 
+async def _resolve_youtube_publish_mode(
+    app_settings: Optional[AppSettings],
+) -> str:
+    """Effective publish mode for a YouTube mix upload.
+
+    ``youtube_publish_mode`` (immediate | scheduled | premiere) resolved via
+    app_config wins whenever it is explicitly set in settings_json. When it
+    is not set, legacy ``premiere_mode`` values that change privacy
+    (``instant`` / the ``unlisted`` safety flag) are honored so existing
+    deployments keep their behavior; otherwise the schema default
+    (scheduled) applies.
+    """
+    publish_mode = await app_config.resolve("youtube_publish_mode")
+
+    sj = (app_settings.settings_json or {}) if app_settings else {}
+    if not sj.get("youtube_publish_mode"):
+        legacy = settings.PREMIERE_MODE
+        if app_settings is not None and app_settings.premiere_mode:
+            legacy = app_settings.premiere_mode
+        if legacy in ("instant", "unlisted"):
+            publish_mode = legacy
+    return publish_mode
+
+
 def _sc_token_persister(app_settings: Optional[AppSettings]):
     """Callback that persists rotated SoundCloud tokens into app_settings.
 
@@ -800,17 +824,16 @@ async def handle_upload_youtube(
     genres = mix.genres or ["electronic"]
     tags = mix.tags or tag_gen.generate(genres=genres, vibes=mix.vibes or [])
 
-    # Determine premiere mode from app settings or config
-    premiere_mode = settings.PREMIERE_MODE
-    if app_settings and app_settings.premiere_mode:
-        premiere_mode = app_settings.premiere_mode
+    # Effective publish mode (youtube_publish_mode, with legacy premiere_mode
+    # instant/unlisted honored when the new key is unset).
+    publish_mode = await _resolve_youtube_publish_mode(app_settings)
 
     sj_yt = (app_settings.settings_json or {}) if app_settings else {}
     uploader = YouTubeUploader(db_settings_json=sj_yt, mix_id=mix_id)
     await _emit_activity(
         "info", "upload_attempt",
-        f"Uploading to YouTube ({premiere_mode}): {mix.title_youtube or mix.title}",
-        mix_id=mix_id, platform="youtube", context={"premiere_mode": premiere_mode},
+        f"Uploading to YouTube ({publish_mode}): {mix.title_youtube or mix.title}",
+        mix_id=mix_id, platform="youtube", context={"publish_mode": publish_mode},
     )
     result = await uploader.upload(
         video_path=mix.video_file_path,
@@ -818,7 +841,7 @@ async def handle_upload_youtube(
         description=mix.description_youtube or "",
         tags=tag_gen.format_for_youtube(tags),
         thumbnail_path=mix.thumbnail_path,
-        premiere_mode=premiere_mode,
+        premiere_mode=publish_mode,
         genre_for_playlist=genres[0] if genres else None,
         progress_cb=progress_cb,
     )
