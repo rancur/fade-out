@@ -67,6 +67,63 @@ class _FakeAppSettings:
         self.settings_json = settings_json
 
 
+class _FakeSettingsRow:
+    def __init__(self, settings_json=None, premiere_mode=None):
+        self.settings_json = settings_json or {}
+        self.premiere_mode = premiere_mode
+
+
+class TestResolveYoutubePublishMode:
+    """youtube_publish_mode resolution with legacy premiere_mode compat."""
+
+    @staticmethod
+    def _patch_resolve(monkeypatch, value="scheduled"):
+        async def fake_resolve(key, force_refresh=False):
+            assert key == "youtube_publish_mode"
+            return value
+
+        monkeypatch.setattr(handlers_mod.app_config, "resolve", fake_resolve)
+
+    async def test_explicit_new_key_wins_over_legacy(self, monkeypatch):
+        self._patch_resolve(monkeypatch, "premiere")
+        row = _FakeSettingsRow(
+            settings_json={"youtube_publish_mode": "premiere"},
+            premiere_mode="unlisted",
+        )
+        assert await handlers_mod._resolve_youtube_publish_mode(row) == "premiere"
+
+    async def test_immediate_mode_resolves(self, monkeypatch):
+        self._patch_resolve(monkeypatch, "immediate")
+        row = _FakeSettingsRow(
+            settings_json={"youtube_publish_mode": "immediate"},
+            premiere_mode="scheduled",
+        )
+        assert await handlers_mod._resolve_youtube_publish_mode(row) == "immediate"
+
+    async def test_legacy_unlisted_safety_flag_honored_when_key_unset(
+        self, monkeypatch
+    ):
+        self._patch_resolve(monkeypatch)  # schema default
+        row = _FakeSettingsRow(premiere_mode="unlisted")
+        assert await handlers_mod._resolve_youtube_publish_mode(row) == "unlisted"
+
+    async def test_legacy_instant_honored_when_key_unset(self, monkeypatch):
+        self._patch_resolve(monkeypatch)
+        row = _FakeSettingsRow(premiere_mode="instant")
+        assert await handlers_mod._resolve_youtube_publish_mode(row) == "instant"
+
+    async def test_default_is_scheduled(self, monkeypatch):
+        self._patch_resolve(monkeypatch)
+        row = _FakeSettingsRow(premiere_mode="scheduled")
+        assert await handlers_mod._resolve_youtube_publish_mode(row) == "scheduled"
+
+    async def test_no_settings_row_uses_resolved_default(self, monkeypatch):
+        self._patch_resolve(monkeypatch)
+        assert (
+            await handlers_mod._resolve_youtube_publish_mode(None) == "scheduled"
+        )
+
+
 async def _seed_app_settings(settings_json):
     async with async_session_factory() as session:
         session.add(AppSettings(id=1, settings_json=settings_json))
