@@ -7,13 +7,20 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.services.catalog_improve import (
+    BANNED_STRIP_FALLBACK_HOOK,
     OVERUSED_TITLE_WORDS,
+    TITLE_MAX_CHARS,
+    TITLE_TARGET_CHARS,
+    banned_wording_problem,
     build_platform_description,
     classify_title_heuristic,
     draft_improvement_llm,
     draft_with_diversity_guard,
     extract_tracklist_block,
+    genre_in_title,
     run_improve,
+    sanitize_title,
+    strip_banned_wording,
     title_diversity_problem,
 )
 
@@ -276,7 +283,9 @@ class TestRunImprove:
         proposals = await _proposals()
         by_key = {(p.platform, p.field): p for p in proposals}
         title = by_key[("both", "title")]
-        assert title.proposed_value == "Peak-Time Techno Rampage"
+        # Shape enforced: the mix has no genres, so the fallback genre keyword
+        # is appended (one title, used identically on both platforms).
+        assert title.proposed_value == "Peak-Time Techno Rampage | Open Format Mix"
         assert title.status == "draft" and title.created_by == "ai"
         assert title.current_value == "Raid Train 2024-05-01"
 
@@ -317,7 +326,7 @@ class TestRunImprove:
         assert len(classify_calls) == 1
 
     async def test_locked_mixes_are_skipped(self, prepared_db, fake_llm):
-        await _make_mix(title="Raid Train 2024-05-01", title_locked=True)
+        await _make_mix(title="Four Decks and a Prayer", title_locked=True)
         summary = await run_improve("all_generic")
         assert summary["classified"] == 0  # excluded by the all_generic query
         assert await _proposals() == []
@@ -406,7 +415,10 @@ class TestRunImprove:
             p.proposed_value for p in proposals
             if p.field == "title" and p.status == "draft"
         }
-        assert drafted == {"Midnight Freight Elevator", "Bassline Border Crossing"}
+        assert drafted == {
+            "Midnight Freight Elevator | Open Format Mix",
+            "Bassline Border Crossing | Open Format Mix",
+        }
 
         draft_prompts = [
             c for g in FakeGenerator.instances for c in g.calls if "triaging" not in c
@@ -441,7 +453,7 @@ class TestRunImprove:
         # Kept despite the banned words, but with an activity warning.
         assert summary["proposals_drafted"] == 3
         titles = {p.proposed_value for p in await _proposals() if p.field == "title"}
-        assert titles == {"Sonic Odyssey"}
+        assert titles == {"Sonic Odyssey | Open Format Mix"}
 
         from app.services import activity_log
 
@@ -458,3 +470,308 @@ class TestRunImprove:
         assert len(items) == 1
         assert "1 keeper" not in items[0]["message"]  # 0 keepers here
         assert "5 proposals drafted" in items[0]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Banned wording (retired stream-era title wording)
+# ---------------------------------------------------------------------------
+
+BANNED_TITLE_SAMPLES = [
+    ("Will See Wednesdays", "Will See Wednesdays: Desert Frequencies"),
+    ("Will See Wednesdays lowercase", "will see wednesdays — neon cactus"),
+    ("Second Saturdays", "Second Saturdays at the Warehouse"),
+    ("2nd Saturdays", "2ND SATURDAYS Deep Cuts"),
+    ("Raid Train", "Neon Cactus Raid Train"),
+    ("raid-train casing", "neon cactus RAID-TRAIN hour 4"),
+    ("Will See | prefix", "Will See | Desert Frequencies"),
+    ("Will See - prefix", "Will See - Desert Frequencies"),
+    ("ISO date", "Desert Frequencies 2026-07-20"),
+    ("US date", "Desert Frequencies 07-20-2026"),
+    ("parenthesized date", "Desert Frequencies (2026-07-20)"),
+]
+
+
+class TestBannedWording:
+    @pytest.mark.parametrize(
+        "title", [t for _, t in BANNED_TITLE_SAMPLES],
+        ids=[name for name, _ in BANNED_TITLE_SAMPLES],
+    )
+    def test_detected(self, title):
+        assert banned_wording_problem(title) is not None
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Desert Frequencies After Dark | Techno Mix",
+            "Four Decks and a Prayer | House Mix",
+            # "Will See" not used as a prefix is fine (it is the brand name)
+            "What the Desert Will See | Techno Mix",
+            # a volume numeral is not a date
+            "Silk and Static Vol 3 | House Mix",
+        ],
+    )
+    def test_clean_titles_pass(self, title):
+        assert banned_wording_problem(title) is None
+
+    @pytest.mark.parametrize(
+        "title", [t for _, t in BANNED_TITLE_SAMPLES],
+        ids=[name for name, _ in BANNED_TITLE_SAMPLES],
+    )
+    def test_strip_removes_the_banned_part(self, title):
+        stripped = strip_banned_wording(title)
+        assert banned_wording_problem(stripped) is None
+
+    def test_strip_leaves_the_creative_hook_intact(self):
+        assert (
+            strip_banned_wording("Will See Wednesdays: Desert Frequencies")
+            == "Desert Frequencies"
+        )
+        assert (
+            strip_banned_wording("Will See | Desert Frequencies")
+            == "Desert Frequencies"
+        )
+        assert (
+            strip_banned_wording("Desert Frequencies (2026-07-20)")
+            == "Desert Frequencies"
+        )
+
+    def test_sanitize_keeps_genre_and_drops_banned_wording(self):
+        out = sanitize_title("Will See Wednesdays: Neon Cactus", "Techno")
+        assert out == "Neon Cactus | Techno Mix"
+        assert banned_wording_problem(out) is None
+
+    def test_sanitize_falls_back_when_banned_wording_was_the_whole_title(self):
+        out = sanitize_title("Second Saturdays", "House")
+        assert banned_wording_problem(out) is None
+        assert out.startswith(BANNED_STRIP_FALLBACK_HOOK)
+        assert "House" in out
+
+    def test_sanitize_respects_the_length_cap(self):
+        out = sanitize_title("Raid Train " + "Very Long Hook " * 8, "Drum & Bass")
+        assert len(out) <= TITLE_MAX_CHARS
+        assert genre_in_title(out, "Drum & Bass")
+
+    @pytest.mark.parametrize(
+        "title", [t for _, t in BANNED_TITLE_SAMPLES],
+        ids=[name for name, _ in BANNED_TITLE_SAMPLES],
+    )
+    def test_heuristic_classifies_banned_wording_as_generic(self, title):
+        assert classify_title_heuristic(title) == "generic"
+
+    def test_diversity_guard_rejects_banned_wording(self):
+        assert title_diversity_problem("Second Saturdays Deep Cuts", []) is not None
+
+
+# ---------------------------------------------------------------------------
+# Unified title shape on the catalog path
+# ---------------------------------------------------------------------------
+
+class TestCatalogTitleShape:
+    async def test_genre_appended_when_the_llm_drops_it(self):
+        class NoGenre(FakeGenerator):
+            async def _create_completion(self, prompt, max_tokens, temperature):
+                self.calls.append(prompt)
+                return FakeResponse(), json.dumps(
+                    {"title": "Neon Cactus After Dark", "description": "Body."}
+                )
+
+        mix = _transient_mix()  # genres=["techno"]
+        draft = await draft_improvement_llm(mix, NoGenre(), None)
+        assert draft["title"] == "Neon Cactus After Dark | Techno Mix"
+
+    async def test_overlong_title_is_capped_but_keeps_the_genre(self):
+        class TooLong(FakeGenerator):
+            async def _create_completion(self, prompt, max_tokens, temperature):
+                self.calls.append(prompt)
+                return FakeResponse(), json.dumps(
+                    {
+                        "title": "An Extremely Long Evocative Hook That Simply "
+                                 "Refuses To Stop Running On And On",
+                        "description": "Body.",
+                    }
+                )
+
+        draft = await draft_improvement_llm(_transient_mix(), TooLong(), None)
+        assert len(draft["title"]) <= TITLE_MAX_CHARS
+        assert genre_in_title(draft["title"], "Techno")
+
+    async def test_prompt_states_the_unified_title_policy(self):
+        gen = FakeGenerator()
+        await draft_improvement_llm(_transient_mix(), gen, None)
+        prompt = gen.calls[0]
+        assert "BOTH SoundCloud and YouTube" in prompt
+        assert "BANNED WORDINGS" in prompt
+        assert "Will See Wednesdays" in prompt
+        assert "Second Saturdays" in prompt
+        assert "Raid Train" in prompt
+        assert str(TITLE_MAX_CHARS) in prompt
+        assert str(TITLE_TARGET_CHARS) in prompt
+        assert "Techno" in prompt  # the resolved genre keyword
+
+
+class TestBannedWordingGuard:
+    async def test_retry_then_deterministic_strip(self, prepared_db, monkeypatch):
+        """The LLM insists on the retired wording twice -> we strip it by hand
+        rather than letting it reach a proposal."""
+        import app.services.description_generator as dg
+
+        class Stubborn(FakeGenerator):
+            async def _create_completion(self, prompt, max_tokens, temperature):
+                self.calls.append(prompt)
+                if "triaging DJ mix titles" in prompt:
+                    return FakeResponse(), json.dumps([{"n": 1, "class": "generic"}])
+                return FakeResponse(), json.dumps(
+                    {
+                        "title": "Will See Wednesdays: Neon Cactus",
+                        "description": "Body.",
+                    }
+                )
+
+        FakeGenerator.instances = []
+        monkeypatch.setattr(dg, "DescriptionGenerator", Stubborn)
+        await _make_mix(genres=["techno"])
+        await run_improve("all_generic")
+
+        titles = {p.proposed_value for p in await _proposals() if p.field == "title"}
+        assert titles == {"Neon Cactus | Techno Mix"}
+        for title in titles:
+            assert banned_wording_problem(title) is None
+
+        draft_prompts = [
+            c for g in FakeGenerator.instances for c in g.calls if "triaging" not in c
+        ]
+        assert len(draft_prompts) == 2  # first attempt + one retry
+        assert "WAS REJECTED" in draft_prompts[1]
+
+        from app.services import activity_log
+
+        items, _ = await activity_log.query(event="catalog_improve", level="warn")
+        assert len(items) == 1
+        assert "Banned wording guard" in items[0]["message"]
+
+    async def test_retry_that_comes_back_clean_is_used_as_is(self):
+        titles = iter(["Raid Train Hour Four", "Bassline Border Crossing"])
+
+        class Seq(FakeGenerator):
+            async def _create_completion(self, prompt, max_tokens, temperature):
+                self.calls.append(prompt)
+                return FakeResponse(), json.dumps(
+                    {"title": next(titles), "description": "Body."}
+                )
+
+        gen = Seq()
+        draft = await draft_with_diversity_guard(
+            _transient_mix(), gen, None, used_titles=[]
+        )
+        assert draft["title"] == "Bassline Border Crossing | Techno Mix"
+        assert len(gen.calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# One title, both platforms
+# ---------------------------------------------------------------------------
+
+class TestUnifiedCatalogTitles:
+    async def test_single_title_proposal_covers_both_platforms(
+        self, prepared_db, fake_llm
+    ):
+        await _make_mix()
+        await run_improve("all_generic")
+
+        titles = [p for p in await _proposals() if p.field == "title"]
+        # ONE row, not one per platform -- catalog_apply fans "both" out to the
+        # YouTube video and the SoundCloud track with the identical string.
+        assert len(titles) == 1
+        assert titles[0].platform == "both"
+
+    async def test_locked_mix_with_banned_wording_is_reopened(
+        self, prepared_db, fake_llm
+    ):
+        """title_locked was never meant to bless retired series wording."""
+        mid = await _make_mix(
+            title="Will See Wednesdays: Desert Frequencies", title_locked=True
+        )
+        summary = await run_improve("all_generic")
+
+        assert summary["classified"] == 1
+        assert summary["generic"] == 1
+        assert summary["proposals_drafted"] == 5
+        assert (await _mix(mid)).title_locked is False
+
+    async def test_locked_clean_mix_stays_untouched(self, prepared_db, fake_llm):
+        await _make_mix(title="Four Decks and a Prayer", title_locked=True)
+        summary = await run_improve("all_generic")
+        assert summary["classified"] == 0
+        assert await _proposals() == []
+
+    async def test_divergent_keeper_is_unified_without_an_llm_call(
+        self, prepared_db, fake_llm
+    ):
+        """A keeper whose YouTube title disagrees with mix.title is a data
+        problem, not a creative one: adopt mix.title on both platforms."""
+        await _make_mix(
+            title="Four Decks and a Prayer",
+            title_youtube="DJ Will See Live 5/1 (reupload)",
+            title_locked=True,
+        )
+        summary = await run_improve("all_generic")
+
+        assert summary["divergent_unified"] == 1
+        assert summary["proposals_drafted"] == 1
+        titles = [p for p in await _proposals() if p.field == "title"]
+        assert len(titles) == 1
+        assert titles[0].platform == "both"
+        assert titles[0].proposed_value == "Four Decks and a Prayer | Open Format Mix"
+
+        # No draft prompts were spent on it.
+        draft_prompts = [
+            c for g in fake_llm.instances for c in g.calls if "triaging" not in c
+        ]
+        assert draft_prompts == []
+
+    async def test_unified_keeper_is_left_alone(self, prepared_db, fake_llm):
+        await _make_mix(
+            title="Four Decks and a Prayer",
+            title_youtube="Four Decks and a Prayer",
+            title_locked=True,
+        )
+        summary = await run_improve("all_generic")
+        assert summary["classified"] == 0
+        assert summary["divergent_unified"] == 0
+        assert await _proposals() == []
+
+    async def test_uniqueness_registry_still_blocks_a_claimed_title(
+        self, prepared_db, monkeypatch
+    ):
+        import app.services.description_generator as dg
+        from app.database import async_session_factory
+        from app.services import uniqueness
+
+        async with async_session_factory() as session:
+            await uniqueness.claim(
+                session, uniqueness.KIND_TITLE, "Neon Cactus | Techno Mix", None
+            )
+            await session.commit()
+
+        titles = iter(["Neon Cactus", "Bassline Border Crossing"])
+
+        class Seq(FakeGenerator):
+            async def _create_completion(self, prompt, max_tokens, temperature):
+                self.calls.append(prompt)
+                if "triaging DJ mix titles" in prompt:
+                    return FakeResponse(), json.dumps([{"n": 1, "class": "generic"}])
+                return FakeResponse(), json.dumps(
+                    {"title": next(titles), "description": "Body."}
+                )
+
+        FakeGenerator.instances = []
+        monkeypatch.setattr(dg, "DescriptionGenerator", Seq)
+        await _make_mix(genres=["techno"])
+        await run_improve("all_generic")
+
+        proposed = {p.proposed_value for p in await _proposals() if p.field == "title"}
+        assert proposed == {"Bassline Border Crossing | Techno Mix"}
+        draft_prompts = [
+            c for g in FakeGenerator.instances for c in g.calls if "triaging" not in c
+        ]
+        assert len(draft_prompts) == 2  # the claimed title forced a retry
