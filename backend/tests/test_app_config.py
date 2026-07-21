@@ -49,11 +49,14 @@ class TestValidation:
         assert d.type == "enum"
         assert d.category == "YouTube"
         assert d.editable is True
-        assert d.choices == ("immediate", "scheduled", "premiere")
+        assert d.choices == ("immediate", "scheduled")
         assert d.key not in app_config.SECRET_JSON_KEYS
         assert app_config.env_default(d) == "scheduled"
-        assert app_config.validate_value(d, "premiere") == "premiere"
-        for bad in ("instant", "unlisted", "now", 3):
+        assert app_config.validate_value(d, "immediate") == "immediate"
+        assert app_config.validate_value(d, "scheduled") == "scheduled"
+        # "premiere" is no longer offered: the Data API cannot create
+        # Premieres, so the schema must reject it outright.
+        for bad in ("premiere", "instant", "unlisted", "now", 3):
             with pytest.raises(ValueError):
                 app_config.validate_value(d, bad)
 
@@ -163,12 +166,12 @@ class TestResolve:
 
         async with async_session_factory() as session:
             session.add(
-                AppSettings(id=1, settings_json={"youtube_publish_mode": "premiere"})
+                AppSettings(id=1, settings_json={"youtube_publish_mode": "immediate"})
             )
             await session.commit()
 
         app_config.invalidate_cache()
-        assert await app_config.resolve("youtube_publish_mode") == "premiere"
+        assert await app_config.resolve("youtube_publish_mode") == "immediate"
 
     async def test_backfill_auto_resume_in_schema_and_roundtrips(
         self, prepared_db

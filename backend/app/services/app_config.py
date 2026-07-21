@@ -228,14 +228,14 @@ SETTINGS_SCHEMA: Tuple[SettingDef, ...] = (
     SettingDef(
         key="youtube_publish_mode",
         label="Publish mode",
-        help="How mix uploads go live: immediate (public on upload), scheduled "
-             "(private + publishAt at the configured premiere day/hour), or "
-             "premiere (simulive). The Data API cannot create Premieres "
-             "(feature request 414284069 is open), so premiere currently "
-             "falls back to scheduled with an activity warning — flip the "
-             "video to a Premiere in YouTube Studio.",
+        help="How mix uploads go live: immediate (publish public on upload) or "
+             "scheduled (private until the configured premiere_day/"
+             "premiere_hour_utc slot, then auto-public). YouTube Premieres are "
+             "not offered here — the Data API cannot create them (feature "
+             "request 414284069 is open), so a Premiere must be enabled "
+             "manually on the video in YouTube Studio.",
         type="enum", category="YouTube",
-        choices=("immediate", "scheduled", "premiere"), fallback="scheduled",
+        choices=("immediate", "scheduled"), fallback="scheduled",
     ),
     SettingDef(
         key="youtube_daily_quota_budget",
