@@ -540,3 +540,97 @@ class TestRunCatalogSync:
         await run_catalog_sync()
         items, _total = await activity_log.query(event="catalog_sync")
         assert len(items) >= 2  # started + finished at minimum
+
+
+# ---------------------------------------------------------------------------
+# Sync must not re-introduce per-platform title divergence
+# ---------------------------------------------------------------------------
+
+class TestSyncKeepsTitlesUnified:
+    """Titles are unified (one string, both platforms). A sync backfilling
+    ``title_youtube`` from whatever the video is currently called would undo
+    that every time it ran, so the live value is only adopted when it agrees
+    with ``mix.title``."""
+
+    @staticmethod
+    def _yt(title):
+        return {
+            "id": "vidUnify001",
+            "platform": "youtube",
+            "url": "https://youtu.be/vidUnify001",
+            "title": title,
+            "description": "yt desc",
+            "duration_seconds": 3600.0,
+            "published_at": None,
+            "thumbnail_url": None,
+            "privacy_status": "public",
+        }
+
+    def test_divergent_live_title_is_not_adopted(self):
+        from app.models import Mix
+        from app.services.catalog_sync import _attach_platform_data
+
+        mix = Mix(title="Four Decks and a Prayer | House Mix")
+        _attach_platform_data(mix, self._yt("Will See Wednesdays 2024-05-01"), None)
+
+        assert mix.title_youtube is None
+        assert mix.title == "Four Decks and a Prayer | House Mix"
+
+    def test_agreeing_live_title_is_adopted(self):
+        from app.models import Mix
+        from app.services.catalog_sync import _attach_platform_data
+
+        mix = Mix(title="Four Decks and a Prayer | House Mix")
+        _attach_platform_data(mix, self._yt("Four Decks and a Prayer | House Mix"), None)
+
+        assert mix.title_youtube == "Four Decks and a Prayer | House Mix"
+
+    def test_live_title_is_still_recorded_in_catalog_metadata(self):
+        from app.models import Mix
+        from app.services.catalog_sync import _attach_platform_data
+
+        mix = Mix(title="Four Decks and a Prayer | House Mix")
+        _attach_platform_data(mix, self._yt("Will See Wednesdays 2024-05-01"), None)
+
+        # Nothing is lost -- the operator can still see what YouTube shows.
+        meta = mix.metadata_json["catalog"]["youtube"]
+        assert meta["title"] == "Will See Wednesdays 2024-05-01"
+
+    def test_existing_unified_title_is_never_clobbered(self):
+        from app.models import Mix
+        from app.services.catalog_sync import _attach_platform_data
+
+        mix = Mix(
+            title="Four Decks and a Prayer | House Mix",
+            title_youtube="Four Decks and a Prayer | House Mix",
+        )
+        _attach_platform_data(mix, self._yt("Some Stale YouTube Name"), None)
+
+        assert mix.title == mix.title_youtube == "Four Decks and a Prayer | House Mix"
+
+    def test_imported_pair_with_different_platform_titles_does_not_diverge(self):
+        from app.services.catalog_sync import _new_imported_mix
+
+        sc = {
+            "id": "9001",
+            "platform": "soundcloud",
+            "url": "https://soundcloud.com/x/y",
+            "title": "Four Decks and a Prayer | House Mix",
+            "description": "sc desc",
+            "duration_seconds": 3600.0,
+            "published_at": None,
+            "artwork_url": None,
+            "sharing": "public",
+        }
+        mix = _new_imported_mix(self._yt("DJ Will See Live 5/1"), sc)
+
+        assert mix.title == "Four Decks and a Prayer | House Mix"
+        assert mix.title_youtube is None  # no divergence created at import
+
+    def test_youtube_only_import_still_gets_its_title(self):
+        from app.services.catalog_sync import _new_imported_mix
+
+        mix = _new_imported_mix(self._yt("Neon Cactus | Techno Mix"), None)
+
+        assert mix.title == "Neon Cactus | Techno Mix"
+        assert mix.title_youtube == "Neon Cactus | Techno Mix"

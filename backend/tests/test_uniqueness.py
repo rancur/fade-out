@@ -533,7 +533,10 @@ class TestImproveRegistryGuard:
             await session.commit()
             mix = await session.get(Mix, mid)
             draft = await draft_with_diversity_guard(mix, Seq(), session, [])
-            assert draft["title"] == "Something Brand New"
+            # The genre tail is appended by the shared shape policy, and
+            # normalize() strips it again for KIND_TITLE — so the claimed
+            # "Registered Already Banger" still blocks its shaped form.
+            assert draft["title"] == "Something Brand New | Open Format Mix"
             assert "WAS REJECTED" in Seq.calls[1]
 
 
