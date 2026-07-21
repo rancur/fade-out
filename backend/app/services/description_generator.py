@@ -3,6 +3,7 @@
 import logging
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import openai
@@ -73,6 +74,84 @@ def _response_text(response: Any) -> str:
     if not content:
         return ""
     return content.strip()
+
+# ---------------------------------------------------------------------------
+# Series / raid-train title identity
+# ---------------------------------------------------------------------------
+# A live incident (2026-07-20) shipped "Twitch DJs House Nation Raid Train
+# (2026-07-20).flac" as "Mirage Reverberation: Sonic Desert Dances" — a fully
+# abstract title with no series name and no date, unrecognizable to the owner.
+# The pipeline now derives the recurring-show identity from the SOURCE FILENAME
+# and keeps it as a mandatory title prefix; only the hook after it is creative.
+
+# Raid-train episodes are named after the hosting community:
+# "Twitch DJs <community> Raid Train".
+_RAID_TRAIN_IDENTITY_RE = re.compile(
+    r"\btwitch\s+djs?\s+(?:[\w&'’]+\s+)*?raid[\s\-]?train\b", re.IGNORECASE
+)
+
+# An ISO date token in the source filename, e.g. "(2026-07-20)".
+_IDENTITY_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+
+
+def _canonicalize_raid_train(raw: str) -> str:
+    """Normalize a matched raid-train phrase: title-case fully-lowercase words
+    (mixed-case words are kept as written) and fix the "DJs" brand casing."""
+    words = [
+        w if any(c.isupper() for c in w) else w.capitalize() for w in raw.split()
+    ]
+    return re.sub(r"\bDj(s?)\b", r"DJ\1", " ".join(words))
+
+
+def derive_title_identity(filename: str) -> Optional[str]:
+    """The recurring-show identity prefix a source filename carries, or None.
+
+    Recognizes the known series ("Will See Wednesdays", "2nd/Second
+    Saturdays" — same patterns the catalog playlist grouping uses) and
+    "Twitch DJs <X> Raid Train" episodes, appending the filename's ISO date
+    token when present:
+
+        "Twitch DJs House Nation Raid Train (2026-07-20).flac"
+            -> "Twitch DJs House Nation Raid Train (2026-07-20)"
+        "will_see_wednesdays_2026-07-16.flac"
+            -> "Will See Wednesdays (2026-07-16)"
+
+    One-off mixes (no known pattern) return None — their titles stay fully
+    creative.
+    """
+    # The catalog rollout's series detection is the canonical source for these
+    # patterns; reuse it rather than growing a second copy.
+    from app.services.catalog_playlists import (
+        SERIES_SATURDAYS,
+        SERIES_WEDNESDAYS,
+        _SATURDAYS_RE,
+        _WEDNESDAYS_RE,
+    )
+
+    stem = Path(filename).stem if filename else ""
+    text = re.sub(r"\s+", " ", stem.replace("_", " ")).strip()
+    if not text:
+        return None
+
+    base: Optional[str] = None
+    raid_match = _RAID_TRAIN_IDENTITY_RE.search(text)
+    if raid_match:
+        base = _canonicalize_raid_train(raid_match.group(0))
+    elif _WEDNESDAYS_RE.search(text):
+        base = SERIES_WEDNESDAYS
+    elif _SATURDAYS_RE.search(text):
+        base = SERIES_SATURDAYS
+    if base is None:
+        return None
+
+    date_match = _IDENTITY_DATE_RE.search(text)
+    return f"{base} ({date_match.group(1)})" if date_match else base
+
+
+# Platform title ceilings: SoundCloud allows 100 chars; YouTube allows 100.
+# With an identity prefix the creative hook gets whatever room remains.
+TITLE_WITH_IDENTITY_MAX = 100
+
 
 # ---------------------------------------------------------------------------
 # Default prompt template
@@ -173,15 +252,25 @@ MIX DATA:
 - Genres: {genres}
 - Vibes: {vibes}
 {tracklist_hint}
-{retry_feedback}
+{identity_hint}{retry_feedback}
 Return ONLY the title, nothing else.\
+"""
+
+# Extra instruction when the mix belongs to a recurring series / raid train:
+# the show name + date are prepended automatically, so the LLM writes only the
+# creative hook that follows them.
+CREATIVE_TITLE_IDENTITY_HINT = """\
+- This mix is an episode of "{identity}". That series name (and date) is
+  prepended to your title automatically — write ONLY the creative subtitle
+  hook that follows it. Do not repeat the series name, "raid train",
+  "twitch", or any date.
 """
 
 YOUTUBE_TITLE_PROMPT = """\
 Generate a YouTube title for a DJ mix upload.
 
 RULES:
-- Format: "{brand_name} | [Genre descriptor] [Mix Type] | [Vibe/Hook]"
+- Format: {format_rule}
 - LEAD the genre descriptor with the PRIMARY genre (the first one listed) --
   it is the dominant genre of the set and must drive the title and discovery
 - Under 60 characters when possible
@@ -199,6 +288,19 @@ MIX DATA:
 
 Return ONLY the title, nothing else.\
 """
+
+YOUTUBE_TITLE_FORMAT_DEFAULT = (
+    '"{brand_name} | [Genre descriptor] [Mix Type] | [Vibe/Hook]"'
+)
+
+# When the mix carries a series / raid-train identity, that identity is the
+# leading segment (prepended automatically) so the owner and subscribers can
+# recognize the episode; the LLM writes only the discoverability part.
+YOUTUBE_TITLE_FORMAT_IDENTITY = (
+    '"[Genre descriptor] [Mix Type] | [Vibe/Hook]" — the series name '
+    '"{identity}" is prepended automatically, so do NOT include the series '
+    'name, the artist/brand name, "raid train", "twitch", or any date'
+)
 
 
 class DescriptionGenerator:
@@ -343,6 +445,7 @@ class DescriptionGenerator:
         filename: str = "",
         session: Optional[AsyncSession] = None,
         mix_id: Optional[str] = None,
+        identity: Optional[str] = None,
     ) -> str:
         """Generate a creative, artistic mix title for SoundCloud.
 
@@ -351,6 +454,14 @@ class DescriptionGenerator:
         against the ``used_creative`` registry (exact + fuzzy), collisions
         retry with feedback, a stubborn collision gets a deterministic
         volume-numeral suffix, and the accepted title is claimed.
+
+        ``identity`` (a series / raid-train prefix from
+        :func:`derive_title_identity`) is MANDATORY branding when present: the
+        returned title is ``"<identity> — <hook>"``. Only the hook is
+        LLM-generated, and the whole uniqueness flow (registry check, retries,
+        suffix fallback, claim) runs on the hook alone — the shared prefix
+        must never make sibling episodes collide, and a hook may not repeat
+        across episodes just because its prefix differs.
         """
         from app.services import uniqueness
 
@@ -386,6 +497,11 @@ class DescriptionGenerator:
                 genres=", ".join(genres),
                 vibes=", ".join(vibes),
                 tracklist_hint=tracklist_hint,
+                identity_hint=(
+                    CREATIVE_TITLE_IDENTITY_HINT.format(identity=identity)
+                    if identity
+                    else ""
+                ),
                 used_titles_block=used_block,
                 retry_feedback=feedback,
             )
@@ -441,6 +557,17 @@ class DescriptionGenerator:
         if session is not None:
             await uniqueness.claim(session, uniqueness.KIND_TITLE, title, mix_id)
 
+        if identity:
+            # The identity prefix is non-negotiable: whatever the hook, the
+            # published title must stay recognizable as this series episode.
+            room = TITLE_WITH_IDENTITY_MAX - len(identity) - len(" — ")
+            hook = title
+            if len(hook) > room:
+                hook = hook[: max(room - 3, 0)].rstrip() + "..."
+            title = f"{identity} — {hook}" if hook else identity
+            logger.info("Generated creative title (identity kept): %s", title)
+            return title
+
         logger.info("Generated creative title: %s", title)
         return title
 
@@ -452,13 +579,26 @@ class DescriptionGenerator:
         duration_seconds: float = 0.0,
         session: Optional[AsyncSession] = None,
         mix_id: Optional[str] = None,
+        identity: Optional[str] = None,
     ) -> str:
-        """Generate an SEO-optimized YouTube title."""
+        """Generate an SEO-optimized YouTube title.
+
+        With an ``identity`` (series / raid-train prefix from
+        :func:`derive_title_identity`) the result is
+        ``"<identity> | <SEO descriptor>"`` — the episode must stay
+        recognizable in Studio and subscribers' feeds.
+        """
         duration_str = _format_duration(duration_seconds)
         bpm_str = f"{bpm_range[0]:.0f}-{bpm_range[1]:.0f}" if bpm_range else "unknown"
 
+        if identity:
+            format_rule = YOUTUBE_TITLE_FORMAT_IDENTITY.format(identity=identity)
+        else:
+            format_rule = YOUTUBE_TITLE_FORMAT_DEFAULT.format(
+                brand_name=settings.BRAND_NAME
+            )
         prompt = YOUTUBE_TITLE_PROMPT.format(
-            brand_name=settings.BRAND_NAME,
+            format_rule=format_rule,
             primary_genre=(genres[0] if genres else "electronic"),
             genres=", ".join(genres),
             vibes=", ".join(vibes),
@@ -479,6 +619,13 @@ class DescriptionGenerator:
                 response.usage.prompt_tokens,
                 response.usage.completion_tokens,
             )
+
+        if identity:
+            room = TITLE_WITH_IDENTITY_MAX - len(identity) - len(" | ")
+            hook = title
+            if len(hook) > room:
+                hook = hook[: max(room - 3, 0)].rstrip() + "..."
+            title = f"{identity} | {hook}" if hook else identity
 
         logger.info("Generated YouTube title: %s", title)
         return title
