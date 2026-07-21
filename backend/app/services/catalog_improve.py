@@ -6,11 +6,24 @@
    via ``title_locked``, never proposed again) or ``generic`` (raid-train
    patterns, date-only titles, "DJ set" boilerplate). A cheap heuristic decides
    the obvious cases; the ambiguous middle ground goes to the LLM in one batch.
-2. **Draft** for each generic mix: a click-optimized title (<=70 chars, genre +
-   hook, no clickbait lies) and a refreshed full description that *retains the
-   existing tracklist section* and the brand links block. Drafts land as
-   ``MixProposal`` rows (``created_by="ai"``, status ``draft``) — platform
-   ``both`` for shared values, split per-platform where the values differ.
+2. **Draft** for each generic mix: ONE click-optimized title and a refreshed
+   full description that *retains the existing tracklist section* and the brand
+   links block. Drafts land as ``MixProposal`` rows (``created_by="ai"``,
+   status ``draft``) — platform ``both`` for shared values, split per-platform
+   where the values differ.
+
+Titles here obey exactly the same policy as the live pipeline (see
+``description_generator``): one string per mix used identically on SoundCloud
+and YouTube, shaped ``"<Evocative Hook> | <Genre> Mix"``, aiming for
+``TITLE_TARGET_CHARS`` and never exceeding ``TITLE_MAX_CHARS``, always carrying
+the searchable genre keyword. The shape/genre helpers are imported rather than
+re-implemented so there is one policy, not two.
+
+On top of that the back catalog needs a guard the fresh pipeline does not: its
+existing titles are full of stream-era wording the owner has since retired
+(series names, "Raid Train", the channel name as a prefix, bare dates). See
+:data:`BANNED_TITLE_PATTERNS` — a drafted title matching any of them is
+rejected, retried, and finally stripped deterministically.
 
 All LLM traffic reuses the DescriptionGenerator client + AIUsage accounting.
 """
@@ -30,12 +43,100 @@ from app.services import activity_log
 
 logger = logging.getLogger(__name__)
 
-TITLE_MAX_CHARS = 70
+# Title shape/length policy is owned by description_generator (the live
+# pipeline's module) and re-exported here so the back catalog cannot drift.
+from app.services.description_generator import (  # noqa: E402
+    TITLE_MAX_CHARS,
+    TITLE_TARGET_CHARS,
+    enforce_title_shape,
+    genre_in_title,
+    resolve_title_genre,
+)
 
 # Words the improve LLM has historically leaned on to the point of parody
 # ("Odyssey" showed up in 15+ of 60 drafts). Banned outright in the prompt and
 # enforced by the post-generation diversity guard.
 OVERUSED_TITLE_WORDS = ["odyssey", "sonic", "journey", "voyage", "exploration"]
+
+# ---------------------------------------------------------------------------
+# Banned wording (back-catalog specific)
+# ---------------------------------------------------------------------------
+# The live catalog was built during the Twitch era, so its titles carry show
+# names, raid-train labels, the channel name as a prefix, and stream dates.
+# None of that belongs in a title any more: a title's job is an evocative hook
+# plus the genre keyword, and calendar/series wording burns characters while
+# actively dating the upload. Same ban-list pattern as OVERUSED_TITLE_WORDS,
+# but these are phrases and structures rather than single words, so each entry
+# pairs a human-readable reason with the pattern that detects it.
+#
+# Order matters for the deterministic strip: the specific series names run
+# before the bare "Will See" channel prefix so "Will See Wednesdays" is removed
+# as a series name rather than half-eaten by the prefix rule.
+BANNED_TITLE_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
+    (
+        'contains the series name "Will See Wednesdays"',
+        re.compile(r"\bwill\s*[-–—]?\s*see\s+wednesdays?\b", re.IGNORECASE),
+    ),
+    (
+        'contains the series name "Second Saturdays"',
+        re.compile(r"\b(?:second|2nd)\s+saturdays?\b", re.IGNORECASE),
+    ),
+    (
+        'contains "Raid Train"',
+        re.compile(r"\braid[\s\-_]*trains?\b", re.IGNORECASE),
+    ),
+    (
+        'starts with the channel name "Will See" as a prefix',
+        re.compile(r"^\s*will\s+see\s*[|\-–—:]+\s*", re.IGNORECASE),
+    ),
+    (
+        "contains a date",
+        re.compile(
+            r"\(?\b(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"
+            r"|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b\)?"
+        ),
+    ),
+]
+
+# Left over when a banned phrase is the entire creative half of a title
+# ("Will See Wednesdays | House Mix" -> "" | House Mix"). Neutral, on-brand,
+# and only ever reached after the LLM has already failed twice.
+BANNED_STRIP_FALLBACK_HOOK = "Late Transmission"
+
+# Separator/punctuation debris left behind by a strip.
+_SEP_RUN_RE = re.compile(r"\s*[|\-–—:]\s*(?:[|\-–—:]\s*)+")
+_SEP_EDGE_RE = re.compile(r"^[\s|\-–—:,]+|[\s|\-–—:,]+$")
+
+
+def banned_wording_problem(title: str) -> Optional[str]:
+    """Why ``title`` violates the retired-wording ban, or None when it's clean."""
+    t = title or ""
+    for reason, pattern in BANNED_TITLE_PATTERNS:
+        if pattern.search(t):
+            return reason
+    return None
+
+
+def strip_banned_wording(title: str) -> str:
+    """Remove every banned phrase from ``title`` and tidy the debris.
+
+    Deterministic last resort for when the LLM will not stop volunteering the
+    old stream wording. The result can be empty (the banned phrase *was* the
+    title) — callers substitute :data:`BANNED_STRIP_FALLBACK_HOOK`.
+    """
+    out = title or ""
+    for _, pattern in BANNED_TITLE_PATTERNS:
+        out = pattern.sub(" ", out)
+    out = _SEP_RUN_RE.sub(" | ", out)
+    out = _SEP_EDGE_RE.sub("", out)
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
+def sanitize_title(title: str, genre_term: str) -> str:
+    """Banned wording removed, then the shared shape/genre/length policy
+    re-applied — the genre keyword survives even when the hook is gutted."""
+    hook = strip_banned_wording(title) or BANNED_STRIP_FALLBACK_HOOK
+    return enforce_title_shape(hook, genre_term)
 
 # A drafted title this difflib-similar to any already-used title triggers a
 # retry (and, failing that, an activity warning).
@@ -83,6 +184,10 @@ def classify_title_heuristic(title: str) -> str:
     t = (title or "").strip()
     if not t:
         return "generic"
+    # Retired stream-era wording is generic by definition, however creative the
+    # rest of the title is — the owner wants it gone from every title.
+    if banned_wording_problem(t):
+        return "generic"
     for pattern in GENERIC_PATTERNS:
         if pattern.search(t):
             return "generic"
@@ -116,10 +221,21 @@ You are refreshing the metadata of an ALREADY-PUBLISHED DJ mix by the brand
 a proper release identity.
 
 RULES FOR THE TITLE:
-- Click-optimized but honest: genre keywords people search for + a hook
-- <= {title_max} characters
-- No clickbait lies, no emojis, no dates
-- Do not include the words "raid train", "twitch", or "stream"
+- ONE title only. It is published verbatim on BOTH SoundCloud and YouTube —
+  do not write platform variants.
+- SHAPE: "<Evocative Hook> | {genre_term} Mix". The hook is abstract and
+  atmospheric; the genre keyword is what people actually search for.
+- The genre keyword "{genre_term}" MUST appear.
+- Aim for {title_target} characters, NEVER exceed {title_max}.
+- Click-optimized but honest: no clickbait lies, no emojis
+- BANNED WORDINGS — never include any of these, in any casing:
+  * the series/show names "Will See Wednesdays", "Second Saturdays",
+    "2nd Saturdays", or ANY other series, show, or residency name
+  * "Raid Train", "raid train", "twitch", or "stream"
+  * the channel name "Will See" as a prefix (no "Will See | ...",
+    no "Will See - ...") — the brand is already on the channel
+  * ANY date in any format: "2026-07-20", "07-20-2026", "(2026-07-20)",
+    "May 3rd", years, weekday names
 - BANNED WORDS (overused across this catalog — never use them in any casing
   or form): {banned_words}
 - Vary the title STRUCTURE — do NOT default to "Adjective Noun: Subtitle".
@@ -276,6 +392,7 @@ async def draft_improvement_llm(
     session=None,
     used_titles: Optional[List[str]] = None,
     retry_feedback: str = "",
+    genre_term: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Draft {"title", "description", "tags_youtube", "tags_soundcloud"} for a
     generic mix, or None on failure. The tags lists (search-discoverability
@@ -290,6 +407,7 @@ async def draft_improvement_llm(
     current_description = (
         mix.description_youtube or mix.description_soundcloud or ""
     )
+    genre_term = genre_term or resolve_title_genre(mix.genres)
     recent_used = (used_titles or [])[-MAX_USED_TITLES_IN_PROMPT:]
     used_titles_block = (
         "\n".join(f"- {t}" for t in recent_used) if recent_used else "(none)"
@@ -297,6 +415,8 @@ async def draft_improvement_llm(
     prompt = IMPROVE_PROMPT.format(
         brand_name=settings.BRAND_NAME,
         title_max=TITLE_MAX_CHARS,
+        title_target=TITLE_TARGET_CHARS,
+        genre_term=genre_term,
         banned_words=", ".join(OVERUSED_TITLE_WORDS),
         used_titles_block=used_titles_block,
         current_title=mix.title,
@@ -319,8 +439,9 @@ async def draft_improvement_llm(
         description = str(data.get("description") or "").strip()
         if not title or not description:
             return None
-        if len(title) > TITLE_MAX_CHARS:
-            title = title[: TITLE_MAX_CHARS - 3].rstrip() + "..."
+        # Shared policy: genre keyword guaranteed, hook (never the keyword)
+        # gives up characters when the cap is tight.
+        title = enforce_title_shape(title, genre_term)
         return {
             "title": title,
             "description": description,
@@ -339,9 +460,13 @@ async def draft_improvement_llm(
 def title_diversity_problem(title: str, used_titles: List[str]) -> Optional[str]:
     """Why a drafted title fails the diversity bar, or None when it's fine.
 
-    Fails on any banned OVERUSED_TITLE_WORDS (word-boundary, case-insensitive)
-    or on >= TITLE_SIMILARITY_MAX difflib similarity to an already-used title.
+    Fails on any retired stream-era wording (:data:`BANNED_TITLE_PATTERNS`),
+    any banned OVERUSED_TITLE_WORDS (word-boundary, case-insensitive), or on
+    >= TITLE_SIMILARITY_MAX difflib similarity to an already-used title.
     """
+    banned = banned_wording_problem(title)
+    if banned:
+        return banned
     for word in OVERUSED_TITLE_WORDS:
         if re.search(rf"\b{re.escape(word)}\b", title, re.IGNORECASE):
             return f'contains the overused word "{word}"'
@@ -374,11 +499,14 @@ async def _title_problem(
 async def draft_with_diversity_guard(
     mix: Mix, generator, session, used_titles: List[str]
 ) -> Optional[Dict[str, Any]]:
-    """draft_improvement_llm + the diversity guard: retry once on a banned-word
-    or too-similar title; if the retry is still bad (or fails), keep the best
-    draft we have but log an activity warning."""
+    """draft_improvement_llm + the diversity guard: retry once on a banned
+    wording, banned word, or too-similar title. If the retry is still bad (or
+    fails), keep the best draft we have — but banned wording is never merely
+    warned about: it is stripped deterministically before the draft is
+    returned, so retired series/date wording can never reach a proposal."""
+    genre_term = resolve_title_genre(mix.genres)
     draft = await draft_improvement_llm(
-        mix, generator, session, used_titles=used_titles
+        mix, generator, session, used_titles=used_titles, genre_term=genre_term
     )
     if not draft:
         return None
@@ -392,7 +520,8 @@ async def draft_with_diversity_guard(
         "different words, different structure."
     )
     retry = await draft_improvement_llm(
-        mix, generator, session, used_titles=used_titles, retry_feedback=feedback
+        mix, generator, session, used_titles=used_titles,
+        retry_feedback=feedback, genre_term=genre_term,
     )
     if retry:
         retry_problem = await _title_problem(
@@ -401,6 +530,26 @@ async def draft_with_diversity_guard(
         if not retry_problem:
             return retry
         draft, problem = retry, retry_problem
+
+    # Two strikes. Banned wording is a hard requirement, not a preference, so
+    # remove it by hand rather than shipping the draft as-is.
+    if banned_wording_problem(draft["title"]):
+        original = draft["title"]
+        draft["title"] = sanitize_title(original, genre_term)
+        await activity_log.warn(
+            "catalog_improve",
+            (
+                f'Banned wording guard: stripped "{original}" -> '
+                f'"{draft["title"]}" for mix {mix.id} after retry — it {problem}.'
+            ),
+            mix_id=mix.id,
+            context={
+                "original_title": original,
+                "title": draft["title"],
+                "problem": problem,
+            },
+        )
+        return draft
 
     await activity_log.warn(
         "catalog_improve",
@@ -438,6 +587,41 @@ async def _has_open_proposal(session, mix_id: str, field: str) -> bool:
     return result.first() is not None
 
 
+def _title_proposal(
+    mix: Mix, title: str, platforms: List[str]
+) -> MixProposal:
+    """A single title proposal carrying ``title`` for every platform the mix is
+    on. ``platform="both"`` is the whole point: one row, one string, applied
+    identically to SoundCloud and YouTube."""
+    return MixProposal(
+        mix_id=mix.id,
+        platform="both" if len(platforms) == 2 else platforms[0],
+        field="title",
+        current_value=mix.title_youtube if platforms == ["youtube"] else mix.title,
+        proposed_value=title,
+        status="draft",
+        created_by="ai",
+    )
+
+
+def titles_diverge(mix: Mix) -> bool:
+    """True when the mix carries a different title on YouTube than everywhere
+    else. Nothing generates these any more, but the imported back catalog is
+    full of them (SoundCloud title vs. the title the video was uploaded with),
+    and a divergent pair is a title problem even when both halves read well."""
+    yt = (mix.title_youtube or "").strip()
+    return bool(yt) and yt != (mix.title or "").strip()
+
+
+def mix_title_has_banned_wording(mix: Mix) -> Optional[str]:
+    """The retired-wording problem in either of a mix's title fields, if any."""
+    for value in (mix.title, mix.title_youtube):
+        problem = banned_wording_problem(value or "")
+        if problem:
+            return problem
+    return None
+
+
 def _draft_proposals_for_mix(mix: Mix, draft: Dict[str, Any]) -> List[MixProposal]:
     """Turn an LLM draft into proposal rows for the platforms the mix is on."""
     platforms = _mix_platforms(mix)
@@ -445,19 +629,11 @@ def _draft_proposals_for_mix(mix: Mix, draft: Dict[str, Any]) -> List[MixProposa
         return []
     proposals: List[MixProposal] = []
 
-    # Title: one shared value -> a single row ("both" when on both platforms).
-    title_platform = "both" if len(platforms) == 2 else platforms[0]
-    proposals.append(
-        MixProposal(
-            mix_id=mix.id,
-            platform=title_platform,
-            field="title",
-            current_value=mix.title_youtube if platforms == ["youtube"] else mix.title,
-            proposed_value=draft["title"],
-            status="draft",
-            created_by="ai",
-        )
-    )
+    # Title: ONE string for the mix, never a per-platform variant. When the mix
+    # is on both platforms this is a single ``platform="both"`` row, which
+    # catalog_apply fans out to the YouTube video AND the SoundCloud track with
+    # the identical value — that is what keeps the two platforms from drifting.
+    proposals.append(_title_proposal(mix, draft["title"], platforms))
 
     # Description: assembled per platform (tracklist + links differ); rows are
     # split per platform when values differ, merged into "both" when identical.
@@ -569,7 +745,7 @@ async def run_improve(mix_ids: Optional[Any] = None) -> Dict[str, Any]:
 
     summary: Dict[str, Any] = {
         "classified": 0, "keepers_locked": 0, "generic": 0,
-        "proposals_drafted": 0, "skipped": 0,
+        "proposals_drafted": 0, "skipped": 0, "divergent_unified": 0,
     }
 
     async with async_session_factory() as session:
@@ -582,10 +758,20 @@ async def run_improve(mix_ids: Optional[Any] = None) -> Dict[str, Any]:
         query = select(Mix)
         if isinstance(mix_ids, list):
             query = query.where(Mix.id.in_(mix_ids))
-        else:  # "all_generic" / None -> every unlocked mix present on a platform
-            query = query.where(Mix.title_locked.is_(False))
         mixes = list((await session.execute(query)).scalars().all())
         mixes = [m for m in mixes if _mix_platforms(m)]
+        if not isinstance(mix_ids, list):
+            # "all_generic" / None -> every unlocked mix, PLUS locked ones whose
+            # title is still wrong in a way locking was never meant to bless:
+            # retired series/date wording, or a YouTube title that disagrees
+            # with the SoundCloud one.
+            mixes = [
+                m
+                for m in mixes
+                if not m.title_locked
+                or mix_title_has_banned_wording(m)
+                or titles_diverge(m)
+            ]
 
         generator = DescriptionGenerator(sj)
 
@@ -593,6 +779,12 @@ async def run_improve(mix_ids: Optional[Any] = None) -> Dict[str, Any]:
         classes: Dict[str, str] = {}
         unknown: List[Mix] = []
         for mix in mixes:
+            banned = mix_title_has_banned_wording(mix)
+            if banned:
+                # Overrides both the lock and the LLM: this title must change.
+                classes[mix.id] = "generic"
+                mix.title_locked = False
+                continue
             if mix.title_locked:
                 classes[mix.id] = "keeper"
                 continue
@@ -645,6 +837,26 @@ async def run_improve(mix_ids: Optional[Any] = None) -> Dict[str, Any]:
                 session.add(proposal)
                 summary["proposals_drafted"] += 1
             await session.commit()
+
+        # Pass 3: unify keepers that diverge across platforms. Their wording is
+        # fine — they just carry a different string on YouTube than everywhere
+        # else, which is a data problem, not a creative one. No LLM: adopt the
+        # canonical ``mix.title`` (shape-enforced so it still carries the genre
+        # keyword) for both platforms.
+        for mix in mixes:
+            if classes.get(mix.id) != "keeper" or not titles_diverge(mix):
+                continue
+            if await _has_open_proposal(session, mix.id, "title"):
+                summary["skipped"] += 1
+                continue
+            unified = enforce_title_shape(
+                mix.title or "", resolve_title_genre(mix.genres)
+            )
+            session.add(_title_proposal(mix, unified, _mix_platforms(mix)))
+            summary["proposals_drafted"] += 1
+            summary["divergent_unified"] += 1
+            await session.commit()
+
         await session.commit()
 
     await activity_log.info(
@@ -652,7 +864,8 @@ async def run_improve(mix_ids: Optional[Any] = None) -> Dict[str, Any]:
         (
             f"AI improve finished: {summary['keepers_locked']} keeper titles locked, "
             f"{summary['proposals_drafted']} proposals drafted for "
-            f"{summary['generic']} generic mixes."
+            f"{summary['generic']} generic mixes "
+            f"({summary['divergent_unified']} platform-divergent titles unified)."
         ),
         context=summary,
     )

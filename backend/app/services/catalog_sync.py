@@ -269,8 +269,21 @@ def _attach_platform_data(
         mix.youtube_url = yt["url"]
         if not mix.description_youtube and yt.get("description"):
             mix.description_youtube = yt["description"]
+        # Titles are unified: one string per mix, identical on both platforms
+        # (see catalog_improve / description_generator). Backfilling
+        # ``title_youtube`` from whatever the video is currently called would
+        # re-open the per-platform split every time a sync runs — a mix whose
+        # SoundCloud title is the canonical one would silently regain a
+        # different YouTube title, and the improve pass would have to unify it
+        # again. So only adopt the live value when it AGREES with mix.title
+        # (or the mix has no title yet); a disagreeing live title is left for
+        # a title proposal to overwrite. Nothing is lost either way: the live
+        # YouTube title is always recorded under
+        # metadata_json['catalog']['youtube']['title'] below.
         if not mix.title_youtube and yt.get("title"):
-            mix.title_youtube = yt["title"]
+            live_title = yt["title"].strip()
+            if not mix.title or live_title == (mix.title or "").strip():
+                mix.title_youtube = yt["title"]
         if mix.duration_seconds is None and yt.get("duration_seconds") is not None:
             mix.duration_seconds = yt["duration_seconds"]
         catalog_meta["youtube"] = _catalog_meta(yt)
