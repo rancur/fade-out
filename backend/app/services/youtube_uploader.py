@@ -1,4 +1,4 @@
-"""YouTube Data API v3 uploader with OAuth2, premiere scheduling, and playlist management."""
+"""YouTube Data API v3 uploader with OAuth2, publish scheduling, and playlist management."""
 
 import logging
 import os
@@ -30,15 +30,13 @@ DAY_INDEX = {
     "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
 }
 
-# Emitted when publish mode "premiere" falls back to a scheduled publish.
 # Verified 2026-07: the YouTube Data/Live Streaming APIs cannot create a
 # Premiere or convert an uploaded video into one (liveBroadcasts only bind
 # to liveStreams; feature request issuetracker.google.com/issues/414284069
-# is open). Premieres can only be created in YouTube Studio.
-PREMIERE_FALLBACK_MESSAGE = (
-    "premiere not supported via API — applied scheduled publish; "
-    "convert in Studio"
-)
+# is open). Premieres can only be enabled in YouTube Studio, so fade-out
+# offers immediate | scheduled only. Publish modes stored as "premiere" by
+# older builds are coerced to "scheduled" in ``_resolve_publish``.
+LEGACY_PREMIERE_MODE = "premiere"
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
           "https://www.googleapis.com/auth/youtube"]
@@ -130,16 +128,6 @@ class YouTubeUploader:
         # Determine privacy and scheduled time
         privacy, scheduled_at = await self._resolve_publish(mode)
 
-        if mode == "premiere":
-            logger.warning("%s (video: %s)", PREMIERE_FALLBACK_MESSAGE, title[:60])
-            await self._activity(
-                "warn", "premiere_fallback", PREMIERE_FALLBACK_MESSAGE,
-                context={
-                    "publish_mode": "premiere",
-                    "publish_at": scheduled_at.isoformat() if scheduled_at else None,
-                },
-            )
-
         body: Dict[str, Any] = {
             "snippet": {
                 "title": title[:100],  # YouTube max 100 chars
@@ -156,7 +144,7 @@ class YouTubeUploader:
         if scheduled_at and privacy == "private":
             body["status"]["publishAt"] = scheduled_at.isoformat()
             body["status"]["privacyStatus"] = "private"
-            logger.info("Scheduling premiere for %s", scheduled_at.isoformat())
+            logger.info("Scheduling publish for %s", scheduled_at.isoformat())
 
         # Upload video
         media = MediaFileUpload(
@@ -326,15 +314,22 @@ class YouTubeUploader:
         - legacy ``unlisted`` → unlisted on insert
         - ``scheduled`` → private + publishAt at the configured
           premiere_day/premiere_hour_utc slot
-        - ``premiere`` → the Data API cannot create Premieres (see
-          PREMIERE_FALLBACK_MESSAGE), so this is the same private+publishAt
-          scheduled publish; ``upload()`` emits the activity warning.
+
+        ``premiere`` is no longer a supported mode (the Data API cannot create
+        Premieres). Values still stored in older databases are coerced to
+        ``scheduled`` so the pipeline keeps running.
         """
+        if mode == LEGACY_PREMIERE_MODE:
+            logger.info(
+                "publish mode 'premiere' is no longer supported (Data API "
+                "cannot create Premieres); treating as 'scheduled'"
+            )
+            mode = "scheduled"
         if mode in ("immediate", "instant"):
             return "public", None
         if mode == "unlisted":
             return "unlisted", None
-        if mode in ("scheduled", "premiere"):
+        if mode == "scheduled":
             return "private", await self._scheduled_publish_time()
         return "private", None
 

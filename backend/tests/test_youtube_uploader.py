@@ -1,4 +1,4 @@
-"""Tests for YouTube premiere-time selection, privacy resolution, and Shorts."""
+"""Tests for YouTube publish-time selection, privacy resolution, and Shorts."""
 
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
@@ -6,10 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.services import app_config
-from app.services.youtube_uploader import (
-    PREMIERE_FALLBACK_MESSAGE,
-    YouTubeUploader,
-)
+from app.services.youtube_uploader import YouTubeUploader
 
 
 def _fake_resolve(values):
@@ -92,7 +89,9 @@ class TestResolvePublish:
         assert when.weekday() == 4  # friday
         assert (when.hour, when.minute) == (3, 0)
 
-    async def test_premiere_falls_back_to_scheduled_slot(self, monkeypatch):
+    async def test_legacy_premiere_value_coerces_to_scheduled(self, monkeypatch):
+        # "premiere" is no longer an offered mode, but a value stored by an
+        # older build must not break the pipeline.
         monkeypatch.setattr(
             app_config, "resolve",
             _fake_resolve({"premiere_day": "sunday", "premiere_hour_utc": 0}),
@@ -195,14 +194,16 @@ class TestUploadPublishModes:
         assert publish_at.weekday() == 3  # thursday, per configured day
         assert not [e for e in events if e[1] == "premiere_fallback"]
 
-    async def test_premiere_falls_back_to_scheduled_with_warning(
+    async def test_legacy_premiere_uploads_as_scheduled_without_warning(
         self, tmp_path, monkeypatch
     ):
+        # A stored legacy "premiere" value behaves exactly like "scheduled"
+        # and no longer emits a premiere_fallback activity event.
         body, events, _ = await self._upload(tmp_path, monkeypatch, "premiere")
         assert body["status"]["privacyStatus"] == "private"
-        assert "publishAt" in body["status"]
-        warns = [e for e in events if e[1] == "premiere_fallback"]
-        assert warns == [("warn", "premiere_fallback", PREMIERE_FALLBACK_MESSAGE)]
+        publish_at = datetime.fromisoformat(body["status"]["publishAt"])
+        assert publish_at.weekday() == 3  # thursday, per configured day
+        assert not [e for e in events if e[1] == "premiere_fallback"]
 
 
 class TestUploadShort:

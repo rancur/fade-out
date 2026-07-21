@@ -85,12 +85,22 @@ class TestResolveYoutubePublishMode:
         monkeypatch.setattr(handlers_mod.app_config, "resolve", fake_resolve)
 
     async def test_explicit_new_key_wins_over_legacy(self, monkeypatch):
+        self._patch_resolve(monkeypatch, "immediate")
+        row = _FakeSettingsRow(
+            settings_json={"youtube_publish_mode": "immediate"},
+            premiere_mode="unlisted",
+        )
+        assert await handlers_mod._resolve_youtube_publish_mode(row) == "immediate"
+
+    async def test_stored_legacy_premiere_coerces_to_scheduled(self, monkeypatch):
+        # The mode was removed (the Data API cannot create Premieres); a value
+        # left in an existing DB must degrade to scheduled, not blow up.
         self._patch_resolve(monkeypatch, "premiere")
         row = _FakeSettingsRow(
             settings_json={"youtube_publish_mode": "premiere"},
             premiere_mode="unlisted",
         )
-        assert await handlers_mod._resolve_youtube_publish_mode(row) == "premiere"
+        assert await handlers_mod._resolve_youtube_publish_mode(row) == "scheduled"
 
     async def test_immediate_mode_resolves(self, monkeypatch):
         self._patch_resolve(monkeypatch, "immediate")
