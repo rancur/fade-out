@@ -43,6 +43,20 @@ class TestValidation:
         with pytest.raises(ValueError):
             app_config.validate_value(d, "whenever")
 
+    def test_youtube_publish_mode_schema(self):
+        # New publish-mode enum: non-secret, editable, default scheduled.
+        d = app_config.SCHEMA_BY_KEY["youtube_publish_mode"]
+        assert d.type == "enum"
+        assert d.category == "YouTube"
+        assert d.editable is True
+        assert d.choices == ("immediate", "scheduled", "premiere")
+        assert d.key not in app_config.SECRET_JSON_KEYS
+        assert app_config.env_default(d) == "scheduled"
+        assert app_config.validate_value(d, "premiere") == "premiere"
+        for bad in ("instant", "unlisted", "now", 3):
+            with pytest.raises(ValueError):
+                app_config.validate_value(d, bad)
+
     def test_secret_must_be_string(self):
         d = app_config.SCHEMA_BY_KEY["openai_api_key"]
         assert app_config.validate_value(d, "sk-abc") == "sk-abc"
@@ -137,6 +151,24 @@ class TestResolve:
 
         app_config.invalidate_cache()
         assert await app_config.resolve("shorts_daily_upload_cap") == 7
+
+    async def test_youtube_publish_mode_defaults_and_roundtrips(
+        self, prepared_db
+    ):
+        # No row: schema default (scheduled — current behavior).
+        assert await app_config.resolve("youtube_publish_mode") == "scheduled"
+
+        from app.database import async_session_factory
+        from app.models import AppSettings
+
+        async with async_session_factory() as session:
+            session.add(
+                AppSettings(id=1, settings_json={"youtube_publish_mode": "premiere"})
+            )
+            await session.commit()
+
+        app_config.invalidate_cache()
+        assert await app_config.resolve("youtube_publish_mode") == "premiere"
 
     async def test_backfill_auto_resume_in_schema_and_roundtrips(
         self, prepared_db

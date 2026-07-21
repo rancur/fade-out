@@ -25,6 +25,21 @@ PREMIERE_SLOTS = [
     ("thursday", 17),  # Thu 5 PM Phoenix
 ]
 
+DAY_INDEX = {
+    "monday": 0, "tuesday": 1, "wednesday": 2,
+    "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+# Emitted when publish mode "premiere" falls back to a scheduled publish.
+# Verified 2026-07: the YouTube Data/Live Streaming APIs cannot create a
+# Premiere or convert an uploaded video into one (liveBroadcasts only bind
+# to liveStreams; feature request issuetracker.google.com/issues/414284069
+# is open). Premieres can only be created in YouTube Studio.
+PREMIERE_FALLBACK_MESSAGE = (
+    "premiere not supported via API — applied scheduled publish; "
+    "convert in Studio"
+)
+
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
           "https://www.googleapis.com/auth/youtube"]
 
@@ -113,7 +128,17 @@ class YouTubeUploader:
         youtube = self._get_service()
 
         # Determine privacy and scheduled time
-        privacy, scheduled_at = self._resolve_privacy(mode)
+        privacy, scheduled_at = await self._resolve_publish(mode)
+
+        if mode == "premiere":
+            logger.warning("%s (video: %s)", PREMIERE_FALLBACK_MESSAGE, title[:60])
+            await self._activity(
+                "warn", "premiere_fallback", PREMIERE_FALLBACK_MESSAGE,
+                context={
+                    "publish_mode": "premiere",
+                    "publish_at": scheduled_at.isoformat() if scheduled_at else None,
+                },
+            )
 
         body: Dict[str, Any] = {
             "snippet": {
@@ -291,8 +316,64 @@ class YouTubeUploader:
     # Premiere scheduling
     # ------------------------------------------------------------------
 
+    async def _resolve_publish(self, mode: str) -> tuple[str, Optional[datetime]]:
+        """Privacy status + optional publishAt for a publish mode.
+
+        Modes (new ``youtube_publish_mode`` enum + legacy ``premiere_mode``
+        values):
+
+        - ``immediate`` / legacy ``instant`` → public on insert
+        - legacy ``unlisted`` → unlisted on insert
+        - ``scheduled`` → private + publishAt at the configured
+          premiere_day/premiere_hour_utc slot
+        - ``premiere`` → the Data API cannot create Premieres (see
+          PREMIERE_FALLBACK_MESSAGE), so this is the same private+publishAt
+          scheduled publish; ``upload()`` emits the activity warning.
+        """
+        if mode in ("immediate", "instant"):
+            return "public", None
+        if mode == "unlisted":
+            return "unlisted", None
+        if mode in ("scheduled", "premiere"):
+            return "private", await self._scheduled_publish_time()
+        return "private", None
+
+    async def _scheduled_publish_time(self) -> datetime:
+        """Next occurrence of the configured premiere_day/premiere_hour_utc.
+
+        Resolved via app_config (DB over env). Falls back to the legacy
+        optimal-slot heuristic when the configured values are unusable.
+        """
+        from app.services import app_config
+
+        try:
+            day = str(await app_config.resolve("premiere_day") or "").lower()
+            hour = int(await app_config.resolve("premiere_hour_utc"))
+            day_index = DAY_INDEX[day]
+            if not 0 <= hour <= 23:
+                raise ValueError(f"premiere_hour_utc out of range: {hour}")
+        except Exception:
+            logger.warning(
+                "premiere_day/premiere_hour_utc unusable; using optimal-slot "
+                "fallback", exc_info=True,
+            )
+            return self._calculate_optimal_time()
+
+        now_utc = datetime.now(timezone.utc)
+        candidate = now_utc.replace(
+            hour=hour, minute=0, second=0, microsecond=0
+        ) + timedelta(days=(day_index - now_utc.weekday()) % 7)
+        if candidate <= now_utc:
+            candidate += timedelta(days=7)
+        logger.info(
+            "Scheduled publish time: %s UTC (%s %02d:00)",
+            candidate.isoformat(), day, hour,
+        )
+        return candidate
+
     def _resolve_privacy(self, mode: str) -> tuple[str, Optional[datetime]]:
-        """Determine privacy status and optional publish time."""
+        """Legacy sync resolver (pre-``youtube_publish_mode``); kept for
+        compatibility. ``upload()`` uses ``_resolve_publish``."""
         if mode == "instant":
             return "public", None
         elif mode == "unlisted":
