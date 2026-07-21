@@ -55,16 +55,36 @@ _SERIES_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Every title now ends in a searchable genre keyword ("... | Tech House Mix").
+# Like a series prefix, that tail is shared branding rather than creative
+# content, and comparing it would cut both ways: it hides a repeated hook
+# behind a different genre, and it inflates the similarity of two genuinely
+# different hooks in the same genre. Strip it, so uniqueness keeps measuring
+# the part a human actually made up. MUST stay in sync with
+# ``description_generator.GENRE_TITLE_TERMS`` — test_unified_titles.py pins it.
+_GENRE_SUFFIX_RE = re.compile(
+    r"\s*[|\-–—:]\s*(?:"
+    r"drum\s*(?:&|and|n)\s*bass|dnb|d&b|jungle|"
+    r"deep\s+house|tech\s+house|melodic\s+house|organic\s+house|"
+    r"uk\s+garage|open\s+format|big\s+room|"
+    r"dubstep|riddim|brostep|house|techno|trance|edm|trap|garage|ukg|"
+    r"progressive|melodic"
+    r")(?:\s+mix)?\s*$",
+    re.IGNORECASE,
+)
+
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _WS_RE = re.compile(r"\s+")
 
 
 def normalize(kind: str, value: str) -> str:
     """The comparison key for a creative value: casefolded, punctuation
-    stripped, whitespace collapsed; titles also lose a leading series prefix."""
+    stripped, whitespace collapsed; titles also lose a leading series prefix
+    and a trailing genre keyword."""
     v = (value or "").strip()
     if kind == KIND_TITLE:
         v = _SERIES_PREFIX_RE.sub("", v)
+        v = _GENRE_SUFFIX_RE.sub("", v)
     v = v.lower()
     v = _PUNCT_RE.sub(" ", v)
     return _WS_RE.sub(" ", v).strip()

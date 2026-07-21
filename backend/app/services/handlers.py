@@ -469,10 +469,7 @@ async def handle_generate_description(
         if bpms:
             bpm_range = [min(bpms), max(bpms)]
 
-    from app.services.description_generator import (
-        DescriptionGenerator,
-        derive_title_identity,
-    )
+    from app.services.description_generator import DescriptionGenerator
     from app.services.tag_generator import TagGenerator
 
     app_settings = await _get_app_settings(session)
@@ -480,18 +477,11 @@ async def handle_generate_description(
     desc_gen = DescriptionGenerator(db_settings_json=sj)
     tag_gen = TagGenerator()
 
-    # Generate a creative SoundCloud title. Its uniqueness claim + usage rows
-    # are committed in a short session of their own before any further await.
-    #
-    # Series / raid-train episodes MUST stay recognizable (live incident
-    # 2026-07-20: a raid-train file shipped under a fully abstract title and
-    # the owner could not find his own uploads): the identity derived from the
-    # source filename becomes a mandatory prefix on both platform titles, and
-    # only the hook after it is creative.
+    # Generate THE title — one canonical, genre-forward, click-optimized
+    # string used verbatim on both platforms. Its uniqueness claim + usage
+    # rows are committed in a short session of their own before any further
+    # await.
     raw_filename = Path(mix.audio_file_path).stem if mix.audio_file_path else "mix"
-    identity = derive_title_identity(raw_filename)
-    if identity:
-        logger.info("Source file carries series identity: %s", identity)
     async with async_session_factory() as title_session:
         creative_title = await desc_gen.generate_creative_title(
             genres=genres,
@@ -500,10 +490,12 @@ async def handle_generate_description(
             filename=raw_filename,
             session=title_session,
             mix_id=mix_id,
-            identity=identity,
         )
         await title_session.commit()
+    # SoundCloud reads mix.title, YouTube reads mix.title_youtube. Same string
+    # in both: a mix is the same artifact wherever someone finds it.
     mix.title = creative_title
+    mix.title_youtube = creative_title
 
     # Generate all content. Usage rows land in a short session committed right
     # after each call, so no dirty session is held across an LLM await.
@@ -538,17 +530,6 @@ async def handle_generate_description(
         )
         await usage_session.commit()
 
-        yt_title = await desc_gen.generate_youtube_title(
-            genres=genres,
-            vibes=vibes,
-            bpm_range=bpm_range,
-            duration_seconds=duration,
-            session=usage_session,
-            mix_id=mix_id,
-            identity=identity,
-        )
-        await usage_session.commit()
-
     tags = tag_gen.generate(
         genres=genres,
         vibes=vibes,
@@ -561,13 +542,13 @@ async def handle_generate_description(
 
     mix.description_soundcloud = sc_desc
     mix.description_youtube = yt_desc
-    mix.title_youtube = yt_title
     mix.tags = tags
 
     return {
         "soundcloud_desc_length": len(sc_desc),
         "youtube_desc_length": len(yt_desc),
-        "youtube_title": yt_title,
+        "title": creative_title,
+        "youtube_title": creative_title,
         "tag_count": len(tags),
     }
 
