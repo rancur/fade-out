@@ -3,7 +3,6 @@
 import logging
 import re
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import openai
@@ -76,81 +75,115 @@ def _response_text(response: Any) -> str:
     return content.strip()
 
 # ---------------------------------------------------------------------------
-# Series / raid-train title identity
+# Unified, genre-forward, click-optimized titles
 # ---------------------------------------------------------------------------
-# A live incident (2026-07-20) shipped "Twitch DJs House Nation Raid Train
-# (2026-07-20).flac" as "Mirage Reverberation: Sonic Desert Dances" — a fully
-# abstract title with no series name and no date, unrecognizable to the owner.
-# The pipeline now derives the recurring-show identity from the SOURCE FILENAME
-# and keeps it as a mandatory title prefix; only the hook after it is creative.
+# One canonical title per mix, published verbatim to BOTH SoundCloud and
+# YouTube. Two separate generators used to produce two different strings for
+# the same set, and a short-lived experiment (PR #30) forced a series /
+# raid-train name plus the recording date in front of the creative hook. Both
+# are gone: the owner wants the abstract creative title he trades on, carrying
+# a searchable genre keyword, tuned for click-through.
+#
+# Shape:  "<Creative Hook> | <Genre> Mix"
+#         e.g. "Mirage Reverberation | Tech House Mix"
 
-# Raid-train episodes are named after the hosting community:
-# "Twitch DJs <community> Raid Train".
-_RAID_TRAIN_IDENTITY_RE = re.compile(
-    r"\btwitch\s+djs?\s+(?:[\w&'’]+\s+)*?raid[\s\-]?train\b", re.IGNORECASE
-)
+# YouTube allows 100 characters but shows far fewer: mobile truncates around
+# 50-60 and desktop search / suggested around 60-70 ("Viewers may only see
+# part of your title" — YouTube Help, Thumbnail & title tips). SoundCloud's
+# own cap is 100. So: aim for 60, never ship past 70, and everything that has
+# to be read survives the cut on every surface.
+TITLE_TARGET_CHARS = 60
+TITLE_MAX_CHARS = 70
 
-# An ISO date token in the source filename, e.g. "(2026-07-20)".
-_IDENTITY_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+# Genre bucket -> (title keyword, spellings that already satisfy the rule).
+# The bucket itself comes from ``thumbnail_design.resolve_genre_key`` — the
+# codebase's existing genre classifier (it drives the thumbnail motifs) — so
+# artwork and title always agree on what the set is, and there is exactly one
+# genre-resolution path to maintain.
+GENRE_TITLE_TERMS: Dict[str, tuple] = {
+    "drum and bass": (
+        "Drum & Bass",
+        ("drum & bass", "drum and bass", "drum n bass", "dnb", "d&b", "jungle"),
+    ),
+    "dubstep": ("Dubstep", ("dubstep", "riddim", "brostep")),
+    "deep house": ("Deep House", ("deep house",)),
+    "tech house": ("Tech House", ("tech house",)),
+    "house": ("House", ("house",)),
+    "techno": ("Techno", ("techno",)),
+    "trance": ("Trance", ("trance",)),
+    "edm": ("EDM", ("edm", "big room")),
+    "trap": ("Trap", ("trap",)),
+    "garage": ("UK Garage", ("uk garage", "garage", "ukg", "2-step", "2step")),
+    "organic": ("Melodic House", ("melodic", "organic house", "progressive")),
+    "open format": ("Open Format", ("open format", "genre-fluid")),
+}
+
+_FALLBACK_GENRE_TERM = ("Open Format", ("open format", "genre-fluid"))
 
 
-def _canonicalize_raid_train(raw: str) -> str:
-    """Normalize a matched raid-train phrase: title-case fully-lowercase words
-    (mixed-case words are kept as written) and fix the "DJs" brand casing."""
-    words = [
-        w if any(c.isupper() for c in w) else w.capitalize() for w in raw.split()
-    ]
-    return re.sub(r"\bDj(s?)\b", r"DJ\1", " ".join(words))
+def resolve_title_genre(genres: Optional[List[str]]) -> str:
+    """The searchable genre keyword that must appear in a mix's title.
 
-
-def derive_title_identity(filename: str) -> Optional[str]:
-    """The recurring-show identity prefix a source filename carries, or None.
-
-    Recognizes the known series ("Will See Wednesdays", "2nd/Second
-    Saturdays" — same patterns the catalog playlist grouping uses) and
-    "Twitch DJs <X> Raid Train" episodes, appending the filename's ISO date
-    token when present:
-
-        "Twitch DJs House Nation Raid Train (2026-07-20).flac"
-            -> "Twitch DJs House Nation Raid Train (2026-07-20)"
-        "will_see_wednesdays_2026-07-16.flac"
-            -> "Will See Wednesdays (2026-07-16)"
-
-    One-off mixes (no known pattern) return None — their titles stay fully
-    creative.
+    Delegates the actual classification to
+    :func:`app.services.thumbnail_design.resolve_genre_key` (the existing
+    genre-bucket classifier used for thumbnail motifs) and maps the resolved
+    bucket to the term listeners actually search for — "Drum & Bass" rather
+    than the internal ``drum and bass`` key, "UK Garage" rather than
+    ``garage``.
     """
-    # The catalog rollout's series detection is the canonical source for these
-    # patterns; reuse it rather than growing a second copy.
-    from app.services.catalog_playlists import (
-        SERIES_SATURDAYS,
-        SERIES_WEDNESDAYS,
-        _SATURDAYS_RE,
-        _WEDNESDAYS_RE,
-    )
+    from app.services.thumbnail_design import resolve_genre_key
 
-    stem = Path(filename).stem if filename else ""
-    text = re.sub(r"\s+", " ", stem.replace("_", " ")).strip()
-    if not text:
-        return None
-
-    base: Optional[str] = None
-    raid_match = _RAID_TRAIN_IDENTITY_RE.search(text)
-    if raid_match:
-        base = _canonicalize_raid_train(raid_match.group(0))
-    elif _WEDNESDAYS_RE.search(text):
-        base = SERIES_WEDNESDAYS
-    elif _SATURDAYS_RE.search(text):
-        base = SERIES_SATURDAYS
-    if base is None:
-        return None
-
-    date_match = _IDENTITY_DATE_RE.search(text)
-    return f"{base} ({date_match.group(1)})" if date_match else base
+    key = resolve_genre_key(genres)
+    return GENRE_TITLE_TERMS.get(key, _FALLBACK_GENRE_TERM)[0]
 
 
-# Platform title ceilings: SoundCloud allows 100 chars; YouTube allows 100.
-# With an identity prefix the creative hook gets whatever room remains.
-TITLE_WITH_IDENTITY_MAX = 100
+def _genre_spellings(genre_term: str) -> tuple:
+    """Accepted spellings for a resolved genre term (for presence checking)."""
+    for term, spellings in GENRE_TITLE_TERMS.values():
+        if term == genre_term:
+            return spellings
+    return (genre_term.lower(),)
+
+
+def genre_in_title(title: str, genre_term: str) -> bool:
+    """True if ``title`` already carries the genre keyword in any spelling."""
+    low = (title or "").lower()
+    return any(spelling in low for spelling in _genre_spellings(genre_term))
+
+
+def _title_hook(title: str, genre_term: str) -> str:
+    """The creative part of a title, with the trailing genre segment removed.
+
+    Used when a title has to be disambiguated: the numeral belongs on the
+    hook ("Neon Cactus II | House Mix"), not tacked onto the keyword.
+    """
+    head, sep, tail = (title or "").rpartition(" | ")
+    if sep and genre_in_title(tail, genre_term):
+        return head.strip()
+    return (title or "").strip()
+
+
+def enforce_title_shape(title: str, genre_term: str) -> str:
+    """Guarantee the published title carries its genre and fits the cap.
+
+    The prompt asks for ``"<Hook> | <Genre> Mix"``, but a model that drops the
+    genre would cost the mix its single strongest discovery keyword, so the
+    genre is appended deterministically when missing. The genre tail is never
+    what gets trimmed — the creative hook gives up the characters, since the
+    keyword is the part doing the search work.
+    """
+    title = (title or "").strip().strip('"').strip("'").strip()
+    if genre_in_title(title, genre_term):
+        return title[:TITLE_MAX_CHARS].rstrip() if len(title) > TITLE_MAX_CHARS else title
+
+    for tail in (f" | {genre_term} Mix", f" | {genre_term}"):
+        if len(title) + len(tail) <= TITLE_MAX_CHARS:
+            return f"{title}{tail}"
+
+    # Even the bare genre tail doesn't fit: trim the hook, never the keyword.
+    tail = f" | {genre_term}"
+    room = max(TITLE_MAX_CHARS - len(tail), 0)
+    return f"{title[:room].rstrip()}{tail}"
 
 
 # ---------------------------------------------------------------------------
@@ -226,81 +259,62 @@ YOUTUBE_LINK_INSTRUCTION_TRACKLIST = (
 )
 
 CREATIVE_TITLE_PROMPT = """\
-Generate a creative, artistic title for a DJ mix by "{brand_name}" for SoundCloud.
+Write ONE title for a DJ mix by "{brand_name}". This exact title is published
+to BOTH SoundCloud and YouTube, so it has to do two jobs at once: sound like
+art, and earn the click.
 
-VIBE:
-- Psychedelic, evocative, poetic
-- Should feel like a DJ mix name, NOT an SEO title
+FORMAT (required):
+"[Creative Hook] | {genre_term} Mix"
+Examples of the shape:
+- "Mirage Reverberation | Tech House Mix"
+- "Four Decks and a Prayer | Drum & Bass Mix"
+- "Neon Cactus After Dark | Melodic House Mix"
+
+THE HOOK (the part before the pipe):
+- Psychedelic, evocative, poetic — it should read like an album name, an art
+  exhibition, or a fever dream, never like an SEO string
 - Desert energy, late-night, otherworldly
-- Think album names, art exhibitions, fever dreams
-- Examples of the vibe: "Desert Frequencies Vol. III", "Four Decks and a Prayer", "Neon Cactus After Dark", "The Eye Opens at Midnight", "Silk and Static", "Phantom Groove Theory"
+- Concrete and specific beats vague and moody: an image someone can picture
+  ("Silk and Static", "The Eye Opens at Midnight") outperforms an abstraction
+  ("Sonic Journey", "Good Vibes")
+- Carry one emotional or curiosity trigger — a tension, a place, a moment —
+  but it must be TRUE to the set. Never promise something the audio does not
+  deliver; misleading titles cost watch time and get demoted
+- 2-5 words. It is the first thing read, so the most arresting word goes early
 
-RULES:
-- Under 60 characters
-- No dates
-- Do not include "DJ mix", "set", or "live" in the title
-- Incorporate the genres and vibes naturally but artistically
-- Do NOT just list genres -- weave them into something evocative
-- One title only, no alternatives, no explanation
+CLICK-THROUGH RULES (non-negotiable):
+- Front-load the hook. Titles are truncated in search results, suggested
+  videos, and on mobile — the most important words go near the beginning,
+  because that is all many viewers will ever see
+- The genre keyword "{genre_term}" MUST appear, spelled exactly like that. It
+  is the term listeners search and browse by, and it is the single strongest
+  reason this mix gets found at all
+- Keep the WHOLE title at or under {target_chars} characters if you possibly
+  can, and NEVER past {max_chars}
+- Say one thing sharply rather than three things vaguely — one vivid, specific
+  image beats a pile of mood words
+- At most ONE power word ("Best", "Ultimate", "Fresh"). No ALL-CAPS words, no
+  emojis, no "must hear", no fake hype
+- The title must accurately represent the audio. A title that oversells gets
+  clicks and then loses them, and low retention after a high click is exactly
+  what buries a video
+- No dates, no year, no series or show name, no "raid train", no "Twitch"
+- Do not include the artist or brand name
+- Do not write "live", "vol.", or a track count
 
 TITLES ALREADY IN USE — every one of these is FORBIDDEN, and do not write
 anything close to them:
 {used_titles_block}
 
 MIX DATA:
+- Genre keyword to use: {genre_term}
 - Raw filename: {filename}
-- Genres: {genres}
+- Detected genres: {genres}
 - Vibes: {vibes}
 {tracklist_hint}
-{identity_hint}{retry_feedback}
+{retry_feedback}
 Return ONLY the title, nothing else.\
 """
-
-# Extra instruction when the mix belongs to a recurring series / raid train:
-# the show name + date are prepended automatically, so the LLM writes only the
-# creative hook that follows them.
-CREATIVE_TITLE_IDENTITY_HINT = """\
-- This mix is an episode of "{identity}". That series name (and date) is
-  prepended to your title automatically — write ONLY the creative subtitle
-  hook that follows it. Do not repeat the series name, "raid train",
-  "twitch", or any date.
-"""
-
-YOUTUBE_TITLE_PROMPT = """\
-Generate a YouTube title for a DJ mix upload.
-
-RULES:
-- Format: {format_rule}
-- LEAD the genre descriptor with the PRIMARY genre (the first one listed) --
-  it is the dominant genre of the set and must drive the title and discovery
-- Under 60 characters when possible
-- Artist name first, genre keywords for discovery
-- No dates in title
-- Use pipe separator |
-- Make it SEO-friendly: include genre keywords people actually search for
-
-MIX DATA:
-- Primary genre: {primary_genre}
-- Genres: {genres}
-- Vibes: {vibes}
-- BPM Range: {bpm_range}
-- Duration: {duration}
-
-Return ONLY the title, nothing else.\
-"""
-
-YOUTUBE_TITLE_FORMAT_DEFAULT = (
-    '"{brand_name} | [Genre descriptor] [Mix Type] | [Vibe/Hook]"'
-)
-
-# When the mix carries a series / raid-train identity, that identity is the
-# leading segment (prepended automatically) so the owner and subscribers can
-# recognize the episode; the LLM writes only the discoverability part.
-YOUTUBE_TITLE_FORMAT_IDENTITY = (
-    '"[Genre descriptor] [Mix Type] | [Vibe/Hook]" — the series name '
-    '"{identity}" is prepended automatically, so do NOT include the series '
-    'name, the artist/brand name, "raid train", "twitch", or any date'
-)
 
 
 class DescriptionGenerator:
@@ -445,25 +459,24 @@ class DescriptionGenerator:
         filename: str = "",
         session: Optional[AsyncSession] = None,
         mix_id: Optional[str] = None,
-        identity: Optional[str] = None,
     ) -> str:
-        """Generate a creative, artistic mix title for SoundCloud.
+        """Generate THE title for a mix — the one string both platforms use.
+
+        The result is written to ``mix.title`` (SoundCloud) and
+        ``mix.title_youtube`` (YouTube) unchanged, so a mix is the same
+        artifact wherever someone finds it. It always carries the resolved
+        genre keyword (see :func:`resolve_title_genre`) and is capped at
+        :data:`TITLE_MAX_CHARS` so nothing truncates in search or suggested.
 
         Uniqueness is system-enforced when a ``session`` is provided: recent
         already-used titles are fed into the prompt, every draft is checked
         against the ``used_creative`` registry (exact + fuzzy), collisions
         retry with feedback, a stubborn collision gets a deterministic
         volume-numeral suffix, and the accepted title is claimed.
-
-        ``identity`` (a series / raid-train prefix from
-        :func:`derive_title_identity`) is MANDATORY branding when present: the
-        returned title is ``"<identity> — <hook>"``. Only the hook is
-        LLM-generated, and the whole uniqueness flow (registry check, retries,
-        suffix fallback, claim) runs on the hook alone — the shared prefix
-        must never make sibling episodes collide, and a hook may not repeat
-        across episodes just because its prefix differs.
         """
         from app.services import uniqueness
+
+        genre_term = resolve_title_genre(genres)
 
         # Build a tracklist hint (first few artists for inspiration)
         tracklist_hint = ""
@@ -493,15 +506,13 @@ class DescriptionGenerator:
                 )
             prompt = CREATIVE_TITLE_PROMPT.format(
                 brand_name=settings.BRAND_NAME,
+                genre_term=genre_term,
+                target_chars=TITLE_TARGET_CHARS,
+                max_chars=TITLE_MAX_CHARS,
                 filename=filename,
                 genres=", ".join(genres),
                 vibes=", ".join(vibes),
                 tracklist_hint=tracklist_hint,
-                identity_hint=(
-                    CREATIVE_TITLE_IDENTITY_HINT.format(identity=identity)
-                    if identity
-                    else ""
-                ),
                 used_titles_block=used_block,
                 retry_feedback=feedback,
             )
@@ -510,11 +521,10 @@ class DescriptionGenerator:
                 prompt, max_tokens=80, temperature=0.9,
             )
 
-            title = text.strip('"').strip("'")
-
-            # Enforce 60-char limit
-            if len(title) > 60:
-                title = title[:57] + "..."
+            # Genre keyword + length cap are guaranteed here, not hoped for,
+            # so uniqueness is checked and claimed on the exact published
+            # string.
+            title = enforce_title_shape(text, genre_term)
 
             # Track usage
             if session and mix_id:
@@ -535,11 +545,14 @@ class DescriptionGenerator:
             )
         else:
             # Hard guarantee: deterministic volume-numeral suffix until free.
-            base = title
-            for n, numeral in enumerate(
-                ("II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"), start=2
-            ):
-                candidate = f"{base[:60 - len(numeral) - 1].rstrip()} {numeral}"
+            # The numeral goes on the HOOK and the genre tail is re-applied
+            # after, so a disambiguated title still reads "Hook II | House Mix"
+            # and never loses its search keyword.
+            base_hook = _title_hook(title, genre_term)
+            for numeral in ("II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"):
+                candidate = enforce_title_shape(
+                    f"{base_hook} {numeral}", genre_term
+                )
                 # Exact-only: "Base II" must not fuzzy-collide with "Base".
                 if not await uniqueness.is_taken(
                     session, uniqueness.KIND_TITLE, candidate,
@@ -549,7 +562,9 @@ class DescriptionGenerator:
                     break
             else:
                 suffix = (mix_id or "X")[:4].upper()
-                title = f"{base[:60 - len(suffix) - 1].rstrip()} {suffix}"
+                title = enforce_title_shape(
+                    f"{base_hook} {suffix}", genre_term
+                )
             logger.warning(
                 "Creative title kept colliding; accepted suffixed title %r", title
             )
@@ -557,77 +572,7 @@ class DescriptionGenerator:
         if session is not None:
             await uniqueness.claim(session, uniqueness.KIND_TITLE, title, mix_id)
 
-        if identity:
-            # The identity prefix is non-negotiable: whatever the hook, the
-            # published title must stay recognizable as this series episode.
-            room = TITLE_WITH_IDENTITY_MAX - len(identity) - len(" — ")
-            hook = title
-            if len(hook) > room:
-                hook = hook[: max(room - 3, 0)].rstrip() + "..."
-            title = f"{identity} — {hook}" if hook else identity
-            logger.info("Generated creative title (identity kept): %s", title)
-            return title
-
-        logger.info("Generated creative title: %s", title)
-        return title
-
-    async def generate_youtube_title(
-        self,
-        genres: List[str],
-        vibes: List[str],
-        bpm_range: Optional[List[float]] = None,
-        duration_seconds: float = 0.0,
-        session: Optional[AsyncSession] = None,
-        mix_id: Optional[str] = None,
-        identity: Optional[str] = None,
-    ) -> str:
-        """Generate an SEO-optimized YouTube title.
-
-        With an ``identity`` (series / raid-train prefix from
-        :func:`derive_title_identity`) the result is
-        ``"<identity> | <SEO descriptor>"`` — the episode must stay
-        recognizable in Studio and subscribers' feeds.
-        """
-        duration_str = _format_duration(duration_seconds)
-        bpm_str = f"{bpm_range[0]:.0f}-{bpm_range[1]:.0f}" if bpm_range else "unknown"
-
-        if identity:
-            format_rule = YOUTUBE_TITLE_FORMAT_IDENTITY.format(identity=identity)
-        else:
-            format_rule = YOUTUBE_TITLE_FORMAT_DEFAULT.format(
-                brand_name=settings.BRAND_NAME
-            )
-        prompt = YOUTUBE_TITLE_PROMPT.format(
-            format_rule=format_rule,
-            primary_genre=(genres[0] if genres else "electronic"),
-            genres=", ".join(genres),
-            vibes=", ".join(vibes),
-            bpm_range=bpm_str,
-            duration=duration_str,
-        )
-
-        response, text = await self._create_completion(
-            prompt, max_tokens=100, temperature=0.8,
-        )
-
-        title = text.strip('"').strip("'")
-
-        # Track usage
-        if session and mix_id:
-            await self._track_usage(
-                session, mix_id, "youtube_title",
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-            )
-
-        if identity:
-            room = TITLE_WITH_IDENTITY_MAX - len(identity) - len(" | ")
-            hook = title
-            if len(hook) > room:
-                hook = hook[: max(room - 3, 0)].rstrip() + "..."
-            title = f"{identity} | {hook}" if hook else identity
-
-        logger.info("Generated YouTube title: %s", title)
+        logger.info("Generated unified title: %s", title)
         return title
 
     async def _generate_description(

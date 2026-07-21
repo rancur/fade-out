@@ -488,13 +488,19 @@ class TestCreativeTitleUniqueness:
                 genres=["house"], vibes=["warm"], session=session, mix_id=mid,
             )
             await session.commit()
-            assert title == "Same Old Title II"
-            assert await is_taken(session, KIND_TITLE, "Same Old Title II", fuzzy=False)
+            # The numeral lands on the hook, ahead of the genre keyword, so
+            # the disambiguated title still reads as a title and stays
+            # searchable.
+            assert title == "Same Old Title II | House Mix"
+            assert await is_taken(
+                session, KIND_TITLE, "Same Old Title II | House Mix", fuzzy=False
+            )
 
     async def test_no_session_keeps_legacy_single_shot(self, monkeypatch):
         gen, seq = self._generator(monkeypatch, ["Any Title At All"])
         title = await gen.generate_creative_title(genres=["house"], vibes=["warm"])
-        assert title == "Any Title At All"
+        # Genre enforcement is unconditional — it does not depend on a session.
+        assert title == "Any Title At All | House Mix"
         assert len(seq.calls) == 1
 
 
