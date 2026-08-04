@@ -208,48 +208,37 @@ def _ensure_tracklist_section(sc_desc: str, tracklist: list) -> str:
     return sc_desc
 
 
-async def _detect_video_offset(
-    video_path: str, flac_tracklist: list, analyzer
-) -> float:
-    """Detect the timestamp offset between the FLAC and the video.
+async def _detect_video_offset(video_path: str, audio_path: str) -> float:
+    """Seconds to ADD to FLAC timestamps to get the matching video timestamps.
 
-    Shazams the first few minutes of the video to find where the first
-    identified track starts, then calculates the difference from the FLAC
-    tracklist's first track timestamp.
+    The tracklist is detected once, against the FLAC that goes to SoundCloud.
+    The video that goes to YouTube is a different render of the same set: the
+    stream starts before the deck recording does, so every chapter sits later
+    in the video by the length of that lead-in. This measures that lead-in
+    against the actual video asset rather than assuming it.
+
+    Returns 0.0 when no trustworthy alignment can be measured — a failed
+    alignment normally means the wrong video is attached to the mix, and
+    YouTube chapters that are merely un-shifted are far less damaging than
+    chapters shifted by a fabricated amount.
     """
-    from app.services.audio_analyzer import TrackHit
+    from app.services import audio_alignment
 
-    first_flac_track = flac_tracklist[0] if flac_tracklist else None
-    if not first_flac_track:
+    try:
+        alignment = await audio_alignment.measure_offset(audio_path, video_path)
+    except audio_alignment.AlignmentError as exc:
+        logger.warning(
+            "Could not align video to audio (%s); YouTube chapters will use the "
+            "unshifted FLAC timestamps", exc,
+        )
         return 0.0
 
-    first_flac_title = first_flac_track.get("title", "").lower() if isinstance(first_flac_track, dict) else first_flac_track.title.lower()
-    first_flac_ts = first_flac_track.get("timestamp_seconds", 0) if isinstance(first_flac_track, dict) else first_flac_track.timestamp_seconds
-
-    # Sample the video at 30s intervals for the first 10 minutes
-    import librosa
-    duration = librosa.get_duration(path=video_path)
-    max_search = min(duration, 600)  # search first 10 min
-
-    for offset in range(0, int(max_search), 30):
-        try:
-            # Get native sample rate for Shazam
-            sr_native = librosa.get_samplerate(video_path)
-            hit = await analyzer._shazam_segment(video_path, float(offset), sr_native)
-            if hit and hit.title.lower() == first_flac_title:
-                # Found the first track in the video
-                video_ts = float(offset)
-                detected_offset = video_ts - first_flac_ts
-                logger.info(
-                    "Video offset: first track '%s' at %.0fs in video vs %.0fs in FLAC = %.1fs offset",
-                    hit.title, video_ts, first_flac_ts, detected_offset,
-                )
-                return detected_offset
-        except Exception:
-            continue
-
-    logger.info("Could not auto-detect video offset (first track not found in video first 10min)")
-    return 0.0
+    logger.info(
+        "Video offset %.2fs (confidence %.2f, spread %.2fs over %d probes)",
+        alignment.offset_seconds, alignment.confidence,
+        alignment.spread_seconds, alignment.probes,
+    )
+    return alignment.offset_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -407,16 +396,20 @@ async def handle_analyze(
     mix.tracklist = final_tracklist
     mix.duration_seconds = result.duration_seconds
 
-    # Auto-detect YouTube timestamp offset if video file exists
-    # The FLAC is trimmed but the video stream isn't — find where the first
-    # track starts in the video vs the FLAC to calculate the offset.
+    # YouTube chapters must be derived from the video that YouTube actually
+    # gets, not from the FLAC SoundCloud gets. Measure the lead-in between the
+    # two renders so the chapter block can be shifted onto the video timeline.
     yt_offset = 0.0
-    if mix.video_file_path and os.path.exists(mix.video_file_path) and final_tracklist:
+    if (
+        mix.video_file_path
+        and os.path.exists(mix.video_file_path)
+        and mix.audio_file_path
+        and os.path.exists(mix.audio_file_path)
+    ):
         try:
             yt_offset = await _detect_video_offset(
-                mix.video_file_path, final_tracklist, analyzer
+                mix.video_file_path, mix.audio_file_path
             )
-            logger.info("Auto-detected YouTube timestamp offset: %.1fs", yt_offset)
         except Exception as exc:
             logger.warning("Video offset detection failed, defaulting to 0: %s", exc)
     mix.youtube_timestamp_offset = yt_offset
