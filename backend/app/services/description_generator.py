@@ -406,6 +406,7 @@ class DescriptionGenerator:
         mix_id: Optional[str] = None,
         brand_settings: Optional[BrandSettings] = None,
         youtube_timestamp_offset: float = 0.0,
+        video_duration_seconds: Optional[float] = None,
     ) -> str:
         """Generate a YouTube description with chapter timestamps.
 
@@ -429,7 +430,21 @@ class DescriptionGenerator:
         # chapters, >=10s apart). When we have enough tracks for real chapters,
         # append them deterministically and keep the model from writing its own
         # (unreliable) tracklist. Otherwise fall back to the model tracklist.
-        chapter_block = _format_chapter_block(adjusted_tracklist)
+        # The video is the whole stream: the mix sits between a "starting
+        # soon" pre-roll of exactly the measured offset and whatever trailed
+        # after the last track. Both bookends fall out of numbers we already
+        # have — no extra analysis.
+        mix_end = (
+            youtube_timestamp_offset + duration_seconds
+            if duration_seconds
+            else None
+        )
+        chapter_block = _format_chapter_block(
+            adjusted_tracklist,
+            lead_in_seconds=youtube_timestamp_offset,
+            mix_end_seconds=mix_end,
+            video_duration_seconds=video_duration_seconds,
+        )
 
         return await self._generate_description(
             platform="YouTube",
@@ -743,14 +758,26 @@ class DescriptionGenerator:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _format_chapter_block(tracklist: Optional[List[Dict[str, Any]]]) -> str:
+def _format_chapter_block(
+    tracklist: Optional[List[Dict[str, Any]]],
+    lead_in_seconds: float = 0.0,
+    mix_end_seconds: Optional[float] = None,
+    video_duration_seconds: Optional[float] = None,
+) -> str:
     """Render a validated YouTube chapter block, or '' if too few chapters.
 
     Uses ``build_youtube_chapters`` to guarantee YouTube renders chapters (first
-    stamp 0:00, >=3 chapters, >=10s apart). Unidentified tracks render as
-    ``ID - ID``; the synthetic 0:00 "Intro" marker renders as just ``Intro``.
+    stamp 0:00, >=3 chapters, >=10s apart) and to bookend the tracks with
+    "Starting Soon" / "Stream Ended" chapters when the video has a pre-roll or
+    trailing content. Unidentified tracks render as ``ID - ID``; marker rows
+    render as just their label.
     """
-    chapters = build_youtube_chapters(tracklist or [])
+    chapters = build_youtube_chapters(
+        tracklist or [],
+        lead_in_seconds=lead_in_seconds,
+        mix_end_seconds=mix_end_seconds,
+        video_duration_seconds=video_duration_seconds,
+    )
     if not chapters:
         return ""
 

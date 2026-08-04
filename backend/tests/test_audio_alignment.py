@@ -118,3 +118,99 @@ def test_shifted_chapters_still_satisfy_youtube_rules():
     assert block.splitlines()[1].startswith("0:00")
     # The first real track lands at the offset, not at 0:00 as SoundCloud has it.
     assert "10:13" in block
+
+
+# ---------------------------------------------------------------------------
+# Bookend chapters: "Starting Soon" pre-roll and "Stream Ended" outro
+# ---------------------------------------------------------------------------
+
+LEAD_IN_SECONDS = 613.0
+FLAC_DURATION = 1000.0
+
+
+def _shifted_tracks(offset, n=6, spacing=180.0):
+    return [
+        {"artist": f"A{i}", "title": f"T{i}",
+         "timestamp_seconds": i * spacing + offset, "timestamp_formatted": ""}
+        for i in range(n)
+    ]
+
+
+def _assert_valid(chapters):
+    """The three rules YouTube silently enforces by rendering nothing."""
+    assert chapters, "no chapters produced"
+    assert chapters[0]["timestamp_seconds"] == 0.0
+    assert len(chapters) >= 3
+    stamps = [c["timestamp_seconds"] for c in chapters]
+    assert stamps == sorted(stamps)
+    assert all(b - a >= 10 for a, b in zip(stamps, stamps[1:]))
+
+
+def test_bookends_wrap_the_tracks():
+    tracks = _shifted_tracks(LEAD_IN_SECONDS)
+    mix_end = LEAD_IN_SECONDS + FLAC_DURATION
+    chapters = build_youtube_chapters(
+        tracks, lead_in_seconds=LEAD_IN_SECONDS,
+        mix_end_seconds=mix_end, video_duration_seconds=mix_end + 120,
+    )
+    _assert_valid(chapters)
+    assert chapters[0]["title"] == "Starting Soon"
+    # The pre-roll chapter must end exactly where the first track begins.
+    assert chapters[1]["timestamp_seconds"] == LEAD_IN_SECONDS
+    assert chapters[-1]["title"] == "Stream Ended"
+    assert chapters[-1]["timestamp_seconds"] == mix_end
+    # Everything between the bookends is a track, nothing else.
+    assert all(c["artist"] for c in chapters[1:-1])
+
+
+def test_no_closing_chapter_when_trailing_content_is_too_short():
+    """A sub-10s outro would invalidate the whole set — drop it instead."""
+    tracks = _shifted_tracks(LEAD_IN_SECONDS)
+    mix_end = LEAD_IN_SECONDS + FLAC_DURATION
+    chapters = build_youtube_chapters(
+        tracks, lead_in_seconds=LEAD_IN_SECONDS,
+        mix_end_seconds=mix_end, video_duration_seconds=mix_end + 4,
+    )
+    _assert_valid(chapters)
+    assert all(c["title"] != "Stream Ended" for c in chapters)
+
+
+def test_closing_chapter_dropped_when_it_crowds_the_last_track():
+    tracks = _shifted_tracks(LEAD_IN_SECONDS)
+    mix_end = tracks[-1]["timestamp_seconds"] + 3  # only 3s of final track
+    chapters = build_youtube_chapters(
+        tracks, lead_in_seconds=LEAD_IN_SECONDS,
+        mix_end_seconds=mix_end, video_duration_seconds=mix_end + 600,
+    )
+    _assert_valid(chapters)
+    assert all(c["title"] != "Stream Ended" for c in chapters)
+
+
+def test_no_pre_roll_still_produces_valid_chapters():
+    """Offset 0: the first track already sits at 0:00, no marker needed."""
+    tracks = _shifted_tracks(0.0)
+    chapters = build_youtube_chapters(tracks, lead_in_seconds=0.0)
+    _assert_valid(chapters)
+    assert chapters[0]["artist"] == "A0"
+    assert all(c["title"] != "Starting Soon" for c in chapters)
+
+
+def test_tiny_pre_roll_uses_neutral_marker_not_starting_soon():
+    """A 4s lead-in is not a 'starting soon' screen — don't mislabel it."""
+    tracks = _shifted_tracks(4.0)
+    chapters = build_youtube_chapters(tracks, lead_in_seconds=4.0)
+    _assert_valid(chapters)
+    assert chapters[0]["title"] == "Intro"
+
+
+def test_bookends_render_in_the_description_block():
+    tracks = _shifted_tracks(LEAD_IN_SECONDS)
+    mix_end = LEAD_IN_SECONDS + FLAC_DURATION
+    block = _format_chapter_block(
+        tracks, lead_in_seconds=LEAD_IN_SECONDS,
+        mix_end_seconds=mix_end, video_duration_seconds=mix_end + 300,
+    )
+    lines = block.splitlines()
+    assert lines[1] == "0:00 Starting Soon"
+    assert lines[2].startswith("10:13 ")          # first track at the offset
+    assert lines[-1].startswith("26:53 Stream Ended")

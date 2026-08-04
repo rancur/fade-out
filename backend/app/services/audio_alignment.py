@@ -193,19 +193,40 @@ async def measure_offset(
     if reference_duration <= window:
         raise AlignmentError("reference too short to align")
 
-    # A coarse probe near the start finds the rough lead-in, then every probe
-    # is refined around it. Searching +/-1800 s at every probe point would be
-    # needlessly slow once the answer is roughly known.
-    coarse = await _probe_offset(
-        reference_path, target_path, min(60.0, reference_duration * 0.1),
-        centre=0.0, search=COARSE_SEARCH_SECONDS, window=window,
-    )
-    if coarse is None or coarse[1] < MIN_PEAK_CORRELATION:
+    # A coarse probe finds the rough lead-in, then every probe is refined
+    # around it — searching +/-1800 s at every probe point would be needlessly
+    # slow once the answer is roughly known.
+    #
+    # The coarse probe is tried from several points in the set and the
+    # strongest peak wins. A single fixed probe point is fragile: a set that
+    # opens on an ambient pad or a long quiet build gives the envelope almost
+    # nothing to lock onto, the coarse probe picks a wrong lag, and every
+    # refined probe then searches around the wrong centre and the whole
+    # alignment fails even though the files match perfectly. That is exactly
+    # what happened on the 2026-08-03 set.
+    coarse_candidates = []
+    for fraction in (0.05, 0.35, 0.65):
+        at = reference_duration * fraction
+        if at + window > reference_duration:
+            continue
+        result = await _probe_offset(
+            reference_path, target_path, at,
+            centre=0.0, search=COARSE_SEARCH_SECONDS, window=window,
+        )
+        if result is not None:
+            coarse_candidates.append(result)
+        # A strong peak is conclusive; no need to pay for the rest.
+        if result is not None and result[1] >= 0.7:
+            break
+
+    if not coarse_candidates:
+        raise AlignmentError("could not read comparable audio from both files")
+    centre, best_peak = max(coarse_candidates, key=lambda c: c[1])
+    if best_peak < MIN_PEAK_CORRELATION:
         raise AlignmentError(
             "no confident coarse alignment — the target is probably not the "
             "same set as the reference"
         )
-    centre = coarse[0]
 
     # Spread probes across the whole set. If the two files drifted apart rather
     # than simply starting at different moments, these disagree and we bail.

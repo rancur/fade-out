@@ -388,6 +388,30 @@ class TestUploadYoutubeQuotaLedger:
             "used": YT_UPLOAD_QUOTA_COST,
         }
 
+    async def test_upload_records_both_url_and_video_id(
+        self, prepared_db, monkeypatch, tmp_path
+    ):
+        """The ID is what consumers query on, so it must be persisted.
+
+        Regression: only ``youtube_url`` was written. Every consumer —
+        catalog's has_yt/no_yt filters, playlist placement, Shorts sourcing —
+        reads ``youtube_video_id``, so a successfully-published mix read as
+        never uploaded and was silently skipped by all of them.
+        """
+        await _seed_app_settings({"youtube_refresh_token": "tok"})
+
+        out = await self._run_upload(tmp_path, monkeypatch)
+
+        async with async_session_factory() as session:
+            mix = (
+                await session.execute(
+                    select(Mix).where(Mix.youtube_url.is_not(None))
+                )
+            ).scalars().first()
+
+        assert mix.youtube_url == out["youtube_url"]
+        assert mix.youtube_video_id == out["video_id"] == "abc123def45"
+
     async def test_charge_accumulates_on_todays_ledger(
         self, prepared_db, monkeypatch, tmp_path
     ):
