@@ -27,6 +27,12 @@ APPLY = "--apply" in sys.argv
 ONLY = [a for a in sys.argv[1:] if not a.startswith("--")]
 
 TS_LINE = re.compile(r"^\s*(?:\d+:)?\d{1,2}:\d{2}\s+\S.*$", re.M)
+_ISO = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+
+
+def _iso8601_seconds(text):
+    h, m, sec = _ISO.match(text).groups()
+    return int(h or 0) * 3600 + int(m or 0) * 60 + int(sec or 0)
 
 db = sqlite3.connect("file:/data/fadeout.db?mode=ro", uri=True)
 db.row_factory = sqlite3.Row
@@ -89,10 +95,11 @@ for r in rows:
     if not flac or not os.path.exists(flac):
         continue
 
-    item = yt.videos().list(part="snippet", id=vid).execute().get("items")
+    item = yt.videos().list(part="snippet,contentDetails", id=vid).execute().get("items")
     if not item:
         continue
     snippet = item[0]["snippet"]
+    yt_seconds = _iso8601_seconds(item[0]["contentDetails"]["duration"])
     desc = snippet.get("description", "")
     if len(TS_LINE.findall(desc)) < 3:
         continue
@@ -128,7 +135,17 @@ for r in rows:
     tracks = json.loads(r["tracklist"])
     shifted = [dict(t, timestamp_seconds=max(0.0, (t.get("timestamp_seconds") or 0) + al.offset_seconds))
                for t in tracks]
-    block = _format_chapter_block(shifted)
+    # Bookend the tracks: the pre-roll runs exactly as long as the measured
+    # offset, and the mix stops at offset + FLAC duration. Both come free from
+    # numbers already in hand; the builder drops either bookend that would
+    # break YouTube's rules.
+    mix_end = al.offset_seconds + (r["duration_seconds"] or 0)
+    block = _format_chapter_block(
+        shifted,
+        lead_in_seconds=al.offset_seconds,
+        mix_end_seconds=mix_end if r["duration_seconds"] else None,
+        video_duration_seconds=yt_seconds,
+    )
     if not block:
         entry["skipped"] = "chapter block failed YouTube validation"
         report.append(entry); print(json.dumps(entry), flush=True); continue
@@ -138,6 +155,9 @@ for r in rows:
     entry["old_first_stamp"] = (TS_LINE.findall(desc) or [""])[0].strip()[:24]
     entry["new_first_stamp"] = lines[1][:24]
     entry["new_second_stamp"] = lines[2][:40] if len(lines) > 2 else ""
+    entry["last_chapter"] = lines[-1][:32]
+    entry["yt_seconds"] = yt_seconds
+    entry["mix_end"] = round(mix_end, 1)
     entry["new_len"] = len(new_desc)
 
     if len(new_desc) > 4900:

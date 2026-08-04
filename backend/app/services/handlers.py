@@ -508,6 +508,19 @@ async def handle_generate_description(
         await usage_session.commit()
 
         yt_offset = mix.youtube_timestamp_offset or 0.0
+        # Video length tells the chapter builder whether there is enough
+        # trailing content to earn a closing "Stream Ended" chapter. ffprobe
+        # only reads the container header, so this is essentially free.
+        video_duration = None
+        if mix.video_file_path and os.path.exists(mix.video_file_path):
+            try:
+                from app.services import audio_alignment
+
+                video_duration = await audio_alignment.probe_duration(
+                    mix.video_file_path
+                )
+            except Exception as exc:
+                logger.warning("Could not probe video duration: %s", exc)
         yt_desc = await desc_gen.generate_youtube_description(
             mix_title=mix.title,
             genres=genres,
@@ -520,6 +533,7 @@ async def handle_generate_description(
             mix_id=mix_id,
             brand_settings=brand,
             youtube_timestamp_offset=yt_offset,
+            video_duration_seconds=video_duration,
         )
         await usage_session.commit()
 
@@ -844,6 +858,11 @@ async def handle_upload_youtube(
     )
 
     mix.youtube_url = result["video_url"]
+    # The ID, not the URL, is what every consumer queries on: catalog's
+    # has_yt/no_yt filters, playlist placement and Shorts sourcing all read
+    # youtube_video_id. Leaving it null made a successfully-uploaded mix look
+    # like it had never been published at all.
+    mix.youtube_video_id = result.get("video_id")
     if result.get("playlist_id"):
         mix.youtube_playlist_id = result["playlist_id"]
 
