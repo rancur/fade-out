@@ -1,5 +1,50 @@
 # Changelog
 
+## v2.3.0 — 2026-08-08
+
+### Source file renaming
+- New opt-in **Rename source files to match titles** setting (Settings →
+  Advanced, OFF by default): when a run completes — and whenever a new title is
+  applied from the catalog — the source audio and video in the watch folders are
+  renamed to `YYYY-MM-DD <title>.<ext>` and the stored paths follow, so the
+  archive on disk finally matches the published catalog.
+- The date prefix comes from the ORIGINAL filename and the same token is applied
+  to both files, so audio/video pairing and catalog local-file matching keep
+  working — and the pair now shares an identical stem, which upgrades
+  `_find_sibling` from its fuzzy same-date branch to its exact-stem branch. An
+  imported back-catalog mix with no date in its filename gets no prefix rather
+  than a fabricated one from its catalog-sync timestamp.
+- Titles are sanitized to the strictest common set across ext4/NTFS/SMB (`|` and
+  `/` become `-`, `:` becomes ` -`), NFC-normalized so macOS's decomposed SMB
+  strings still compare equal, and truncated on a UTF-8 boundary against a
+  255-byte ceiling.
+- `POST /api/catalog/mixes/{id}/rename-source?dry_run=true` previews or triggers
+  a rename for a single mix, and works while the setting is off — the only path
+  the existing back-catalog has to the new naming.
+- **Requires the audio and video bind mounts to be read-write.**
+  `docker-compose.yml` now sets `/watch/audio` and `/watch/video` to `:rw`
+  (`/watch/shorts` and `/watch/djctl-cue` stay `:ro`). Until that lands on the
+  NAS the feature is a clean no-op: every rename is skipped and logged.
+
+### Safety rails
+This is the first code in the backend that writes to the watch folders, so the
+guarantees are worth stating plainly:
+- Only files inside `/watch/audio` and `/watch/video` are eligible — containment
+  is checked with `commonpath`, not `startswith`, so a lookalike sibling like
+  `/watch/audio-archive` is refused. `CATALOG_EXTRA_AUDIO_PATHS`,
+  `/watch/shorts` and `/watch/djctl-cue` are excluded outright. `POST /api/mixes`
+  accepts a caller-supplied `audio_file_path`, which is exactly what this rail
+  defends against.
+- An existing file is never overwritten: an occupied target name gets a ` (2)`
+  through ` (9)` suffix and is then refused. Symlinks are skipped rather than
+  followed.
+- A rename can never fail a pipeline run, and can never cause a re-ingest —
+  dedupe is keyed on the content hash, which a rename does not change.
+- No DB session is held across the rename, so sqlite's write lock is never held
+  while a NAS call blocks. A partial outcome (audio renamed, video not) is
+  committed as-is, and a crash between the rename and the commit self-heals on
+  the next run.
+
 ## v2.2.0 — 2026-07-19
 
 ### YouTube Shorts auto-uploader
