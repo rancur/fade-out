@@ -10,9 +10,14 @@ services:
     ports:
       - "8500:8000"
     volumes:
-      # Watch folders on NAS (read-only)
-      - /volume1/music/DJ Will See:/watch/audio:ro
-      - /volume1/twitch/Recordings:/watch/video:ro
+      # Audio + video watch folders on NAS. READ-WRITE so the optional
+      # "Rename source files to match titles" setting (Settings -> Advanced,
+      # OFF by default) can rename finished recordings in place. Change these
+      # back to :ro if you never want fade-out to touch the source files — with
+      # the setting on and a :ro mount every rename is simply skipped and
+      # logged, and nothing else about the pipeline changes.
+      - /volume1/music/DJ Will See:/watch/audio:rw
+      - /volume1/twitch/Recordings:/watch/video:rw
       - /volume1/homes/willcurran/djctl/cue-sheets:/watch/djctl-cue:ro
       # Vertical OBS Backtrack clips for the Shorts auto-uploader (READ-ONLY —
       # the pipeline only ever reads the source recordings)

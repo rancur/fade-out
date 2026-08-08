@@ -394,3 +394,89 @@ class TestQuotaBudget:
         summary = await run_apply()
         assert summary["paused"] is True and summary["applied"] == 0
         assert (await _get_proposal(pid)).status == "approved"
+
+
+class TestSourceRenameHook:
+    """A SoundCloud title landing on a platform also renames the file on disk.
+
+    The hook is deferred until after run_apply's session commits, because that
+    session holds sqlite's single write lock and a rename against a sleeping NAS
+    can block for seconds. These tests pin both the wiring and the deferral.
+    """
+
+    @pytest.fixture
+    def rename_spy(self, monkeypatch):
+        import app.services.source_renamer as renamer
+
+        calls = []
+
+        async def spy(mix_id, *, reason, dry_run=False):
+            calls.append((mix_id, reason))
+            return {}
+
+        monkeypatch.setattr(renamer, "rename_sources_for_mix", spy)
+        return calls
+
+    async def test_soundcloud_title_apply_triggers_one_rename(
+        self, prepared_db, fake_uploaders, rename_spy
+    ):
+        mix_id = await _make_mix()
+        await _make_proposal(mix_id, "soundcloud", "title", "New Title")
+        await run_apply()
+        assert rename_spy == [(mix_id, "catalog_apply")]
+
+    async def test_both_platform_title_renames_once(
+        self, prepared_db, fake_uploaders, rename_spy
+    ):
+        mix_id = await _make_mix()
+        await _make_proposal(mix_id, "both", "title", "New Title")
+        await run_apply()
+        assert rename_spy == [(mix_id, "catalog_apply")]
+
+    async def test_youtube_only_title_does_not_rename(
+        self, prepared_db, fake_uploaders, rename_spy
+    ):
+        # That branch moves title_youtube; the filename follows mix.title.
+        mix_id = await _make_mix()
+        await _make_proposal(mix_id, "youtube", "title", "New YT Title")
+        await run_apply()
+        assert rename_spy == []
+
+    async def test_non_title_apply_does_not_rename(
+        self, prepared_db, fake_uploaders, rename_spy
+    ):
+        mix_id = await _make_mix()
+        await _make_proposal(mix_id, "soundcloud", "description", "fresh")
+        await run_apply()
+        assert rename_spy == []
+
+    async def test_failed_apply_does_not_rename(
+        self, prepared_db, fake_uploaders, rename_spy
+    ):
+        yt, sc = fake_uploaders
+        sc.fail_on = ("update_track_fields",)
+        mix_id = await _make_mix()
+        await _make_proposal(mix_id, "soundcloud", "title", "New Title")
+        summary = await run_apply()
+        assert summary["failed"] == 1
+        assert rename_spy == []
+
+    async def test_rename_runs_after_the_apply_session_commits(
+        self, prepared_db, fake_uploaders, monkeypatch
+    ):
+        """The deferral is real, not incidental: the spy opens its OWN session
+        and must already see the committed title."""
+        import app.services.source_renamer as renamer
+
+        seen = []
+
+        async def spy(mix_id, *, reason, dry_run=False):
+            seen.append((await _get_mix(mix_id)).title)
+            return {}
+
+        monkeypatch.setattr(renamer, "rename_sources_for_mix", spy)
+        mix_id = await _make_mix()
+        await _make_proposal(mix_id, "soundcloud", "title", "New Title")
+        await run_apply()
+
+        assert seen == ["New Title"]
