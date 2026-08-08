@@ -14,9 +14,11 @@ services:
       - ./backend:/app/backend
       # Mount frontend build output (built by vite dev or separate build)
       - ./frontend/dist:/app/frontend/dist
-      # Local watch directories for development
-      - ./dev/watch/audio:/watch/audio:ro
-      - ./dev/watch/video:/watch/video:ro
+      # Local watch directories for development. Audio + video are read-write
+      # so the optional source-file renaming feature can be exercised locally;
+      # see the note in docker-compose.yml.
+      - ./dev/watch/audio:/watch/audio:rw
+      - ./dev/watch/video:/watch/video:rw
       - ./dev/watch/djctl-cue:/watch/djctl-cue:ro
       # Local output directories
       - ./dev/output/thumbnails:/output/thumbnails

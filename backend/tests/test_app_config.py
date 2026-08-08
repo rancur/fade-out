@@ -204,6 +204,34 @@ class TestResolve:
         app_config.invalidate_cache()
         assert await app_config.resolve("backfill_auto_resume") is False
 
+    async def test_rename_source_files_in_schema_and_roundtrips(self, prepared_db):
+        # Source-file renaming: bool, non-secret, env-backed, default OFF. The
+        # default matters — this is the only feature that mutates the watch
+        # folders, so it must never come on by accident.
+        d = app_config.SCHEMA_BY_KEY["rename_source_files"]
+        assert d.type == "bool"
+        assert d.category == "Advanced"
+        assert d.editable is True
+        assert d.key not in app_config.SECRET_JSON_KEYS
+        assert app_config.env_default(d) is False
+        assert app_config.validate_value(d, True) is True
+        with pytest.raises(ValueError):
+            app_config.validate_value(d, "true")
+
+        assert await app_config.resolve("rename_source_files") is False
+
+        from app.database import async_session_factory
+        from app.models import AppSettings
+
+        async with async_session_factory() as session:
+            session.add(
+                AppSettings(id=1, settings_json={"rename_source_files": True})
+            )
+            await session.commit()
+
+        app_config.invalidate_cache()
+        assert await app_config.resolve("rename_source_files") is True
+
     async def test_video_wait_max_checks_in_schema_and_roundtrips(
         self, prepared_db
     ):

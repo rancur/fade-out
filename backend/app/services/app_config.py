@@ -357,6 +357,21 @@ SETTINGS_SCHEMA: Tuple[SettingDef, ...] = (
         type="bool", category="Advanced", env_attr="CROSS_LINK_PUSH_ENABLED",
     ),
     SettingDef(
+        key="rename_source_files",
+        label="Rename source files to match titles",
+        help="When a run completes — and whenever a new title is applied from "
+             "the catalog — rename the source audio and video in the watch "
+             "folders to \"YYYY-MM-DD <title>.<ext>\" and update the stored "
+             "paths. The date comes from the ORIGINAL filename, so audio/video "
+             "pairing and catalog matching keep working. Requires the audio and "
+             "video watch folders to be mounted read-WRITE (docker-compose: "
+             "change ':ro' to ':rw'); with a read-only mount every rename is "
+             "skipped and logged, and nothing else is affected. Files outside "
+             "those two folders are never touched, and an existing file is "
+             "never overwritten. OFF by default.",
+        type="bool", category="Advanced", env_attr="RENAME_SOURCE_FILES",
+    ),
+    SettingDef(
         key="backfill_auto_resume",
         label="Backfill auto-resume",
         help="Restart an interrupted catalog tracklist backfill shortly after "

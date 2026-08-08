@@ -700,6 +700,20 @@ class PipelineOrchestrator:
                 await session.commit()
 
     async def _mark_complete(self, mix_id: str) -> None:
+        # Rename the sources to match the generated title now that every upload
+        # has been verified -- the video has passed its completeness gate and no
+        # uploader is holding the file open. Off by default; see source_renamer.
+        # The renamer never raises, and the try/except keeps it that way even if
+        # that ever changes: a rename must not be able to un-complete a run.
+        try:
+            from app.services import source_renamer
+
+            await source_renamer.rename_sources_for_mix(
+                mix_id, reason="pipeline_complete"
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Source rename failed for mix %s", mix_id)
+
         async with async_session_factory() as session:
             mix = await session.get(Mix, mix_id)
             if mix:

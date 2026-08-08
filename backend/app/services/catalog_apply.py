@@ -202,6 +202,9 @@ async def _apply_to_soundcloud(
     if proposal.field == "title":
         await uploader.update_track_fields(tid, title=proposal.proposed_value)
         mix.title = proposal.proposed_value
+        # The matching source-file rename is NOT triggered here: this runs
+        # inside run_apply's long-lived write session. It is collected into
+        # renamed_mix_ids and executed after that session commits.
     elif proposal.field == "description":
         await uploader.update_track_fields(tid, description=proposal.proposed_value)
         mix.description_soundcloud = proposal.proposed_value
@@ -221,6 +224,10 @@ async def _apply_to_soundcloud(
 async def run_apply() -> Dict[str, Any]:
     """Apply all approved proposals sequentially. Returns a run summary."""
     summary: Dict[str, Any] = {"applied": 0, "failed": 0, "queued": 0, "paused": False}
+    # Mixes whose SoundCloud title changed in this run. The source-file rename
+    # they trigger is deliberately deferred until the apply session below has
+    # committed and closed -- see the loop at the end of this function.
+    renamed_mix_ids: List[str] = []
     from app.services import app_config
 
     budget = int(await app_config.resolve("youtube_daily_quota_budget"))
@@ -355,6 +362,11 @@ async def run_apply() -> Dict[str, Any]:
                             proposal.proposed_value,
                             proposal.mix_id,
                         )
+                        # Only the SoundCloud branch writes mix.title, and the
+                        # filename on disk follows mix.title. A YouTube-only
+                        # title proposal moves title_youtube and must not rename.
+                        if "soundcloud" in _proposal_platforms(proposal):
+                            renamed_mix_ids.append(proposal.mix_id)
                 except Exception as exc:
                     logger.exception(
                         "Failed to apply proposal %s (%s/%s)",
@@ -376,6 +388,15 @@ async def run_apply() -> Dict[str, Any]:
         merged[QUOTA_KEY] = {"date": today, "used": used}
         settings_row.settings_json = merged
         await session.commit()
+
+    # Deferred on purpose: the apply session above holds sqlite's single write
+    # lock through to COMMIT, and a rename against a sleeping NAS can block for
+    # seconds. Running it here means the new title is already committed, which
+    # is exactly what the renamer reads. Off by default and never raises.
+    for mix_id in dict.fromkeys(renamed_mix_ids):
+        from app.services import source_renamer
+
+        await source_renamer.rename_sources_for_mix(mix_id, reason="catalog_apply")
 
     if summary["applied"] or summary["failed"]:
         await activity_log.info(

@@ -25,10 +25,12 @@ HASH_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB for dedup hash
 # truncated artifact -- a stray ``touch``, an interrupted SMB copy, or a
 # name-normalized phantom sitting next to the real drop -- and must never be
 # ingested. Such a file goes "stable" instantly (its size never changes) and
-# would otherwise spin up a full pipeline on non-audio. The source itself is
-# never modified: the watch folder is bind-mounted read-only, and ingest only
-# ever opens the source for reading. This guard is purely about not acting on a
-# garbage/empty file.
+# would otherwise spin up a full pipeline on non-audio. Ingest itself never
+# modifies the source -- it only ever opens it for reading. The single exception
+# is the opt-in ``rename_source_files`` feature (see ``source_renamer``), which
+# renames a finished mix's sources in place; a rename cannot change a file's
+# dedupe hash, so it can never cause a re-ingest. This guard is purely about not
+# acting on a garbage/empty file.
 MIN_AUDIO_FILE_BYTES = 1024 * 1024  # 1 MB floor
 
 
@@ -124,6 +126,19 @@ class _SeenFilesDB:
     def clear(self, file_hash: str) -> None:
         """Drop a record so a failed file is retried on the next scan/restart."""
         self._conn.execute("DELETE FROM seen_files WHERE file_hash = ?", (file_hash,))
+        self._conn.commit()
+
+    def rename_path(self, old_path: str, new_path: str) -> None:
+        """Follow a source file that ``source_renamer`` moved.
+
+        Cosmetic only -- dedupe is keyed on ``file_hash``, which a rename cannot
+        change, so a stale path here can never cause a re-ingest. Kept current
+        anyway so the forensic trail in this table stays honest.
+        """
+        self._conn.execute(
+            "UPDATE seen_files SET file_path = ? WHERE file_path = ?",
+            (new_path, old_path),
+        )
         self._conn.commit()
 
     def _set_status(
@@ -237,6 +252,17 @@ class _WatchHandler(FileSystemEventHandler):
         self._tracker.update(path)
 
 
+# Module-level handle to the running watcher, mirroring
+# ``ingest.get_active_coordinator``. Lets ``source_renamer`` keep the seen-files
+# record in step with a rename without threading the instance through the
+# pipeline.
+_active_watcher: "Optional[FileWatcherService]" = None
+
+
+def get_active_watcher() -> "Optional[FileWatcherService]":
+    return _active_watcher
+
+
 class FileWatcherService:
     """Watches audio and video directories and triggers callbacks on stable new files."""
 
@@ -264,9 +290,15 @@ class FileWatcherService:
         self._running = False
         self._poll_task: Optional[asyncio.Task] = None
 
+    def note_renamed(self, old_path: str, new_path: str) -> None:
+        """Point this watcher's seen-files record at a renamed source file."""
+        self._seen_db.rename_path(old_path, new_path)
+
     async def start(self) -> None:
         """Start watching directories."""
         loop = asyncio.get_running_loop()
+        global _active_watcher
+        _active_watcher = self
 
         for path in (self._audio_path, self._video_path):
             os.makedirs(path, exist_ok=True)
@@ -424,4 +456,7 @@ class FileWatcherService:
             self._observer.stop()
             self._observer.join(timeout=5)
         self._seen_db.close()
+        global _active_watcher
+        if _active_watcher is self:
+            _active_watcher = None
         logger.info("FileWatcher stopped")

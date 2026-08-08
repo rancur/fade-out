@@ -175,6 +175,14 @@ class Settings(BaseSettings):
     # opt out of mutating published descriptions.
     CROSS_LINK_PUSH_ENABLED: bool = True
 
+    # --- Source-file renaming ---
+    # When True, a finished run renames the source audio/video in the watch
+    # folders to "YYYY-MM-DD <title>.<ext>" so the archive on disk matches the
+    # published catalog. OFF by default: this is the only feature that MUTATES
+    # the watch folders, and it needs those bind mounts flipped from :ro to :rw
+    # to do anything at all (with :ro every rename is skipped and logged).
+    RENAME_SOURCE_FILES: bool = False
+
     # --- Track-detection merge ---
     # Gap-filling detections (Shazam/AudD) scoring strictly below this confidence
     # keep their timestamp but render as the "ID - ID" placeholder instead of
