@@ -33,6 +33,28 @@ class TestSeenFilesDB:
         assert db.is_done("h1") is True
         db.close()
 
+    def test_rename_path_follows_a_renamed_source(self, tmp_path):
+        # source_renamer moves a file; the record follows it. Dedupe is keyed on
+        # the hash, so the file stays "done" either way -- a rename must never
+        # cause a re-ingest.
+        db = _SeenFilesDB(str(tmp_path / "seen.db"))
+        db.mark_done("h1", "/a/old.flac", "audio")
+        db.rename_path("/a/old.flac", "/a/2026-07-15 New Title.flac")
+
+        row = db._conn.execute(
+            "SELECT file_path FROM seen_files WHERE file_hash = 'h1'"
+        ).fetchone()
+        assert row[0] == "/a/2026-07-15 New Title.flac"
+        assert db.is_done("h1") is True
+        db.close()
+
+    def test_rename_path_is_a_noop_for_an_unknown_path(self, tmp_path):
+        db = _SeenFilesDB(str(tmp_path / "seen.db"))
+        db.mark_done("h1", "/a/b.flac", "audio")
+        db.rename_path("/nowhere.flac", "/elsewhere.flac")
+        assert db.is_done("h1") is True
+        db.close()
+
     def test_clear_allows_retry(self, tmp_path):
         db = _SeenFilesDB(str(tmp_path / "seen.db"))
         db.begin_processing("h1", "/a/b.flac", "audio")

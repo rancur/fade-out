@@ -598,6 +598,31 @@ async def lock_title(
     return {"id": mix.id, "title_locked": mix.title_locked}
 
 
+@router.post("/mixes/{mix_id}/rename-source")
+async def rename_mix_source(
+    mix_id: str,
+    dry_run: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rename this mix's source files on disk to match its current title.
+
+    The automatic hooks only fire when a run completes or a title proposal is
+    applied, so this is how an already-titled back-catalog mix gets the new
+    naming. ``dry_run=true`` reports the plan without touching anything, and
+    works even while the feature is switched off -- the preview you want before
+    letting fade-out rename recordings on the NAS.
+    """
+    result = await db.execute(select(Mix).where(Mix.id == mix_id))
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Mix not found")
+
+    from app.services import source_renamer
+
+    return await source_renamer.rename_sources_for_mix(
+        mix_id, reason="manual", dry_run=dry_run
+    )
+
+
 # --- Proposals ---
 
 

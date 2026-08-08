@@ -125,6 +125,56 @@ The web dashboard will be available at `http://<nas-ip>:8500`.
 | `/watch/video` | Twitch/OBS video recordings for YouTube upload |
 | `/watch/djctl-cue` | Cue sheets exported from DJ software (via djctl) |
 
+### Source File Renaming
+
+fade-out invents a title for every mix, but the recordings on disk keep whatever
+OBS or your DJ software called them. Turning on **Rename source files to match
+titles** (Settings → Advanced) closes that gap: when a run finishes — and
+whenever a new title is applied from the catalog — the source audio and video
+are renamed in place and the stored paths follow.
+
+```
+before  /watch/audio/Twitch DJs Vol 4 (2026-07-15).flac
+        /watch/video/will-see-live-2026-07-15.mkv
+after   /watch/audio/2026-07-15 Neon Drift - House Mix.flac
+        /watch/video/2026-07-15 Neon Drift - House Mix.mkv
+```
+
+It takes **two keys to fire**, and either one missing is a safe no-op:
+
+1. the setting is on, and
+2. `/watch/audio` and `/watch/video` are mounted `:rw` in `docker-compose.yml`.
+
+With a read-only mount every rename is skipped and logged to the Activity page,
+and nothing else about the pipeline changes.
+
+The date prefix comes from the **original** filename, so audio/video pairing and
+catalog matching keep working; both files get the same token, which means the
+pair ends up with identical stems. Characters that SMB and Windows cannot store
+are replaced (`|` and `/` become `-`, `:` becomes ` -`).
+
+Safety rails worth knowing about:
+
+- Only files inside `/watch/audio` and `/watch/video` are ever touched.
+  `/watch/shorts`, `/watch/djctl-cue`, and anything in
+  `CATALOG_EXTRA_AUDIO_PATHS` are excluded.
+- An existing file is **never** overwritten — an occupied name gets a ` (2)`
+  suffix, and after `(9)` the rename is refused.
+- Symlinks are skipped, and a rename can never fail a pipeline run.
+- On a Synology, the share's ACLs and the container's UID govern whether the
+  write actually succeeds; a permission failure shows up as a warning in the
+  Activity page.
+
+To preview or trigger a rename for one mix — including for back-catalog mixes
+that predate the feature:
+
+```bash
+curl -X POST "$FADEOUT/api/catalog/mixes/<mix_id>/rename-source?dry_run=true"
+```
+
+`dry_run=true` reports the plan without touching anything, and works even while
+the setting is off.
+
 ### Output Directories
 
 | Path | Purpose |
