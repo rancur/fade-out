@@ -54,6 +54,16 @@ class TestDeploymentStatus:
         assert snap["behind_by"] == "2.2.0 -> v2.4.0"
         assert snap["healthy"] is False
 
+    def test_no_releases_is_a_known_answer_not_unknown(self, monkeypatch):
+        monkeypatch.setattr(upgrade_service, "_get_current_version", lambda: "2.4.0")
+        status = upgrade_service._DeploymentStatus()
+        status.record_success(None)
+        snap = status.as_dict()
+        assert snap["state"] == "ok"
+        assert snap["stale"] is False
+        assert snap["healthy"] is True
+        assert "no releases" in snap["comparison"]
+
     def test_current_is_healthy(self, monkeypatch):
         monkeypatch.setattr(upgrade_service, "_get_current_version", lambda: "2.4.0")
         status = upgrade_service._DeploymentStatus()

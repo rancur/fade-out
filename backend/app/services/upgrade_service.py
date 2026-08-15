@@ -108,10 +108,18 @@ class _DeploymentStatus:
 
         stale: Optional[bool] = None
         behind_by: Optional[str] = None
-        if state == "ok" and self.latest_version:
-            stale = _is_newer(self.latest_version, current)
-            if stale:
-                behind_by = f"{current} -> {self.latest_version}"
+        comparison: Optional[str] = None
+        if state == "ok":
+            if self.latest_version:
+                stale = _is_newer(self.latest_version, current)
+                if stale:
+                    behind_by = f"{current} -> {self.latest_version}"
+                comparison = "compared against the latest GitHub release"
+            else:
+                # A repo with no published releases is a KNOWN answer with
+                # nothing to compare against — not an unknown one.
+                stale = False
+                comparison = "no releases published; nothing to compare against"
 
         from app.version import build_info
 
@@ -121,6 +129,7 @@ class _DeploymentStatus:
             "state": state,
             "stale": stale,
             "behind_by": behind_by,
+            "comparison": comparison,
             "error": self.error if state == "error" else None,
             "checked_at": self.checked_at,
             "build": build_info(),
