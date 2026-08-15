@@ -38,8 +38,12 @@ DEFAULT_UNPUBLISHED_HOURS = 6
 # that silently never shipped.
 DEFAULT_DRAFT_HOURS = 72
 
-# Don't re-alert about the same mix more often than this.
-REALERT_AFTER_HOURS = 24
+# Don't re-alert about the same mix more often than this. The FIRST alert is
+# the one that matters; the repeat exists so a genuinely stuck publish is not
+# forgotten, not to nag. A draft the owner has consciously parked gets a much
+# longer leash than a mix that failed to publish.
+REALERT_AFTER_HOURS = 48
+REALERT_AFTER_HOURS_DRAFT = 168  # weekly
 
 EVENT = "stuck_mix"
 
@@ -211,8 +215,13 @@ class StuckMixWatchdog:
 
         # Dedupe against the persistent log, not memory: a crash loop must not
         # turn one stuck mix into an alert storm.
+        window = (
+            REALERT_AFTER_HOURS_DRAFT
+            if entry.get("kind") == "draft_unreviewed"
+            else REALERT_AFTER_HOURS
+        )
         try:
-            since = datetime.now(timezone.utc) - timedelta(hours=REALERT_AFTER_HOURS)
+            since = datetime.now(timezone.utc) - timedelta(hours=window)
             _items, total = await activity_log.query(
                 limit=1, mix_id=entry["id"], event=EVENT, since=since,
             )
