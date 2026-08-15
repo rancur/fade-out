@@ -231,6 +231,9 @@ class PlatformHealth:
         uploader = SoundCloudUploader(
             db_settings_json=sj,
             on_tokens_refreshed=_sc_token_persister(app_settings),
+            # The probe runs every 10 minutes; it must not write an identical
+            # activity entry each sweep. /api/health is where this is reported.
+            emit_activity=False,
         )
         try:
             await uploader._ensure_access_token()
