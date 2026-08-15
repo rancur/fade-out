@@ -12,6 +12,10 @@ const statusConfig: Record<string, { label: string; color: string; glow: string 
   completed: { label: 'Completed', color: 'text-cyber-lime border-cyber-lime', glow: '' },
   complete: { label: 'Completed', color: 'text-cyber-lime border-cyber-lime', glow: '' },
   failed: { label: 'Failed', color: 'text-cyber-red border-cyber-red', glow: 'shadow-neon-red' },
+  // Some platforms published and some did not — a real, nameable outcome
+  // rather than a mix quietly sitting at "pending" forever.
+  partial: { label: 'Partial', color: 'text-gold border-gold', glow: 'shadow-neon-red' },
+  blocked: { label: 'Blocked', color: 'text-gray-400 border-cyber-red/40 border-dashed', glow: '' },
   skipped: { label: 'Skipped', color: 'text-gray-500 border-gray-600', glow: '' },
   waiting: { label: 'Waiting', color: 'text-gold border-gold', glow: '' },
   interrupted: { label: 'Interrupted', color: 'text-gold border-gold border-dashed', glow: '' },

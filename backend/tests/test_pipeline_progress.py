@@ -188,7 +188,7 @@ class TestProgressCallbackWiring:
 
         orch.register_handler("detect", handler)
         ok = await orch._execute_step("m1", "detect")
-        assert ok is True
+        assert ok.ok is True
 
         progress = _progress_events(events)
         assert progress and progress[0]["data"] == {
@@ -204,7 +204,7 @@ class TestProgressCallbackWiring:
 
         orch.register_handler("detect", legacy_handler)
         ok = await orch._execute_step("m1", "detect")
-        assert ok is True
+        assert ok.ok is True
         (row,) = await _get_step("m1", "detect")
         assert row.status == "completed"
         assert row.output_json == {"legacy": True}

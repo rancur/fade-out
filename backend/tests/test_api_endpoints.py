@@ -10,12 +10,47 @@ import pytest
 
 
 class TestHealth:
-    async def test_health_ok(self, client):
+    async def test_liveness_is_always_up_when_the_process_is(self, client):
+        resp = await client.get("/api/health/live")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "alive"
+
+    async def test_health_ok_when_nothing_is_broken(self, client):
+        """/api/health asserts function, so the test has to give it a
+        verifiable world: no platform configured (nothing to assert) and a
+        deployment check that has actually run."""
+        from app.services.platform_health import get_platform_health
+        from app.services.upgrade_service import deployment_status
+
+        deployment_status.record_success(None)
+        for state in get_platform_health()._states.values():
+            state.state = "not_configured"
+            state.detail = "not configured in tests"
+
         resp = await client.get("/api/health")
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "ok"
+        assert body["problems"] == []
         assert "version" in body
+
+    async def test_unverifiable_deployment_warns_but_does_not_503(self, client):
+        """An unreachable GitHub is stated out loud, not treated as fine —
+        and not treated as an outage of a service that can still publish."""
+        from app.services.platform_health import get_platform_health
+        from app.services.upgrade_service import deployment_status
+
+        deployment_status.record_error("connection refused")
+        for state in get_platform_health()._states.values():
+            state.state = "not_configured"
+            state.detail = "not configured in tests"
+
+        resp = await client.get("/api/health")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["deployment"]["state"] == "error"
+        assert body["deployment"]["stale"] is None
+        assert any("deployment freshness" in w for w in body["warnings"])
 
 
 class TestMixesCrud:

@@ -66,6 +66,18 @@ RUN mkdir -p /usr/share/fonts/truetype/pressstart2p \
 # Copy frontend build from stage 1
 COPY --from=frontend-build /app/frontend/dist /app/frontend/dist
 
+# Build stamp. Baked LAST so it does not bust the layer cache, and exposed on
+# /api/health so a running container can be matched against the commit it was
+# built from. A version string alone has already proved unreliable: the
+# container running in production on 2026-08-14 was built 07-21 and nothing
+# said so.
+ARG BUILD_COMMIT=unknown
+ARG BUILD_TIME=unknown
+ARG BUILD_SOURCE=local
+ENV BUILD_COMMIT=$BUILD_COMMIT \
+    BUILD_TIME=$BUILD_TIME \
+    BUILD_SOURCE=$BUILD_SOURCE
+
 # Create persistent data, watch, and output directories
 RUN mkdir -p /data /watch/audio /watch/video /watch/djctl-cue \
     /output/thumbnails /output/cover-art
@@ -75,7 +87,10 @@ VOLUME ["/data", "/watch", "/output"]
 
 EXPOSE 8000
 
+# Container liveness only. /api/health asserts real function (credentials,
+# deployment freshness) and returns 503 when the service cannot publish —
+# which is a paging condition, not a reason for Docker to cycle the process.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8000/api/health || exit 1
+    CMD curl -f http://localhost:8000/api/health/live || exit 1
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

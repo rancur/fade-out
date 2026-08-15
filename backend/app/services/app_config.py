@@ -164,6 +164,22 @@ SETTINGS_SCHEMA: Tuple[SettingDef, ...] = (
         min_value=1, max_value=2016,
     ),
     SettingDef(
+        key="stuck_mix_hours",
+        label="Unpublished-mix alert window (h)",
+        help="How long a mix may sit ingested-but-unpublished before the "
+             "watchdog raises it. A mix that never reaches a platform has to "
+             "surface on its own rather than waiting to be noticed.",
+        type="int", category="Pipeline", fallback=6, min_value=1, max_value=720,
+    ),
+    SettingDef(
+        key="stuck_draft_hours",
+        label="Unreviewed-draft alert window (h)",
+        help="How long a draft-mode mix may await review before the watchdog "
+             "raises it. Longer than the publish window — a draft is waiting "
+             "on a person — but not unlimited.",
+        type="int", category="Pipeline", fallback=72, min_value=1, max_value=2160,
+    ),
+    SettingDef(
         key="max_concurrent_pipelines",
         label="Max concurrent pipelines",
         help="Upper bound on pipelines processing at once. Read at startup — "

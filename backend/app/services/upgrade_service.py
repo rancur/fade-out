@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,12 +23,32 @@ GITHUB_API_BASE = "https://api.github.com"
 BACKUP_DIR = "/data/backups"
 CURRENT_VERSION_FILE = "/app/VERSION"
 
+# How long a successful release check stays authoritative, and how long before
+# never-checked/failed state is loud rather than quiet.
+DEPLOYMENT_CHECK_INTERVAL_SECONDS = 6 * 3600
+DEPLOYMENT_STALE_CHECK_SECONDS = 26 * 3600
+
 
 def _get_current_version() -> str:
-    """Read current version from VERSION file or return 0.0.0."""
+    """The version of the code that is actually running.
+
+    Previously this read ``/app/VERSION`` — a file the image does not contain —
+    and fell back to ``0.0.0``. That fallback is why a container built on
+    2026-07-21 reported ``current_version 0.0.0`` and
+    ``update_available false`` for weeks: 0.0.0 is not a version anyone
+    notices, and the comparison never ran. The version now ships inside the
+    code, so it cannot go missing from the image.
+    """
     if os.path.exists(CURRENT_VERSION_FILE):
-        return Path(CURRENT_VERSION_FILE).read_text().strip()
-    return "0.0.0"
+        try:
+            text = Path(CURRENT_VERSION_FILE).read_text().strip()
+            if text:
+                return text
+        except OSError:  # pragma: no cover - unreadable file
+            pass
+    from app.version import __version__
+
+    return __version__
 
 
 def _parse_semver(version: str) -> Tuple[int, int, int]:
@@ -46,6 +67,143 @@ def _parse_semver(version: str) -> Tuple[int, int, int]:
 def _is_newer(remote: str, local: str) -> bool:
     """Return True if remote version is newer than local."""
     return _parse_semver(remote) > _parse_semver(local)
+
+
+class _DeploymentStatus:
+    """Cached answer to "is the running container the current build?".
+
+    Deliberately three-valued. ``state`` is ``ok`` (checked, comparison
+    valid), ``error`` (the check failed) or ``unknown`` (never checked / the
+    last success has gone stale). ``stale`` is only ever True on a real
+    comparison — a failed check reports ``unknown``, never "up to date".
+    """
+
+    def __init__(self) -> None:
+        self.state: str = "unknown"
+        self.latest_version: Optional[str] = None
+        self.error: Optional[str] = None
+        self.checked_at: Optional[str] = None
+        self.checked_monotonic: float = 0.0
+
+    def record_success(self, latest: Optional[str]) -> None:
+        self.state = "ok"
+        self.latest_version = latest
+        self.error = None
+        self.checked_at = datetime.now(timezone.utc).isoformat()
+        self.checked_monotonic = time.monotonic()
+
+    def record_error(self, error: str) -> None:
+        self.state = "error"
+        self.error = error
+        self.checked_at = datetime.now(timezone.utc).isoformat()
+        self.checked_monotonic = time.monotonic()
+
+    def as_dict(self) -> Dict[str, Any]:
+        current = _get_current_version()
+        state = self.state
+        if state == "ok" and self.checked_monotonic and (
+            time.monotonic() - self.checked_monotonic > DEPLOYMENT_STALE_CHECK_SECONDS
+        ):
+            state = "unknown"
+
+        stale: Optional[bool] = None
+        behind_by: Optional[str] = None
+        comparison: Optional[str] = None
+        if state == "ok":
+            if self.latest_version:
+                stale = _is_newer(self.latest_version, current)
+                if stale:
+                    behind_by = f"{current} -> {self.latest_version}"
+                comparison = "compared against the latest GitHub release"
+            else:
+                # A repo with no published releases is a KNOWN answer with
+                # nothing to compare against — not an unknown one.
+                stale = False
+                comparison = "no releases published; nothing to compare against"
+
+        from app.version import build_info
+
+        return {
+            "current_version": current,
+            "latest_version": self.latest_version if state == "ok" else None,
+            "state": state,
+            "stale": stale,
+            "behind_by": behind_by,
+            "comparison": comparison,
+            "error": self.error if state == "error" else None,
+            "checked_at": self.checked_at,
+            "build": build_info(),
+            # Healthy means: we KNOW the running build is current. Unknown is
+            # not healthy — that assumption is what let a July image run into
+            # the middle of August unnoticed.
+            "healthy": state == "ok" and stale is False,
+        }
+
+
+deployment_status = _DeploymentStatus()
+
+
+async def refresh_deployment_status() -> Dict[str, Any]:
+    """Ask GitHub for the newest release and update the cached comparison."""
+    repo = settings.GITHUB_REPO
+    url = f"{GITHUB_API_BASE}/repos/{repo}/releases/latest"
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    token = settings.GITHUB_TOKEN
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code == 404:
+            if token:
+                # Authenticated and still 404: the repo genuinely has no
+                # releases. A known answer.
+                deployment_status.record_success(None)
+            else:
+                # Unauthenticated 404 is ambiguous — "no releases" and
+                # "private repo" look identical from here. Saying "up to
+                # date" on that evidence is exactly the false green this
+                # change exists to remove.
+                deployment_status.record_error(
+                    "releases API returned 404 unauthenticated — cannot tell "
+                    "'no releases' from 'private repo'; set GITHUB_TOKEN"
+                )
+        else:
+            resp.raise_for_status()
+            deployment_status.record_success(resp.json().get("tag_name"))
+    except Exception as exc:
+        logger.warning("Deployment version check failed: %s", exc)
+        deployment_status.record_error(str(exc))
+
+    snapshot = deployment_status.as_dict()
+    if snapshot["stale"]:
+        logger.warning(
+            "STALE DEPLOYMENT: running %s, latest release %s",
+            snapshot["current_version"], snapshot["latest_version"],
+        )
+        try:
+            from app.services import activity_log
+
+            await activity_log.warn(
+                "deployment_stale",
+                f"Running version {snapshot['current_version']} but "
+                f"{snapshot['latest_version']} has been released "
+                f"(built {snapshot['build'].get('built_at') or 'unknown'}).",
+                context={k: v for k, v in snapshot.items() if k != "build"},
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return snapshot
+
+
+async def deployment_watch_loop() -> None:
+    """Background loop keeping the deployment freshness answer current."""
+    while True:
+        try:
+            await refresh_deployment_status()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Deployment watch iteration failed")
+        await asyncio.sleep(DEPLOYMENT_CHECK_INTERVAL_SECONDS)
 
 
 class UpgradeService:
