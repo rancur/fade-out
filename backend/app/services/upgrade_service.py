@@ -143,6 +143,44 @@ class _DeploymentStatus:
 deployment_status = _DeploymentStatus()
 
 
+def _scrub(text: str) -> str:
+    """Never let a credential reach a log line, an error field, or the API.
+
+    Error strings are rendered into ``/api/health`` and into the activity log,
+    both of which are read by humans and shipped around. httpx does not put
+    request headers in its messages today, but "today" is not a guarantee worth
+    betting a token on.
+    """
+    token = settings.GITHUB_TOKEN
+    if token and token in text:
+        text = text.replace(token, "***")
+    return text
+
+
+async def _token_can_see_repo(client: httpx.AsyncClient, repo: str,
+                              headers: Dict[str, str]) -> Tuple[bool, str]:
+    """Does the configured credential actually have this repo in view?
+
+    ``GET /repos/{owner}/{repo}`` answers 404 — not 403 — for a private repo the
+    caller cannot read, which is the whole reason this probe exists.
+    """
+    resp = await client.get(f"{GITHUB_API_BASE}/repos/{repo}", headers=headers)
+    if resp.status_code == 200:
+        return True, ""
+    if resp.status_code == 404:
+        return False, (
+            f"GITHUB_TOKEN authenticates but cannot see {repo} — a token "
+            "without access to this private repo is indistinguishable from a "
+            "repo with no releases; grant it read access to the repository"
+        )
+    if resp.status_code in (401, 403):
+        return False, (
+            f"GITHUB_TOKEN rejected on {repo} (HTTP {resp.status_code}) — "
+            "expired, revoked, or missing SSO authorization"
+        )
+    return False, f"repo lookup for {repo} returned HTTP {resp.status_code}"
+
+
 async def refresh_deployment_status() -> Dict[str, Any]:
     """Ask GitHub for the newest release and update the cached comparison."""
     repo = settings.GITHUB_REPO
@@ -154,26 +192,44 @@ async def refresh_deployment_status() -> Dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(url, headers=headers)
-        if resp.status_code == 404:
-            if token:
-                # Authenticated and still 404: the repo genuinely has no
-                # releases. A known answer.
-                deployment_status.record_success(None)
-            else:
-                # Unauthenticated 404 is ambiguous — "no releases" and
-                # "private repo" look identical from here. Saying "up to
-                # date" on that evidence is exactly the false green this
-                # change exists to remove.
+            if resp.status_code == 404:
+                if not token:
+                    # Unauthenticated 404 is ambiguous — "no releases" and
+                    # "private repo" look identical from here. Saying "up to
+                    # date" on that evidence is exactly the false green this
+                    # check exists to remove.
+                    deployment_status.record_error(
+                        "releases API returned 404 unauthenticated — cannot "
+                        "tell 'no releases' from 'private repo'; set "
+                        "GITHUB_TOKEN"
+                    )
+                else:
+                    # Authenticated 404 is STILL ambiguous. GitHub hides
+                    # private repos a credential cannot read behind 404 rather
+                    # than 403, so "no releases published" and "this token has
+                    # no access to this repo" arrive as the same response. The
+                    # first reading marks the deployment healthy; the second is
+                    # a check that has silently stopped checking. Only a repo
+                    # the token can demonstrably see turns 404 into an answer.
+                    visible, why = await _token_can_see_repo(
+                        client, repo, headers
+                    )
+                    if visible:
+                        deployment_status.record_success(None)
+                    else:
+                        deployment_status.record_error(why)
+            elif resp.status_code in (401, 403):
                 deployment_status.record_error(
-                    "releases API returned 404 unauthenticated — cannot tell "
-                    "'no releases' from 'private repo'; set GITHUB_TOKEN"
+                    f"releases API returned HTTP {resp.status_code} — "
+                    "GITHUB_TOKEN is missing, expired, rejected, or rate "
+                    "limited; the running build cannot be compared"
                 )
-        else:
-            resp.raise_for_status()
-            deployment_status.record_success(resp.json().get("tag_name"))
+            else:
+                resp.raise_for_status()
+                deployment_status.record_success(resp.json().get("tag_name"))
     except Exception as exc:
-        logger.warning("Deployment version check failed: %s", exc)
-        deployment_status.record_error(str(exc))
+        logger.warning("Deployment version check failed: %s", _scrub(str(exc)))
+        deployment_status.record_error(_scrub(str(exc)))
 
     snapshot = deployment_status.as_dict()
     if snapshot["stale"]:
@@ -260,10 +316,16 @@ class UpgradeService:
         Returns release info dict if update available, None otherwise.
         """
         url = f"{GITHUB_API_BASE}/repos/{self._repo}/releases/latest"
+        # Same credential as the freshness check. Without it a private repo
+        # answers 404 to every query, this returns None forever, and the
+        # auto-upgrade loop quietly never upgrades anything.
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        if settings.GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {settings.GITHUB_TOKEN}"
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url, headers={"Accept": "application/vnd.github.v3+json"})
+            resp = await client.get(url, headers=headers)
             if resp.status_code == 404:
-                logger.debug("No releases found for %s", self._repo)
+                logger.debug("No releases visible for %s", self._repo)
                 return None
             resp.raise_for_status()
             release = resp.json()

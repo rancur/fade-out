@@ -115,7 +115,31 @@ The web dashboard will be available at `http://<nas-ip>:8500`.
 | `YOUTUBE_CLIENT_SECRET` | Yes | YouTube Data API OAuth2 client secret |
 | `YOUTUBE_REFRESH_TOKEN` | Yes | YouTube Data API OAuth2 refresh token |
 | `NOTIFICATION_DISCORD_WEBHOOK_URL` | No | Discord webhook for upload notifications |
+| `GITHUB_TOKEN` | Only for a private repo | Read-only credential for the deployment freshness check (see below) |
 | `TZ` | No | Timezone (default: `America/Phoenix`) |
+
+### Deployment freshness
+
+`GET /api/health` and `GET /api/upgrade/status` compare the running build
+against the newest GitHub release of `GITHUB_REPO`.
+
+If that repo is **private**, the comparison needs `GITHUB_TOKEN`. GitHub
+answers `404` — not `403` — for a private repo the caller cannot read, so
+without a credential "no releases published" and "you cannot see this repo"
+are literally the same response. The check refuses to guess between them:
+it reports `state: error`, `stale: null`, `healthy: false`, and names the
+missing credential. It never degrades to "up to date".
+
+Give it the least privilege that works: a **fine-grained** personal access
+token scoped to this one repository, with *Repository permissions → Contents:
+Read-only*. Release and tag metadata is all this ever reads. A token with write
+scopes would hand a monitoring loop the ability to modify the repo it is
+watching, and a classic PAT cannot be scoped to a single repository at all.
+
+A credential that authenticates but has no access to the repo is reported as
+an error, not as a clean bill of health — the check verifies the repository is
+visible before it accepts a 404 as "no releases". Inject the value from your
+secret manager at deploy time; never commit it or bake it into the image.
 
 ### Watch Directories
 
