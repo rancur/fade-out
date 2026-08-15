@@ -8,7 +8,7 @@ import { useRetryStep, useRereadTracklist, type PipelineStep } from '@/api/hooks
 import { isNotConfigured } from './PipelineProgress'
 import StatusBadge from './StatusBadge'
 
-const RETRYABLE = new Set(['failed', 'interrupted', 'completed', 'skipped'])
+const RETRYABLE = new Set(['failed', 'interrupted', 'completed', 'skipped', 'blocked'])
 const REREAD_STEPS = ['analyze', 'generate_description']
 
 function fmtDuration(started: string | null, completed: string | null): string | null {

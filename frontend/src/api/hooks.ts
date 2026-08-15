@@ -51,6 +51,8 @@ export type PipelineStepStatus =
   | 'skipped'
   | 'waiting'
   | 'interrupted'
+  // Never attempted because an earlier step in the SAME platform leg failed.
+  | 'blocked'
 
 export interface PipelineStep {
   id: number

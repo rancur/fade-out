@@ -5,14 +5,30 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 from app.config import settings
+from app.services.platform_errors import PlatformAuthError
 
 logger = logging.getLogger(__name__)
+
+
+class YouTubeAuthError(PlatformAuthError):
+    """The YouTube OAuth grant was refused — re-authorization required."""
+
+    platform = "youtube"
+
+    def __init__(self, reason: str, credential: str = "YOUTUBE_REFRESH_TOKEN") -> None:
+        super().__init__(
+            f"YouTube authorization failed and needs re-authorization: {reason}",
+            platform="youtube",
+            credential=credential,
+            attempts=[reason],
+        )
 
 # Arizona/Phoenix is UTC-7 year-round (no DST)
 PHOENIX_UTC_OFFSET = timedelta(hours=-7)
@@ -80,7 +96,10 @@ class YouTubeUploader:
         client_secret = sj.get("youtube_client_secret") or settings.YOUTUBE_CLIENT_SECRET
 
         if not refresh_token:
-            raise RuntimeError("YOUTUBE_REFRESH_TOKEN not configured")
+            raise YouTubeAuthError(
+                "no refresh token configured",
+                credential="YOUTUBE_REFRESH_TOKEN (not configured)",
+            )
 
         self._credentials = Credentials(
             token=None,
@@ -90,7 +109,14 @@ class YouTubeUploader:
             client_secret=client_secret,
             scopes=SCOPES,
         )
-        self._credentials.refresh(Request())
+        try:
+            self._credentials.refresh(Request())
+        except RefreshError as exc:
+            # A revoked/expired grant is an operator action, not a transient
+            # fault: surface it as an auth failure naming the credential so
+            # the alert does not read as a generic upload error.
+            self._credentials = None
+            raise YouTubeAuthError(f"refresh grant rejected: {exc}") from exc
         return self._credentials
 
     def _get_service(self):

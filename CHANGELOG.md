@@ -1,5 +1,66 @@
 # Changelog
 
+## v2.4.0 — 2026-08-14
+
+Fixes the structural defects behind the 2026-08-12 publish failure, where one
+mix reached no platform at all and nothing said so for two days.
+
+### Platform legs are independent
+- The orchestrator no longer walks one flat step list and stops at the first
+  failure. Prep (detect → analyze → description → art) is still shared and
+  sequential, but each publish target is its own leg: **one platform's failure
+  can no longer prevent another platform from being attempted.** On 08-12 a dead
+  SoundCloud grant left `upload_youtube` at "pending" while YouTube was healthy
+  the whole time.
+- A partial publish is a first-class state. A mix that reached some targets and
+  not others is `partial`, with `pipeline_error` naming which is which and
+  `metadata_json.publish` recording every leg's outcome.
+- Steps behind a failed step in the SAME leg are recorded `blocked` with a
+  reason, never left at "pending" — that resting state is what hid the stranded
+  YouTube step.
+- `POST /api/mixes/{id}/retry-platform/{platform}` re-runs ONE leg and
+  re-finalizes the mix; `GET /api/mixes/{id}/publish-state` reports per-leg
+  status. Recovering a half-published mix no longer needs a human driving the
+  pipeline by hand.
+- Finalization fails closed: only `published` and `skipped` (nothing
+  configured) count as done. Pending/blocked/unknown legs cannot produce a
+  "completed" mix.
+
+### Failures name their real cause
+- New failure classifier attributes each failure to a kind (`auth`, `quota`,
+  `network`, `missing_file`, `video_not_ready`, `unknown`), a platform, and the
+  **name** of the credential at fault — never its value. It walks the
+  `__cause__` chain, so a chained auth failure beats the browser fallback's
+  selector timeout that used to be reported instead.
+- Auth failures are non-retryable and no longer burn the retry budget.
+- The failure email and Discord embed lead with the cause, platform, credential
+  and whether a retry can help. The subject line states the kind of failure.
+- `YouTubeAuthError` joins `SoundCloudAuthError` under a shared
+  `PlatformAuthError`, so a rejected Google refresh grant is reported as an auth
+  failure too.
+
+### Two false greens killed
+- `GET /api/health` now asserts real function: it exercises the same auth path
+  an upload uses for every configured platform, and returns **503** when a
+  credential is dead, unknown, or stale. It previously returned `{"status":
+  "ok"}` unconditionally — including throughout the 08-12 outage. Container
+  liveness moved to the new `GET /api/health/live`, so a credential outage pages
+  rather than cycling the process.
+- Version detection no longer reads a VERSION file the image never contained.
+  The version lives in `app/version.py`, the image bakes `BUILD_COMMIT` /
+  `BUILD_TIME`, and `/api/upgrade/status` reports a tri-state check
+  (`ok` / `error` / `unknown`) instead of a comfortable `update_available:
+  false`. A deployment behind the latest release is reported as stale by
+  `/api/health` and written to the activity log.
+
+### Unpublished-mix watchdog
+- A new watchdog sweeps every 30 minutes for mixes ingested but not published
+  inside their window (default 6h; 72h for drafts awaiting review, both
+  configurable in Settings → Pipeline). It alerts once per mix per 24h,
+  deduplicated against the activity log so a restart cannot cause a storm.
+- `GET /api/system/unpublished` exposes the result, and reports `unknown` when
+  the sweep has never run rather than an empty all-clear.
+
 ## v2.3.0 — 2026-08-08
 
 ### Source file renaming

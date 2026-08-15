@@ -18,6 +18,10 @@ from app.config import settings
 from app.database import async_session_factory
 from app.services import app_config
 from app.services import ingest as ingest_module
+from app.services.platform_health import get_platform_health
+from app.services.stuck_mix_watchdog import get_stuck_mix_watchdog
+from app.services.upgrade_service import deployment_status
+from app.version import __version__, build_info
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +59,25 @@ async def system_health() -> Dict[str, Any]:
     free_gb = output_disk.get("free_gb")
     disk_ok = free_gb is None or free_gb >= settings.MIN_FREE_DISK_GB
 
-    ok = db_ok and disk_ok
+    # Credential + deployment truth, same source as /api/health.
+    platforms = get_platform_health().snapshot()
+    deployment = deployment_status.as_dict()
+    stuck = get_stuck_mix_watchdog().last_result
+
+    platforms_ok = all(p["healthy"] for p in platforms.values())
+    ok = db_ok and disk_ok and platforms_ok and deployment["healthy"]
 
     return {
         "status": "ok" if ok else "degraded",
-        "version": "0.1.0",
+        "version": __version__,
+        "build": build_info(),
+        "platforms": platforms,
+        "deployment": deployment,
+        "unpublished_mixes": {
+            "state": stuck.get("state", "unknown"),
+            "count": stuck.get("stuck_count"),
+            "checked_at": stuck.get("checked_at"),
+        },
         "db_ok": db_ok,
         "watcher_running": coordinator is not None,
         "pending_pairs": pending,
@@ -74,3 +92,17 @@ async def system_health() -> Dict[str, Any]:
             "premiere_mode": await app_config.resolve("premiere_mode"),
         },
     }
+
+
+@router.get("/unpublished")
+async def unpublished_mixes(refresh: bool = False) -> Dict[str, Any]:
+    """Mixes ingested but not published inside their window.
+
+    ``refresh=true`` runs the sweep now instead of returning the watchdog's
+    last result. The result always carries its own ``state`` — a check that
+    has never run reports ``unknown``, never an empty "all clear".
+    """
+    watchdog = get_stuck_mix_watchdog()
+    if refresh:
+        return await watchdog.check(alert=False)
+    return watchdog.last_result
