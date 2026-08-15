@@ -914,7 +914,8 @@ class PipelineOrchestrator:
         attempt now wins in place.
         """
         completed_at = datetime.now(timezone.utc) if status in (
-            StepStatus.COMPLETED, StepStatus.FAILED, StepStatus.SKIPPED
+            StepStatus.COMPLETED, StepStatus.FAILED, StepStatus.SKIPPED,
+            StepStatus.BLOCKED,
         ) else None
 
         async with async_session_factory() as session:
