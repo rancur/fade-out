@@ -34,6 +34,23 @@ API_MAX_UPLOAD_BYTES = 450 * 1024 * 1024
 TRANSCODE_BITRATE = "320k"
 
 
+class SoundCloudAuthError(RuntimeError):
+    """Every SoundCloud credential path was rejected.
+
+    Carries the per-grant rejections so the surfaced error names the real
+    problem (e.g. ``invalid_grant`` on the refresh token) instead of whatever
+    the browser fallback happens to trip over next. Re-authorization is an
+    operator action — no retry will clear it.
+    """
+
+    def __init__(self, attempts: Optional[List[str]] = None):
+        self.attempts = attempts or []
+        detail = "; ".join(self.attempts) if self.attempts else "no credentials configured"
+        super().__init__(
+            f"SoundCloud authorization failed and needs re-authorization: {detail}"
+        )
+
+
 def format_bytes(n: float) -> str:
     """Human-readable byte count, e.g. 1.2 GB / 340 MB / 12 KB."""
     for unit, div in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
@@ -126,6 +143,9 @@ class SoundCloudUploader:
         self._password = settings.SOUNDCLOUD_PASSWORD
         self._playwright = None
         self._browser = None
+        # Per-grant rejection reasons, collected so a failed upload reports why
+        # auth was refused rather than only that it was.
+        self._auth_failures: List[str] = []
 
     async def _activity(self, level: str, event: str, message: str, **kwargs) -> None:
         """Best-effort activity-log emit — never breaks an upload."""
@@ -143,28 +163,41 @@ class SoundCloudUploader:
     # ------------------------------------------------------------------
 
     async def _ensure_access_token(self) -> str:
-        """Get a valid access token, refreshing or obtaining one if needed."""
+        """Get a valid access token, refreshing or obtaining one if needed.
+
+        Raises ``SoundCloudAuthError`` carrying every grant's rejection reason
+        when no path yields a token.
+        """
+        self._auth_failures = []
+
         if self._access_token:
             # Test if token is still valid
             if await self._test_token(self._access_token):
                 return self._access_token
+            self._auth_failures.append("stored access token rejected by /me")
 
         # Try refreshing with refresh_token
         if self._refresh_token:
             token = await self._refresh_access_token()
             if token:
                 return token
+        else:
+            self._auth_failures.append("no refresh token configured")
 
         # Try client credentials + user password grant
         if self._email and self._password and self._client_id and self._client_secret:
             token = await self._password_grant()
             if token:
                 return token
+        else:
+            self._auth_failures.append("password grant not configured")
 
-        raise RuntimeError(
-            "No valid SoundCloud access token. Set SOUNDCLOUD_ACCESS_TOKEN "
-            "or provide CLIENT_ID + CLIENT_SECRET + EMAIL + PASSWORD for OAuth."
+        await self._activity(
+            "error", "sc_reauth_required",
+            "SoundCloud re-authorization required — every credential path was "
+            f"rejected: {'; '.join(self._auth_failures)}",
         )
+        raise SoundCloudAuthError(self._auth_failures)
 
     async def _test_token(self, token: str) -> bool:
         """Test if an access token is valid."""
@@ -195,11 +228,29 @@ class SoundCloudUploader:
                 await self._persist_tokens()
                 return self._access_token
             logger.warning("Token refresh failed: %s", resp.text)
+            self._auth_failures.append(
+                f"refresh_token grant rejected ({resp.status_code}: "
+                f"{self._grant_error(resp)})"
+            )
             await self._activity(
                 "warn", "sc_token_refresh_failed",
                 f"SoundCloud token refresh failed ({resp.status_code})",
             )
             return None
+
+    @staticmethod
+    def _grant_error(resp: Any) -> str:
+        """Pull the OAuth error code out of a rejected grant response."""
+        try:
+            body = resp.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            for key in ("error_code", "error", "message"):
+                value = body.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return (getattr(resp, "text", "") or "no detail")[:200]
 
     async def _persist_tokens(self) -> None:
         """Persist rotated tokens via the callback (best-effort)."""
@@ -243,6 +294,10 @@ class SoundCloudUploader:
                 await self._persist_tokens()
                 return self._access_token
             logger.warning("Password grant failed: %s", resp.text)
+            self._auth_failures.append(
+                f"password grant rejected ({resp.status_code}: "
+                f"{self._grant_error(resp)})"
+            )
             return None
 
     # ------------------------------------------------------------------
@@ -269,6 +324,7 @@ class SoundCloudUploader:
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
         # Try API upload first
+        api_error: Optional[Exception] = None
         if self._client_id and self._client_secret:
             try:
                 return await self._api_upload(
@@ -276,12 +332,26 @@ class SoundCloudUploader:
                     progress_cb=progress_cb,
                 )
             except Exception as exc:
-                logger.warning("API upload failed, falling back to browser: %s", exc)
+                api_error = exc
+                logger.warning(
+                    "API upload failed, falling back to browser: %s", exc, exc_info=True
+                )
 
-        # Fall back to Playwright browser automation
-        return await self._browser_upload(
-            audio_path, title, description, genre, tags, cover_art_path,
-        )
+        # Fall back to Playwright browser automation. If it also fails, report
+        # BOTH causes — the browser fallback's own error (a selector timeout on
+        # a login page, say) is a symptom, and on its own it sends whoever reads
+        # the failure chasing the wrong problem.
+        try:
+            return await self._browser_upload(
+                audio_path, title, description, genre, tags, cover_art_path,
+            )
+        except Exception as browser_error:
+            if api_error is None:
+                raise
+            raise RuntimeError(
+                f"SoundCloud upload failed. API path: {api_error}. "
+                f"Browser fallback: {browser_error}"
+            ) from api_error
 
     async def _api_upload(
         self,

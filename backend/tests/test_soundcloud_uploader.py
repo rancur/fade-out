@@ -337,3 +337,99 @@ class TestProgressHelpers:
         with open(f, "rb") as fh:
             reader = sc_mod.CountingReader(fh, 10, boom)
             assert reader.read(10) == b"a" * 10
+
+
+class TestAuthFailureSurfacing:
+    """A dead refresh token must be reported as a dead refresh token.
+
+    Regression cover for a live incident: SoundCloud rejected the rotated
+    refresh token with ``invalid_grant``, the uploader silently fell through to
+    the Playwright fallback, and the only error that reached the database and
+    the failure notification was ``Page.wait_for_selector: Timeout 10000ms
+    exceeded`` — pointing at the browser automation instead of at the
+    credentials that actually needed re-authorization.
+    """
+
+    async def test_ensure_token_raises_auth_error_naming_invalid_grant(self):
+        # /me rejects the stored access token, and the refresh grant 401s.
+        FakeAsyncClient.get_response = FakeResp(401)
+        FakeAsyncClient.post_response = FakeResp(
+            401, json_data={"error_code": "invalid_grant"}, text="invalid_grant"
+        )
+
+        up = _uploader()
+        up._access_token = "stale-access"
+
+        with pytest.raises(sc_mod.SoundCloudAuthError) as exc_info:
+            await up._ensure_access_token()
+
+        message = str(exc_info.value)
+        assert "invalid_grant" in message
+        assert "re-authorization" in message.lower()
+        # The individual rejections are retained for the operator.
+        assert any("refresh_token grant rejected" in a for a in exc_info.value.attempts)
+
+    async def test_password_grant_rejection_is_recorded(self):
+        FakeAsyncClient.get_response = FakeResp(401)
+        FakeAsyncClient.post_response = FakeResp(
+            400, json_data={"error_code": "unsupported_grant_type"}
+        )
+
+        up = _uploader()
+        up._access_token = "stale-access"
+        up._email = "dj@example.com"
+        up._password = "hunter2"
+
+        with pytest.raises(sc_mod.SoundCloudAuthError) as exc_info:
+            await up._ensure_access_token()
+
+        assert "unsupported_grant_type" in str(exc_info.value)
+        assert any("password grant rejected" in a for a in exc_info.value.attempts)
+
+    async def test_browser_fallback_failure_still_reports_the_auth_cause(
+        self, tmp_path, monkeypatch
+    ):
+        f = tmp_path / "mix.flac"
+        f.write_bytes(b"x")
+
+        async def dead_auth(*args, **kwargs):
+            raise sc_mod.SoundCloudAuthError(
+                ["refresh_token grant rejected (401: invalid_grant)"]
+            )
+
+        async def browser_times_out(*args, **kwargs):
+            raise RuntimeError("Page.wait_for_selector: Timeout 10000ms exceeded.")
+
+        monkeypatch.setattr(sc_mod.SoundCloudUploader, "_api_upload", dead_auth)
+        monkeypatch.setattr(sc_mod.SoundCloudUploader, "_browser_upload", browser_times_out)
+
+        up = _uploader()
+        with pytest.raises(RuntimeError) as exc_info:
+            await up.upload(str(f), "Mix", "desc", "Drum & Bass", ["dnb"], None)
+
+        message = str(exc_info.value)
+        # The actionable cause survives...
+        assert "invalid_grant" in message
+        # ...alongside the fallback's own symptom, not replaced by it.
+        assert "Timeout 10000ms" in message
+        # And the auth error is the chained root cause.
+        assert isinstance(exc_info.value.__cause__, sc_mod.SoundCloudAuthError)
+
+    async def test_browser_only_failure_is_left_untouched(self, tmp_path, monkeypatch):
+        """With no API credentials there is no auth cause to chain."""
+        f = tmp_path / "mix.flac"
+        f.write_bytes(b"x")
+
+        async def browser_boom(*args, **kwargs):
+            raise RuntimeError("browser exploded")
+
+        monkeypatch.setattr(sc_mod.SoundCloudUploader, "_browser_upload", browser_boom)
+
+        up = _uploader()
+        up._client_id = None
+        up._client_secret = None
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await up.upload(str(f), "Mix", "desc", "House", ["house"], None)
+
+        assert str(exc_info.value) == "browser exploded"
