@@ -543,7 +543,19 @@ class PipelineOrchestrator:
         # not un-publish anything.
         if any(o.get("status") == "published" for o in outcomes.values()):
             for step_name in POST_PUBLISH_STEPS:
-                await self._execute_step(mix_id, step_name)
+                result = await self._execute_step(mix_id, step_name)
+                if not result.ok:
+                    # Cross-linking is cosmetic relative to publishing: it must
+                    # not un-publish a mix, but it must not vanish either.
+                    logger.warning(
+                        "Post-publish step %s failed for mix %s: %s",
+                        step_name, mix_id, result.error,
+                    )
+        else:
+            for step_name in POST_PUBLISH_STEPS:
+                await self._mark_pending_blocked(
+                    mix_id, step_name, "not attempted — nothing published",
+                )
 
         await self._finalize(mix_id)
         return outcomes
@@ -1207,8 +1219,12 @@ class PipelineOrchestrator:
             if mix:
                 mix.pipeline_status = "completed"
                 mix.pipeline_step = "complete"
+                mix.pipeline_error = None
                 mix.pipeline_completed_at = datetime.now(timezone.utc)
                 await session.commit()
+        # Close out the pre-created "complete" row too, so a finished mix has
+        # no step left sitting at "pending".
+        await self._record_step(mix_id, "complete", StepStatus.COMPLETED)
         await self._emit("upload_complete", mix_id)
         logger.info("Pipeline fully completed for mix %s", mix_id)
 
