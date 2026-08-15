@@ -147,15 +147,27 @@ async def refresh_deployment_status() -> Dict[str, Any]:
     """Ask GitHub for the newest release and update the cached comparison."""
     repo = settings.GITHUB_REPO
     url = f"{GITHUB_API_BASE}/repos/{repo}/releases/latest"
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    token = settings.GITHUB_TOKEN
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                url, headers={"Accept": "application/vnd.github.v3+json"}
-            )
+            resp = await client.get(url, headers=headers)
         if resp.status_code == 404:
-            # No releases published: nothing to compare against, and that is
-            # a KNOWN answer, not a failure.
-            deployment_status.record_success(None)
+            if token:
+                # Authenticated and still 404: the repo genuinely has no
+                # releases. A known answer.
+                deployment_status.record_success(None)
+            else:
+                # Unauthenticated 404 is ambiguous — "no releases" and
+                # "private repo" look identical from here. Saying "up to
+                # date" on that evidence is exactly the false green this
+                # change exists to remove.
+                deployment_status.record_error(
+                    "releases API returned 404 unauthenticated — cannot tell "
+                    "'no releases' from 'private repo'; set GITHUB_TOKEN"
+                )
         else:
             resp.raise_for_status()
             deployment_status.record_success(resp.json().get("tag_name"))

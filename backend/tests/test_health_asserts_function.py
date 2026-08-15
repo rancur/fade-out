@@ -158,6 +158,26 @@ class TestHealthEndpoint:
         assert live.status_code == 200
         assert live.json()["status"] == "alive"
 
+    async def test_unknown_deployment_is_a_warning_not_an_outage(self, client):
+        from app.services import upgrade_service
+        from app.services.platform_health import get_platform_health
+
+        svc = get_platform_health()
+        svc._states = {
+            p: _state(p, OK, detail="ok") for p in ("soundcloud", "youtube", "mixcloud")
+        }
+        upgrade_service.deployment_status.record_error(
+            "releases API returned 404 unauthenticated"
+        )
+        resp = await client.get("/api/health")
+        assert resp.status_code == 200
+        body = resp.json()
+        # Reported honestly as unverified — never rewritten as "up to date".
+        assert body["deployment"]["state"] == "error"
+        assert body["deployment"]["stale"] is None
+        assert body["deployment"]["latest_version"] is None
+        assert body["warnings"]
+
     async def test_health_200s_when_everything_asserts(self, client):
         from app.services.platform_health import get_platform_health
         from app.services.upgrade_service import deployment_status

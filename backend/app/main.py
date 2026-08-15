@@ -245,23 +245,35 @@ async def health_check():
         db_ok = False
         db_detail = str(exc)
 
-    problems = []
+    # problems  -> the service cannot be trusted to do its job (503)
+    # warnings  -> something is genuinely UNKNOWN and must be visible, but is
+    #              not itself proof the service is broken (200, still stated
+    #              out loud — "unknown" is never rewritten as "fine")
+    problems: list[str] = []
+    warnings: list[str] = []
+
     if not db_ok:
         problems.append(f"database: {db_detail}")
+
     for name, info in platforms.items():
         if not info["healthy"]:
+            # A credential we cannot verify is as unpublishable as one we know
+            # is dead: both mean the next upload is a coin flip.
             problems.append(f"{name} credentials {info['state']}: {info['detail']}")
-    if not deployment["healthy"]:
-        if deployment["stale"]:
-            problems.append(
-                f"deployment stale: running {deployment['current_version']}, "
-                f"latest {deployment['latest_version']}"
-            )
-        else:
-            problems.append(
-                f"deployment freshness {deployment['state']}"
-                + (f": {deployment['error']}" if deployment["error"] else "")
-            )
+
+    if deployment["stale"]:
+        problems.append(
+            f"deployment stale: running {deployment['current_version']}, "
+            f"latest {deployment['latest_version']}"
+        )
+    elif not deployment["healthy"]:
+        # We could not establish whether this build is current. That is a
+        # warning, not a verdict — an unreachable GitHub must not take down
+        # the health of a service that is otherwise fully able to publish.
+        warnings.append(
+            f"deployment freshness {deployment['state']}"
+            + (f": {deployment['error']}" if deployment["error"] else "")
+        )
 
     healthy = not problems
     body = {
@@ -272,6 +284,7 @@ async def health_check():
         "platforms": platforms,
         "deployment": deployment,
         "problems": problems,
+        "warnings": warnings,
     }
     return JSONResponse(status_code=200 if healthy else 503, content=body)
 

@@ -52,6 +52,17 @@ mix reached no platform at all and nothing said so for two days.
   (`ok` / `error` / `unknown`) instead of a comfortable `update_available:
   false`. A deployment behind the latest release is reported as stale by
   `/api/health` and written to the activity log.
+- The release check distinguishes "no releases" from "cannot see the
+  releases": on a PRIVATE repo the unauthenticated API answers 404, which is
+  indistinguishable from an empty release list, so that case is reported as
+  `error` (with the reason) rather than silently "up to date". Set
+  `GITHUB_TOKEN` to make the comparison work on a private repo.
+- `/api/health` separates `problems` (503 — the service cannot be trusted to
+  publish: dead/unverifiable credentials, DB down, a KNOWN-stale build) from
+  `warnings` (200 — something is genuinely unknown and is said out loud, e.g.
+  GitHub was unreachable). An unreachable third party does not take down the
+  health of a service that can still publish, and unknown is never rendered
+  as fine.
 
 ### Unpublished-mix watchdog
 - A new watchdog sweeps every 30 minutes for mixes ingested but not published
