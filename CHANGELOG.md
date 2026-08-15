@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### The deployment freshness check can actually reach a private repo
+- `GITHUB_TOKEN` is now **passed through to the container** in
+  `docker-compose.yml` / `docker-compose.dev.yml` and documented in
+  `.env.example`. The setting has existed since v2.4.0, but nothing ever handed
+  it to the running process, so on a private repo the check had no way to
+  answer anything but "cannot determine".
+- An **authenticated 404 is no longer treated as "no releases published"**.
+  GitHub answers 404 — not 403 — for a private repo the caller cannot read, so
+  "this repo has no releases" and "this credential cannot see this repo" arrive
+  as the same response. The first reading marked the deployment healthy on the
+  strength of a token that was doing nothing. The check now confirms the
+  credential can actually see the repository (`GET /repos/{repo}`) before
+  reading a 404 as an answer, and reports an error naming the reason when it
+  cannot.
+- 401/403 from the releases API is reported as a named error (expired, revoked,
+  missing SSO authorization, or rate limited) instead of a raw exception string.
+- `UpgradeService.check_for_update()` sends the same credential. Without it the
+  auto-upgrade loop saw a permanent 404 on a private repo and silently never
+  had an upgrade to do.
+- Error strings are scrubbed of the token before they reach a log line, the
+  activity log, or `/api/health`.
+
+Unchanged, and deliberately: with no credential the check still reports
+`state: error`, `stale: null`, `healthy: false` and says a token is needed. An
+honest unknown is not replaced with a confident answer.
+
 ## v2.4.0 — 2026-08-14
 
 Fixes the structural defects behind the 2026-08-12 publish failure, where one
