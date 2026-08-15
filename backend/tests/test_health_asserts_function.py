@@ -67,7 +67,9 @@ class TestOverallHealth:
 
 
 class TestProbes:
-    async def test_soundcloud_probe_reports_dead_on_auth_error(self, monkeypatch):
+    async def test_soundcloud_probe_reports_dead_on_auth_error(
+        self, prepared_db, monkeypatch
+    ):
         from app.services import platform_health as ph
         import app.services.soundcloud_uploader as sc_mod
 
@@ -82,7 +84,7 @@ class TestProbes:
         assert "invalid_grant" in state.detail
         assert "SOUNDCLOUD" in state.credential
 
-    async def test_soundcloud_probe_ok_when_token_accepted(self, monkeypatch):
+    async def test_soundcloud_probe_ok_when_token_accepted(self, prepared_db, monkeypatch):
         from app.services import platform_health as ph
         import app.services.soundcloud_uploader as sc_mod
 
@@ -94,7 +96,7 @@ class TestProbes:
         state = await svc._probe_soundcloud({"soundcloud_access_token": "x"})
         assert state.state == OK
 
-    async def test_unconfigured_platform_is_not_a_failure(self, monkeypatch):
+    async def test_unconfigured_platform_is_not_a_failure(self, prepared_db, monkeypatch):
         from app.config import settings
         from app.services import platform_health as ph
 
@@ -107,7 +109,9 @@ class TestProbes:
         state = await svc._probe_soundcloud({})
         assert state.state == NOT_CONFIGURED
 
-    async def test_youtube_probe_reports_dead_on_refresh_error(self, monkeypatch):
+    async def test_youtube_probe_reports_dead_on_refresh_error(
+        self, prepared_db, monkeypatch
+    ):
         from app.config import settings
         from app.services import platform_health as ph
         import app.services.youtube_uploader as yt_mod

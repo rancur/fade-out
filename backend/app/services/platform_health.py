@@ -141,9 +141,13 @@ class PlatformHealth:
                         state=UNKNOWN,
                         detail=f"probe error: {exc}",
                     )
-                state.checked_at = datetime.now(timezone.utc).isoformat()
-                state.checked_monotonic = time.monotonic()
-                self._states[platform] = state
+                # A deferred probe returns the EXISTING state object. Do not
+                # re-stamp it: that would keep a skipped check looking fresh
+                # forever, which is the false green in miniature.
+                if state is not self._states.get(platform):
+                    state.checked_at = datetime.now(timezone.utc).isoformat()
+                    state.checked_monotonic = time.monotonic()
+                    self._states[platform] = state
         return self.snapshot()
 
     def snapshot(self) -> Dict[str, Dict[str, Any]]:
@@ -168,9 +172,41 @@ class PlatformHealth:
         except Exception:  # pragma: no cover - DB down is reported elsewhere
             return {}
 
+    @staticmethod
+    async def _upload_in_flight(platform: str) -> bool:
+        """Is an upload for this platform running right now?
+
+        Probing mid-upload is not worth the risk of a concurrent token
+        rotation, so the probe stands down and the previous result stands (and
+        ages toward ``unknown`` on its own if this persists).
+        """
+        from sqlalchemy import select
+
+        from app.models import PipelineStep
+
+        try:
+            async with async_session_factory() as session:
+                row = (
+                    await session.execute(
+                        select(PipelineStep.id).where(
+                            PipelineStep.step_name == f"upload_{platform}",
+                            PipelineStep.status == "running",
+                        ).limit(1)
+                    )
+                ).first()
+            return row is not None
+        except Exception:  # pragma: no cover - defensive
+            return False
+
     async def _probe_soundcloud(self, sj: Dict[str, Any]) -> CredentialState:
         from app.services.platform_errors import PlatformAuthError
         from app.services.soundcloud_uploader import SoundCloudUploader
+
+        if await self._upload_in_flight("soundcloud"):
+            return self._states.get("soundcloud") or CredentialState(
+                platform="soundcloud", state=UNKNOWN,
+                detail="upload in flight — probe deferred",
+            )
 
         has_any = any((
             sj.get("soundcloud_access_token"), settings.SOUNDCLOUD_ACCESS_TOKEN,
@@ -183,7 +219,19 @@ class PlatformHealth:
                 detail="no SoundCloud credentials configured",
             )
 
-        uploader = SoundCloudUploader(db_settings_json=sj)
+        # The persister is NOT optional here. SoundCloud rotates the refresh
+        # token on every refresh, so a probe that refreshes without persisting
+        # the new pair would invalidate the credential it is checking and
+        # strand the next real upload with invalid_grant. The probe uses the
+        # exact same persistence path an upload does.
+        from app.services.handlers import _sc_token_persister
+
+        async with async_session_factory() as session:
+            app_settings = await session.get(AppSettings, 1)
+        uploader = SoundCloudUploader(
+            db_settings_json=sj,
+            on_tokens_refreshed=_sc_token_persister(app_settings),
+        )
         try:
             await uploader._ensure_access_token()
         except PlatformAuthError as exc:
