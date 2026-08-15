@@ -49,6 +49,11 @@ services:
       - YOUTUBE_REFRESH_TOKEN=${YOUTUBE_REFRESH_TOKEN}
       - PUBLIC_URL=${PUBLIC_URL}
       - NOTIFICATION_DISCORD_WEBHOOK_URL=${NOTIFICATION_DISCORD_WEBHOOK_URL}
+      # Read-only GitHub credential for the deployment freshness check. The
+      # setting existed but was never passed through to the container, so on a
+      # private repo the check could only ever answer "cannot determine".
+      # Optional: unset, the check stays honestly unknown rather than green.
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
     mem_limit: 4g
     logging:
       driver: json-file

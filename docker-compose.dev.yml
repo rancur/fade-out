@@ -35,6 +35,7 @@ services:
       - YOUTUBE_CLIENT_SECRET=${YOUTUBE_CLIENT_SECRET}
       - YOUTUBE_REFRESH_TOKEN=${YOUTUBE_REFRESH_TOKEN}
       - NOTIFICATION_DISCORD_WEBHOOK_URL=${NOTIFICATION_DISCORD_WEBHOOK_URL}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - DEBUG=1
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 
