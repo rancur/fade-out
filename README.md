@@ -209,17 +209,56 @@ The backend exposes a REST API at `/api`:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/health` | GET | Health check |
+| `/api/health` | GET | Functional health — 503 when a credential is dead or the build is stale |
+| `/api/health/live` | GET | Process liveness only (what the container healthcheck uses) |
 | `/api/mixes` | GET | List all mixes |
 | `/api/mixes/{id}` | GET | Get mix details |
 | `/api/mixes/{id}` | PATCH | Update mix metadata |
 | `/api/mixes/{id}/retry` | POST | Retry failed pipeline stages |
+| `/api/mixes/{id}/retry-platform/{platform}` | POST | Re-run ONE platform leg (soundcloud/youtube/mixcloud) |
+| `/api/mixes/{id}/publish-state` | GET | Per-platform publish state for a mix |
 | `/api/mixes/{id}/upload` | POST | Manually trigger upload |
+| `/api/system/unpublished` | GET | Mixes ingested but not published inside their window |
 | `/api/pipeline/status` | GET | Current pipeline status |
 | `/api/brand` | GET | Get brand settings |
 | `/api/brand` | PUT | Update brand settings |
 | `/api/settings` | GET | Get application settings |
 | `/api/settings` | PUT | Update application settings |
+
+### Health, and what "healthy" means here
+
+`/api/health` asserts real function, not process liveness. It exercises the
+same auth path an upload uses for every configured platform and returns **503**
+when a credential is dead, unknown, or its last probe went stale — a publish
+pipeline that cannot authenticate is not healthy, whatever the process is
+doing. It also reports the running build against the latest release, so a
+container that never got redeployed is visible rather than silently old.
+
+Container orchestration should watch `/api/health/live` instead: the
+Dockerfile healthcheck does, so a dead OAuth grant pages a human rather than
+cycling a process that is working fine.
+
+Build identity comes from `app/version.py` plus `BUILD_COMMIT` / `BUILD_TIME`,
+baked in at image build time:
+
+```bash
+BUILD_COMMIT=$(git rev-parse --short HEAD) \
+BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+docker compose build && docker compose up -d
+curl -s localhost:8500/api/health | jq .build   # must match what you built
+```
+
+### When one platform fails
+
+Publish targets are independent legs. If SoundCloud's grant is dead, YouTube
+is still attempted; the mix ends up `partial` with `pipeline_error` naming
+which targets are live, and the failed leg's remaining steps are recorded
+`blocked` rather than left at `pending`. Fix the credential and re-run just
+that leg:
+
+```bash
+curl -X POST localhost:8500/api/mixes/<id>/retry-platform/soundcloud
+```
 
 ## Development
 
