@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
@@ -17,6 +18,7 @@ from app.config import settings
 from app.database import async_session_factory
 from app.models import Mix, PipelineStep
 from app.services import app_config
+from app.services.platform_errors import FailureCause, classify_failure
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,53 @@ PIPELINE_STEPS: List[str] = [
     "cross_link",
     "complete",
 ]
+
+# --- Phase structure -------------------------------------------------------
+#
+# The flat list above is still the canonical ORDER (the UI renders it, and the
+# step-index math depends on it), but it is no longer the unit of execution.
+#
+# Incident 2026-08-12: the orchestrator walked PIPELINE_STEPS strictly in
+# order and returned on the first failure. SoundCloud's OAuth grant was dead,
+# upload_soundcloud failed, and the run stopped — leaving upload_youtube
+# "pending" forever even though YouTube was healthy the entire time. The mix
+# was published nowhere and nothing said so; a human had to notice.
+#
+# So: prep is shared and genuinely sequential (nothing can publish without
+# artwork and a description), but each publish target is an INDEPENDENT leg.
+# One leg's failure blocks only the rest of ITS OWN leg. Legs run one after
+# another rather than concurrently on purpose — a multi-GB upload on home
+# upstream should not compete with another one — but failure never propagates
+# sideways.
+PREP_STEPS: List[str] = [
+    "detect",
+    "analyze",
+    "generate_description",
+    "generate_art",
+]
+
+PLATFORM_LEGS: Dict[str, List[str]] = {
+    "soundcloud": ["upload_soundcloud", "verify_soundcloud"],
+    "youtube": ["upload_youtube", "verify_youtube"],
+    "mixcloud": ["upload_mixcloud", "verify_mixcloud"],
+}
+
+# Steps that need more than one platform to have landed.
+POST_PUBLISH_STEPS: List[str] = ["cross_link"]
+
+PLATFORM_URL_FIELD = {
+    "soundcloud": "soundcloud_url",
+    "youtube": "youtube_url",
+    "mixcloud": "mixcloud_url",
+}
+
+
+def leg_for_step(step_name: str) -> Optional[str]:
+    """The platform leg a step belongs to, or None for shared steps."""
+    for platform, steps in PLATFORM_LEGS.items():
+        if step_name in steps:
+            return platform
+    return None
 
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 5
@@ -54,6 +103,14 @@ class StepStatus(str, Enum):
     WAITING = "waiting"
     PAUSED = "paused"
     INTERRUPTED = "interrupted"  # was "running" when the app restarted
+    # An upstream step in the SAME leg failed, so this one was never attempted.
+    # Distinct from PENDING, which used to be the resting place of every step
+    # a failure had silently stranded.
+    BLOCKED = "blocked"
+
+
+# Mix-level publish outcomes.
+MIX_STATUS_PARTIAL = "partial"
 
 
 # report_progress throttles: WS emit at most once per second per (mix, step);
@@ -63,6 +120,19 @@ PROGRESS_DB_INTERVAL = 5.0
 
 
 StepHandler = Callable[[str, AsyncSession], Coroutine[Any, Any, Optional[dict]]]
+
+
+@dataclass
+class StepResult:
+    """Outcome of one step attempt sequence."""
+
+    ok: bool
+    output: Optional[dict] = None
+    error: Optional[str] = None
+    cause: Optional[FailureCause] = None
+
+    def __bool__(self) -> bool:  # keeps `if await _execute_step(...)` honest
+        return self.ok
 
 
 async def _ffprobe_container_duration(video_path: str) -> Optional[float]:
@@ -208,12 +278,38 @@ class PipelineOrchestrator:
                     "upload_complete", "Pipeline completed — all uploads done", mix_id=mix_id
                 )
             elif event_type == "error":
+                cause = data.get("cause") or {}
                 await activity_log.error(
                     "pipeline_error",
                     f"Pipeline error at step {stage}: {data.get('error', 'failed')}",
                     mix_id=mix_id,
                     stage=stage,
-                    context={"retryable": True, **{k: v for k, v in data.items() if k != "step"}},
+                    platform=cause.get("platform") or data.get("platform"),
+                    context={
+                        "retryable": data.get("retryable", True),
+                        **{k: v for k, v in data.items() if k != "step"},
+                    },
+                )
+            elif event_type == "platform_failed":
+                cause = data.get("cause") or {}
+                await activity_log.error(
+                    "platform_failed",
+                    f"{data.get('platform')} leg failed at {stage or data.get('step')}: "
+                    f"{cause.get('summary') or data.get('error', 'failed')}",
+                    mix_id=mix_id,
+                    stage=data.get("step"),
+                    platform=data.get("platform"),
+                    context={k: v for k, v in data.items() if k != "step"},
+                )
+            elif event_type == "publish_incomplete":
+                await activity_log.warn(
+                    "publish_incomplete",
+                    data.get("error", "publish incomplete"),
+                    mix_id=mix_id,
+                    context={
+                        "published": data.get("published"),
+                        "failed": data.get("failed"),
+                    },
                 )
         except Exception:  # pragma: no cover - defensive
             logger.debug("activity mirror failed for %s", event_type, exc_info=True)
@@ -352,13 +448,12 @@ class PipelineOrchestrator:
                 mix.pipeline_started_at = datetime.now(timezone.utc)
                 await session.commit()
 
-            for step_name in PIPELINE_STEPS:
-                if step_name == "complete":
-                    await self._mark_complete(mix_id)
-                    break
-
-                success = await self._execute_step(mix_id, step_name)
-                if not success:
+            # Phase 1 — shared prep. A prep failure genuinely blocks every
+            # platform, so it still stops the run.
+            for step_name in PREP_STEPS:
+                result = await self._execute_step(mix_id, step_name)
+                if not result.ok:
+                    await self._block_unreached(mix_id, after_prep_failure=step_name)
                     await self._mark_failed(mix_id, step_name)
                     return
 
@@ -369,7 +464,10 @@ class PipelineOrchestrator:
                     await self._emit("draft_ready", mix_id)
                     return
 
-            logger.info("Pipeline completed for mix %s", mix_id)
+            # Phase 2 + 3 — independent publish legs, then finalize.
+            await self._run_publish_phase(mix_id)
+
+            logger.info("Pipeline finished for mix %s", mix_id)
 
     async def resume_pipeline(self, mix_id: str) -> None:
         """Resume a paused (draft) pipeline from where it left off."""
@@ -384,54 +482,197 @@ class PipelineOrchestrator:
             logger.warning("No pipeline step recorded for mix %s", mix_id)
             return
 
-        # Find next step after current
         try:
             idx = PIPELINE_STEPS.index(current_step)
         except ValueError:
             logger.error("Unknown step %s for mix %s", current_step, mix_id)
             return
 
-        remaining_steps = PIPELINE_STEPS[idx + 1:]
-        if not remaining_steps:
-            return
+        remaining_prep = [s for s in PIPELINE_STEPS[idx + 1:] if s in PREP_STEPS]
 
-        task = asyncio.create_task(self._run_remaining(mix_id, remaining_steps))
+        task = asyncio.create_task(self._run_remaining(mix_id, remaining_prep))
         self._running_pipelines[mix_id] = task
         task.add_done_callback(lambda _t: self._running_pipelines.pop(mix_id, None))
 
-    async def _run_remaining(self, mix_id: str, steps: List[str]) -> None:
+    async def _run_remaining(self, mix_id: str, prep_steps: List[str]) -> None:
+        """Finish any leftover prep, then run the publish phase."""
         async with self._semaphore:
             await self._set_mix_status(mix_id, "running")
-            for step_name in steps:
-                if step_name == "complete":
-                    await self._mark_complete(mix_id)
-                    break
-
-                success = await self._execute_step(mix_id, step_name)
-                if not success:
+            for step_name in prep_steps:
+                result = await self._execute_step(mix_id, step_name)
+                if not result.ok:
+                    await self._block_unreached(mix_id, after_prep_failure=step_name)
                     await self._mark_failed(mix_id, step_name)
                     return
+            await self._run_publish_phase(mix_id)
+
+    # ------------------------------------------------------------------
+    # Publish phase — one independent leg per platform
+    # ------------------------------------------------------------------
+
+    async def _run_publish_phase(
+        self, mix_id: str, platforms: Optional[List[str]] = None
+    ) -> Dict[str, dict]:
+        """Run each platform leg independently, then cross-link and finalize.
+
+        ``platforms`` limits the run to specific legs (a targeted retry);
+        by default every leg is attempted. A leg that raises does not stop the
+        next one — that isolation is the whole point of this method.
+        """
+        targets = platforms or list(PLATFORM_LEGS)
+        outcomes: Dict[str, dict] = {}
+
+        for platform in targets:
+            steps = PLATFORM_LEGS.get(platform)
+            if not steps:
+                continue
+            try:
+                outcomes[platform] = await self._run_leg(mix_id, platform, steps)
+            except Exception as exc:  # pragma: no cover - belt and braces
+                # A leg must never be able to take the process (or the other
+                # legs) down with it.
+                logger.exception("Platform leg %s crashed for mix %s", platform, mix_id)
+                outcomes[platform] = {
+                    "status": "failed",
+                    "error": f"leg crashed: {exc}",
+                    "cause": {"kind": "unknown", "summary": str(exc)},
+                }
+
+        # Cross-link only makes sense once more than one platform has landed;
+        # the handler already no-ops otherwise, and a cross-link failure must
+        # not un-publish anything.
+        if any(o.get("status") == "published" for o in outcomes.values()):
+            for step_name in POST_PUBLISH_STEPS:
+                result = await self._execute_step(mix_id, step_name)
+                if not result.ok:
+                    # Cross-linking is cosmetic relative to publishing: it must
+                    # not un-publish a mix, but it must not vanish either.
+                    logger.warning(
+                        "Post-publish step %s failed for mix %s: %s",
+                        step_name, mix_id, result.error,
+                    )
+        else:
+            for step_name in POST_PUBLISH_STEPS:
+                await self._mark_pending_blocked(
+                    mix_id, step_name, "not attempted — nothing published",
+                )
+
+        await self._finalize(mix_id)
+        return outcomes
+
+    async def _run_leg(self, mix_id: str, platform: str, steps: List[str]) -> dict:
+        """Execute one platform's steps. Returns its outcome record.
+
+        Outcome ``status`` is one of:
+          published — the upload landed and verified
+          skipped   — the platform is not configured (nothing was attempted)
+          failed    — an upload/verify step failed; later steps in THIS leg
+                      are recorded BLOCKED so they never sit at "pending"
+        """
+        url: Optional[str] = None
+        skipped_reason: Optional[str] = None
+
+        for idx, step_name in enumerate(steps):
+            result = await self._execute_step(mix_id, step_name)
+
+            if not result.ok:
+                for blocked in steps[idx + 1:]:
+                    await self._record_step(
+                        mix_id, blocked, StepStatus.BLOCKED,
+                        error=f"not attempted — {step_name} failed for {platform}",
+                    )
+                cause = result.cause.to_dict() if result.cause else None
+                await self._emit("platform_failed", mix_id, {
+                    "platform": platform,
+                    "step": step_name,
+                    "error": result.error or "failed",
+                    "cause": cause,
+                })
+                return {
+                    "status": "failed",
+                    "failed_step": step_name,
+                    "error": result.error,
+                    "cause": cause,
+                }
+
+            output = result.output or {}
+            url = url or output.get(PLATFORM_URL_FIELD[platform])
+            if output.get("skipped") and not url:
+                skipped_reason = output.get("reason") or "not configured"
+
+        if skipped_reason and not url:
+            return {"status": "skipped", "reason": skipped_reason}
+        return {"status": "published", "url": url}
+
+    async def retry_platform(self, mix_id: str, platform: str) -> dict:
+        """Re-run ONE platform leg, then re-finalize the mix.
+
+        This is the endpoint that makes a partial publish self-serve: on
+        2026-08-12 the only way to publish the YouTube leg of a mix whose
+        SoundCloud leg had failed was for a human to drive it by hand.
+        """
+        if platform not in PLATFORM_LEGS:
+            raise ValueError(f"Unknown platform: {platform}")
+
+        async with self._semaphore:
+            await self._set_mix_status(mix_id, "running")
+            # Clear the leg's failed/blocked rows so the run is a real attempt.
+            for step_name in PLATFORM_LEGS[platform]:
+                await self._reset_step_if(
+                    mix_id, step_name,
+                    statuses=(
+                        StepStatus.FAILED.value,
+                        StepStatus.BLOCKED.value,
+                        StepStatus.INTERRUPTED.value,
+                    ),
+                )
+            outcomes = await self._run_publish_phase(mix_id, platforms=[platform])
+        return outcomes.get(platform, {"status": "unknown"})
 
     async def retry_step(self, mix_id: str, step_name: str) -> bool:
-        """Retry a specific failed step, then continue pipeline."""
-        success = await self._execute_step(mix_id, step_name, force=True)
-        if success:
-            # Continue from next step
-            try:
-                idx = PIPELINE_STEPS.index(step_name)
-            except ValueError:
-                return success
-            remaining = PIPELINE_STEPS[idx + 1:]
-            if remaining:
-                task = asyncio.create_task(self._run_remaining(mix_id, remaining))
-                self._running_pipelines[mix_id] = task
-                task.add_done_callback(lambda _t: self._running_pipelines.pop(mix_id, None))
-        return success
+        """Retry a single step, then continue only what that step gates.
+
+        A platform step continues its own leg and re-finalizes; it no longer
+        drags the other platforms' steps along behind it.
+        """
+        result = await self._execute_step(mix_id, step_name, force=True)
+        if not result.ok:
+            await self._finalize(mix_id)
+            return False
+
+        platform = leg_for_step(step_name)
+        if platform:
+            steps = PLATFORM_LEGS[platform]
+            rest = steps[steps.index(step_name) + 1:]
+            for later in rest:
+                later_result = await self._execute_step(mix_id, later)
+                if not later_result.ok:
+                    break
+            await self._finalize(mix_id)
+            return True
+
+        if step_name in PREP_STEPS:
+            remaining_prep = [
+                s for s in PREP_STEPS[PREP_STEPS.index(step_name) + 1:]
+            ]
+            task = asyncio.create_task(self._run_remaining(mix_id, remaining_prep))
+            self._running_pipelines[mix_id] = task
+            task.add_done_callback(lambda _t: self._running_pipelines.pop(mix_id, None))
+            return True
+
+        await self._finalize(mix_id)
+        return True
 
     async def _execute_step(
         self, mix_id: str, step_name: str, force: bool = False
-    ) -> bool:
-        """Execute a single step with retries and exponential backoff."""
+    ) -> "StepResult":
+        """Execute a single step with retries and exponential backoff.
+
+        Returns a :class:`StepResult` so callers can see the handler output
+        (did the platform actually publish, or was it skipped?) and the
+        classified proximate cause of a failure — an auth rejection is not the
+        same event as a network blip, and the alert has to say which it was.
+        """
         while self._paused:
             await asyncio.sleep(2)
 
@@ -439,7 +680,7 @@ class PipelineOrchestrator:
         if handler is None:
             logger.warning("No handler registered for step %s, skipping", step_name)
             await self._record_step(mix_id, step_name, StepStatus.SKIPPED)
-            return True
+            return StepResult(ok=True, output={"skipped": True, "reason": "no handler"})
 
         async with async_session_factory() as session:
             # Check if already completed (unless forced)
@@ -455,7 +696,7 @@ class PipelineOrchestrator:
                 ).scalar_one_or_none()
                 if existing:
                     logger.info("Step %s already completed for mix %s, skipping", step_name, mix_id)
-                    return True
+                    return StepResult(ok=True, output=existing.output_json or {})
 
         for attempt in range(1, MAX_RETRIES + 1):
             while self._paused:
@@ -500,7 +741,7 @@ class PipelineOrchestrator:
                     "step": step_name, "elapsed_seconds": elapsed,
                 })
                 logger.info("Step %s completed for mix %s in %.1fs", step_name, mix_id, elapsed)
-                return True
+                return StepResult(ok=True, output=output or {})
 
             except _VideoNotReady as not_ready:
                 logger.info(
@@ -516,19 +757,32 @@ class PipelineOrchestrator:
                     # Re-attempt after video found + complete
                     continue
                 else:
+                    cause = classify_failure(not_ready, step_name)
+                    cause.summary = wait_reason
                     await self._record_step(
                         mix_id, step_name, StepStatus.FAILED,
                         started_at=started_at, error=wait_reason,
                         retry_count=attempt - 1,
                     )
-                    return False
+                    await self._emit("error", mix_id, {
+                        "step": step_name, "error": wait_reason,
+                        "cause": cause.to_dict(), "platform": cause.platform,
+                    })
+                    return StepResult(ok=False, error=wait_reason, cause=cause)
 
             except Exception as exc:
+                cause = classify_failure(exc, step_name)
                 logger.exception(
-                    "Step %s failed for mix %s (attempt %d): %s",
-                    step_name, mix_id, attempt, exc,
+                    "Step %s failed for mix %s (attempt %d): %s [%s]",
+                    step_name, mix_id, attempt, exc, cause.kind,
                 )
-                if attempt < MAX_RETRIES:
+                # A rejected credential is not a transient fault. Retrying it
+                # two more times only delays the operator learning that a
+                # token needs replacing — and on 08-12 those retries were
+                # what pushed the run into the browser fallback whose timeout
+                # then became the reported "cause".
+                is_last = attempt >= MAX_RETRIES or not cause.retryable
+                if not is_last:
                     backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
                     logger.info("Retrying step %s in %ds", step_name, backoff)
                     try:
@@ -537,26 +791,40 @@ class PipelineOrchestrator:
                         await activity_log.warn(
                             "step_retry",
                             f"Step {step_name} failed (attempt {attempt}/{MAX_RETRIES}): "
-                            f"{exc}. Retrying in {backoff}s.",
+                            f"{cause.summary}. Retrying in {backoff}s.",
                             mix_id=mix_id,
                             stage=step_name,
-                            context={"attempt": attempt, "backoff_seconds": backoff},
+                            context={"attempt": attempt, "backoff_seconds": backoff,
+                                     "cause_kind": cause.kind},
                         )
                     except Exception:  # pragma: no cover - defensive
                         pass
                     await asyncio.sleep(backoff)
                 else:
+                    if not cause.retryable and attempt < MAX_RETRIES:
+                        logger.warning(
+                            "Step %s for mix %s failed with a non-retryable %s error; "
+                            "not burning the remaining %d attempt(s)",
+                            step_name, mix_id, cause.kind, MAX_RETRIES - attempt,
+                        )
+                    # The step row records the PROXIMATE cause, not just the
+                    # outermost exception text.
                     await self._record_step(
                         mix_id, step_name, StepStatus.FAILED,
-                        started_at=started_at, error=str(exc),
+                        started_at=started_at, error=cause.summary,
                         retry_count=attempt - 1,
                     )
                     await self._emit("error", mix_id, {
-                        "step": step_name, "error": str(exc),
+                        "step": step_name,
+                        "error": cause.summary,
+                        "cause": cause.to_dict(),
+                        "platform": cause.platform,
+                        "credential": cause.credential,
+                        "retryable": cause.retryable,
                     })
-                    return False
+                    return StepResult(ok=False, error=cause.summary, cause=cause)
 
-        return False
+        return StepResult(ok=False, error=f"{step_name} exhausted all attempts")
 
     async def _call_handler(
         self, handler: StepHandler, mix_id: str, session: AsyncSession, step_name: str
@@ -646,7 +914,8 @@ class PipelineOrchestrator:
         attempt now wins in place.
         """
         completed_at = datetime.now(timezone.utc) if status in (
-            StepStatus.COMPLETED, StepStatus.FAILED, StepStatus.SKIPPED
+            StepStatus.COMPLETED, StepStatus.FAILED, StepStatus.SKIPPED,
+            StepStatus.BLOCKED,
         ) else None
 
         async with async_session_factory() as session:
@@ -699,6 +968,238 @@ class PipelineOrchestrator:
                     mix.pipeline_step = step
                 await session.commit()
 
+    async def _reset_step_if(
+        self, mix_id: str, step_name: str, statuses: Tuple[str, ...]
+    ) -> None:
+        """Put a step back to PENDING when it is in one of ``statuses``."""
+        async with async_session_factory() as session:
+            row = (
+                await session.execute(
+                    select(PipelineStep)
+                    .where(
+                        PipelineStep.mix_id == mix_id,
+                        PipelineStep.step_name == step_name,
+                    )
+                    .order_by(PipelineStep.id.desc())
+                )
+            ).scalars().first()
+            if row is not None and row.status in statuses:
+                row.status = StepStatus.PENDING.value
+                row.error = None
+                await session.commit()
+
+    async def _block_unreached(
+        self, mix_id: str, after_prep_failure: str
+    ) -> None:
+        """Mark every still-pending step BLOCKED after a prep failure.
+
+        Prep genuinely gates all publishing, but the steps behind it must
+        still say WHY they never ran instead of resting at "pending".
+        """
+        try:
+            idx = PIPELINE_STEPS.index(after_prep_failure)
+        except ValueError:  # pragma: no cover - defensive
+            return
+        reason = f"not attempted — {after_prep_failure} failed"
+        for step_name in PIPELINE_STEPS[idx + 1:]:
+            if step_name == "complete":
+                continue
+            await self._mark_pending_blocked(mix_id, step_name, reason)
+
+    async def _mark_pending_blocked(
+        self, mix_id: str, step_name: str, reason: str
+    ) -> None:
+        async with async_session_factory() as session:
+            row = (
+                await session.execute(
+                    select(PipelineStep)
+                    .where(
+                        PipelineStep.mix_id == mix_id,
+                        PipelineStep.step_name == step_name,
+                    )
+                    .order_by(PipelineStep.id.desc())
+                )
+            ).scalars().first()
+            if row is None:
+                session.add(PipelineStep(
+                    mix_id=mix_id, step_name=step_name,
+                    status=StepStatus.BLOCKED.value, error=reason,
+                    completed_at=datetime.now(timezone.utc),
+                ))
+                await session.commit()
+            elif row.status == StepStatus.PENDING.value:
+                row.status = StepStatus.BLOCKED.value
+                row.error = reason
+                row.completed_at = datetime.now(timezone.utc)
+                await session.commit()
+
+    async def leg_states(self, mix_id: str) -> Dict[str, dict]:
+        """Per-platform publish state, derived from the DB — never guessed.
+
+        The step rows plus the mix's platform URLs are the ground truth. A leg
+        is reported as:
+
+          published  — its steps completed and a platform URL exists
+          skipped    — its steps completed but the platform is unconfigured
+          failed     — a step failed (carries the recorded proximate cause)
+          blocked    — never attempted because its own upload failed earlier
+          pending    — genuinely not run yet
+
+        There is no default-to-fine branch: an unrecognized combination is
+        reported as ``unknown``, because "we don't know" must never render as
+        "published".
+        """
+        async with async_session_factory() as session:
+            mix = await session.get(Mix, mix_id)
+            rows = (
+                await session.execute(
+                    select(PipelineStep).where(PipelineStep.mix_id == mix_id)
+                )
+            ).scalars().all()
+
+        by_name: Dict[str, PipelineStep] = {}
+        for row in rows:
+            prev = by_name.get(row.step_name)
+            if prev is None or (row.id or 0) > (prev.id or 0):
+                by_name[row.step_name] = row
+
+        states: Dict[str, dict] = {}
+        for platform, steps in PLATFORM_LEGS.items():
+            url = getattr(mix, PLATFORM_URL_FIELD[platform], None) if mix else None
+            statuses = [
+                (by_name[s].status if s in by_name else StepStatus.PENDING.value)
+                for s in steps
+            ]
+            entry: Dict[str, Any] = {"url": url}
+
+            failed_step = next(
+                (s for s in steps
+                 if s in by_name and by_name[s].status == StepStatus.FAILED.value),
+                None,
+            )
+            if failed_step is not None:
+                entry.update({
+                    "status": "failed",
+                    "failed_step": failed_step,
+                    "error": by_name[failed_step].error,
+                })
+            elif all(s == StepStatus.COMPLETED.value for s in statuses):
+                entry["status"] = "published" if url else "skipped"
+                if not url:
+                    upload_out = (by_name[steps[0]].output_json or {}) if steps[0] in by_name else {}
+                    entry["reason"] = upload_out.get("reason", "platform not configured")
+            elif any(s == StepStatus.BLOCKED.value for s in statuses):
+                entry["status"] = "blocked"
+            elif all(s in (StepStatus.PENDING.value, StepStatus.SKIPPED.value)
+                     for s in statuses):
+                entry["status"] = "skipped" if all(
+                    s == StepStatus.SKIPPED.value for s in statuses
+                ) else "pending"
+            elif any(s in (StepStatus.RUNNING.value, StepStatus.WAITING.value)
+                     for s in statuses):
+                entry["status"] = "running"
+            else:
+                entry["status"] = "unknown"
+            states[platform] = entry
+        return states
+
+    async def _finalize(self, mix_id: str) -> str:
+        """Set the mix's terminal publish state from its per-leg outcomes.
+
+        Three honest outcomes: everything that could publish did (completed),
+        some did and some did not (partial), or none did (failed). ``partial``
+        is a first-class state — before this, a mix that reached YouTube but
+        not SoundCloud had no way to say so.
+        """
+        states = await self.leg_states(mix_id)
+        published = [p for p, s in states.items() if s["status"] == "published"]
+        # Fail closed: only "published" and "skipped" (nothing to publish to)
+        # are acceptable resting states. pending/blocked/running/unknown all
+        # count as not-done, because an unfinished leg rendering as fine is
+        # exactly how a mix went missing for two days.
+        failed = [
+            p for p, s in states.items()
+            if s["status"] not in ("published", "skipped")
+        ]
+
+        summary = {
+            "legs": states,
+            "published": published,
+            "failed": failed,
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if not failed:
+            await self._store_publish_summary(mix_id, summary)
+            await self._mark_complete(mix_id)
+            return "completed"
+
+        # Nothing further will run for the failed legs, so their untouched
+        # rows are blocked, not pending, and so is `complete`.
+        for platform in failed:
+            for step_name in PLATFORM_LEGS[platform]:
+                await self._mark_pending_blocked(
+                    mix_id, step_name, f"not attempted — {platform} leg failed",
+                )
+        await self._mark_pending_blocked(
+            mix_id, "complete",
+            f"publish incomplete — failed: {', '.join(sorted(failed))}",
+        )
+
+        detail = "; ".join(
+            f"{p}: {states[p].get('error') or states[p]['status']}" for p in sorted(failed)
+        )
+        if published:
+            status = MIX_STATUS_PARTIAL
+            error_text = (
+                f"Partial publish — live on {', '.join(sorted(published))}; "
+                f"not published to {', '.join(sorted(failed))}. {detail}"
+            )
+        else:
+            status = "failed"
+            error_text = f"Publish failed on every target. {detail}"
+
+        summary["status"] = status
+        await self._store_publish_summary(mix_id, summary)
+
+        async with async_session_factory() as session:
+            mix = await session.get(Mix, mix_id)
+            if mix:
+                mix.pipeline_status = status
+                mix.pipeline_error = error_text
+                await session.commit()
+
+        try:
+            from app.services import activity_log
+
+            await activity_log.error(
+                "publish_partial" if published else "publish_failed",
+                error_text,
+                mix_id=mix_id,
+                context={"published": published, "failed": failed},
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        await self._emit("publish_incomplete", mix_id, {
+            "published": published,
+            "failed": failed,
+            "legs": states,
+            "error": error_text,
+        })
+        logger.warning("Mix %s finished %s: %s", mix_id, status, error_text)
+        return status
+
+    async def _store_publish_summary(self, mix_id: str, summary: dict) -> None:
+        async with async_session_factory() as session:
+            mix = await session.get(Mix, mix_id)
+            if not mix:
+                return
+            meta = dict(mix.metadata_json or {})
+            meta["publish"] = summary
+            mix.metadata_json = meta
+            await session.commit()
+
     async def _mark_complete(self, mix_id: str) -> None:
         # Rename the sources to match the generated title now that every upload
         # has been verified -- the video has passed its completeness gate and no
@@ -719,8 +1220,12 @@ class PipelineOrchestrator:
             if mix:
                 mix.pipeline_status = "completed"
                 mix.pipeline_step = "complete"
+                mix.pipeline_error = None
                 mix.pipeline_completed_at = datetime.now(timezone.utc)
                 await session.commit()
+        # Close out the pre-created "complete" row too, so a finished mix has
+        # no step left sitting at "pending".
+        await self._record_step(mix_id, "complete", StepStatus.COMPLETED)
         await self._emit("upload_complete", mix_id)
         logger.info("Pipeline fully completed for mix %s", mix_id)
 

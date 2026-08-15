@@ -2,7 +2,13 @@ version: "3.8"
 
 services:
   fade-out:
-    build: .
+    build:
+      context: .
+      args:
+        # Set by scripts/deploy.sh so the running image can be identified.
+        BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+        BUILD_SOURCE: ${BUILD_SOURCE:-local}
     # Or use pre-built image:
     # image: ghcr.io/rancur/fade-out:latest
     container_name: fade-out

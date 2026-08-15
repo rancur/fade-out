@@ -360,6 +360,65 @@ async def retry_step(mix_id: str, step_name: str, db: AsyncSession = Depends(get
     return out
 
 
+@router.post("/{mix_id}/retry-platform/{platform}", status_code=202)
+async def retry_platform(
+    mix_id: str, platform: str, db: AsyncSession = Depends(get_db)
+):
+    """Re-run ONE platform's upload+verify leg for this mix.
+
+    The point of this endpoint: when SoundCloud's grant died on 2026-08-12 the
+    YouTube leg had to be driven by hand, because the only retry available
+    re-entered the whole pipeline at the failed step and stopped there again.
+    A failed leg is now retryable on its own.
+    """
+    from app.services.pipeline import PLATFORM_LEGS
+
+    if platform not in PLATFORM_LEGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown platform '{platform}'. Known: {', '.join(PLATFORM_LEGS)}",
+        )
+
+    result = await db.execute(select(Mix).where(Mix.id == mix_id))
+    mix = result.scalar_one_or_none()
+    if not mix:
+        raise HTTPException(status_code=404, detail="Mix not found")
+
+    # Commit before handing off: the leg writes from its own sessions and a
+    # multi-GB upload cannot live inside an HTTP request.
+    await db.commit()
+
+    import asyncio
+
+    orch = _get_orchestrator()
+    asyncio.create_task(orch.retry_platform(mix_id, platform))
+
+    return {
+        "mix_id": mix_id,
+        "platform": platform,
+        "started": True,
+        "detail": f"Retrying the {platform} leg in the background.",
+    }
+
+
+@router.get("/{mix_id}/publish-state")
+async def publish_state(mix_id: str, db: AsyncSession = Depends(get_db)):
+    """Per-platform publish state for this mix, derived from the DB."""
+    result = await db.execute(select(Mix).where(Mix.id == mix_id))
+    mix = result.scalar_one_or_none()
+    if not mix:
+        raise HTTPException(status_code=404, detail="Mix not found")
+
+    orch = _get_orchestrator()
+    legs = await orch.leg_states(mix_id)
+    return {
+        "mix_id": mix_id,
+        "pipeline_status": mix.pipeline_status,
+        "pipeline_error": mix.pipeline_error,
+        "legs": legs,
+    }
+
+
 @router.post("/{mix_id}/reread-tracklist", response_model=MixOut, status_code=202)
 async def reread_tracklist(mix_id: str, db: AsyncSession = Depends(get_db)):
     """Re-detect the tracklist and patch YT/SC descriptions in place.

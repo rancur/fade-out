@@ -126,6 +126,11 @@ class Settings(BaseSettings):
 
     # --- Auto-Upgrade ---
     GITHUB_REPO: str = "rancur/fade-out"
+    # Needed only when the repo is PRIVATE: the unauthenticated releases API
+    # answers 404 for a private repo, which is indistinguishable from "no
+    # releases exist". Without this the freshness check reports "unknown"
+    # rather than inventing an up-to-date answer.
+    GITHUB_TOKEN: str = ""
     AUTO_UPGRADE_ENABLED: bool = True
     AUTO_UPGRADE_CHECK_INTERVAL_HOURS: int = 6
 

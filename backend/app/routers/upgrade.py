@@ -9,7 +9,13 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.services.upgrade_service import UpgradeService, _get_current_version, BACKUP_DIR
+from app.services.upgrade_service import (
+    BACKUP_DIR,
+    UpgradeService,
+    _get_current_version,
+    deployment_status,
+    refresh_deployment_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +31,14 @@ _last_checked_at: Optional[str] = None
 class UpgradeStatusResponse(BaseModel):
     current_version: str
     latest_version: Optional[str] = None
-    update_available: bool = False
+    # Tri-state on purpose. ``None`` means "we do not know" — the old bool
+    # reported False for "never checked", which is how a stale container went
+    # unnoticed from July into August.
+    update_available: Optional[bool] = None
+    check_state: str = "unknown"  # ok | error | unknown
+    check_error: Optional[str] = None
+    stale: Optional[bool] = None
+    build: Optional[dict] = None
     last_checked: Optional[str] = None
 
 
@@ -69,18 +82,30 @@ class BackupCreateResponse(BaseModel):
 
 @router.get("/status", response_model=UpgradeStatusResponse)
 async def upgrade_status():
-    """Return current version info and whether an update is available."""
-    global _last_check, _last_checked_at
+    """Current build identity and whether it is behind the latest release.
 
-    current = _get_current_version()
-    latest = _last_check.get("latest_version") if _last_check else None
-    update_available = _last_check is not None and _last_check.get("latest_version") is not None
+    Answers from the cached background check. When that check has never
+    succeeded the answer is ``unknown`` — never a comfortable ``false``.
+    """
+    if deployment_status.state == "unknown":
+        # First caller after boot pays for one check rather than being told
+        # "no update available" on no evidence at all.
+        await refresh_deployment_status()
+
+    snapshot = deployment_status.as_dict()
+    update_available: Optional[bool] = None
+    if snapshot["state"] == "ok":
+        update_available = bool(snapshot["stale"])
 
     return UpgradeStatusResponse(
-        current_version=current,
-        latest_version=latest,
+        current_version=snapshot["current_version"],
+        latest_version=snapshot["latest_version"],
         update_available=update_available,
-        last_checked=_last_checked_at,
+        check_state=snapshot["state"],
+        check_error=snapshot["error"],
+        stale=snapshot["stale"],
+        build=snapshot["build"],
+        last_checked=snapshot["checked_at"],
     )
 
 
@@ -97,6 +122,10 @@ async def check_for_updates():
     except Exception as exc:
         logger.exception("Update check failed")
         raise HTTPException(status_code=502, detail=f"Failed to check for updates: {exc}")
+
+    # Keep the cached deployment-freshness answer (health, /status) in step
+    # with an explicit check.
+    await refresh_deployment_status()
 
     _last_checked_at = checked_at
 
