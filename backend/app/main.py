@@ -11,8 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from sqlalchemy import text as sa_text
+
 from app.config import settings
-from app.database import init_db
+from app.database import async_session_factory, init_db
 from app.logging_config import configure_logging
 from app.routers import (
     activity,
@@ -35,7 +37,11 @@ from app.services.handlers import register_all_handlers
 from app.services.ingest import IngestCoordinator
 from app.services.notification_service import get_notification_service
 from app.services.pipeline import PipelineOrchestrator, sweep_interrupted_at_boot
+from app.services.platform_health import get_platform_health
 from app.services.shorts_pipeline import get_shorts_service
+from app.services.stuck_mix_watchdog import get_stuck_mix_watchdog
+from app.services.upgrade_service import deployment_status, deployment_watch_loop
+from app.version import __version__ as APP_VERSION_STR, build_info
 
 logger = logging.getLogger("fadeout")
 
@@ -125,11 +131,32 @@ async def lifespan(app: FastAPI):
         catalog.kickoff_backfill_auto_resume()
     )
 
+    # Credential health: probes each configured platform's auth on a timer so
+    # /api/health can assert real function instead of process liveness.
+    platform_health = get_platform_health()
+    await platform_health.start()
+
+    # Deployment freshness: keeps "is the running container the current
+    # build?" answered, loudly, instead of defaulting to "no update".
+    deployment_task = asyncio.create_task(deployment_watch_loop())
+
+    # Stuck-mix watchdog: a mix that was ingested but never published has to
+    # surface on its own rather than waiting for someone to notice it missing.
+    stuck_watchdog = get_stuck_mix_watchdog()
+    await stuck_watchdog.start()
+
     await activity_log.info("service_started", "fade-out started; watching for drops.")
 
     logger.info("Fade-Out is running.")
     yield
     logger.info("Fade-Out shutting down.")
+    await stuck_watchdog.stop()
+    await platform_health.stop()
+    deployment_task.cancel()
+    try:
+        await deployment_task
+    except asyncio.CancelledError:
+        pass
     await shorts_service.stop_watcher()
     backfill_resume_task.cancel()
     try:
@@ -146,7 +173,7 @@ async def lifespan(app: FastAPI):
     await notifier.stop()
 
 
-APP_VERSION = "2.3.0"
+APP_VERSION = APP_VERSION_STR
 
 app = FastAPI(
     title="Fade-Out",
@@ -180,11 +207,73 @@ app.include_router(upgrade.router)
 app.include_router(ws.router)
 
 
-# --- Health Check ---
+# --- Health Checks ---
+#
+# Two endpoints, because they answer two different questions and conflating
+# them is how a green check came to mean nothing:
+#
+#   /api/health/live  — is the process up? (container liveness; always 200)
+#   /api/health       — is the service able to do its job? A publish pipeline
+#                       whose OAuth grant is dead cannot publish, so it is NOT
+#                       healthy, and this endpoint says so with a 503.
+
+
+@app.get("/api/health/live")
+async def health_live():
+    """Process liveness only. Never asserts anything about credentials."""
+    return {"status": "alive", "version": APP_VERSION, "build": build_info()}
+
+
 @app.get("/api/health")
 async def health_check():
-    """Return service health status."""
-    return {"status": "ok", "version": APP_VERSION}
+    """Functional health: credentials, deployment freshness, database.
+
+    Returns 503 when the service cannot actually publish. Before this it
+    returned ``{"status":"ok"}`` unconditionally — including for the two days
+    the SoundCloud grant was dead and mixes were failing.
+    """
+    platform_health = get_platform_health()
+    platforms = platform_health.snapshot()
+    deployment = deployment_status.as_dict()
+
+    db_ok = True
+    db_detail = "SELECT 1 ok"
+    try:
+        async with async_session_factory() as session:
+            await session.execute(sa_text("SELECT 1"))
+    except Exception as exc:  # pragma: no cover - defensive
+        db_ok = False
+        db_detail = str(exc)
+
+    problems = []
+    if not db_ok:
+        problems.append(f"database: {db_detail}")
+    for name, info in platforms.items():
+        if not info["healthy"]:
+            problems.append(f"{name} credentials {info['state']}: {info['detail']}")
+    if not deployment["healthy"]:
+        if deployment["stale"]:
+            problems.append(
+                f"deployment stale: running {deployment['current_version']}, "
+                f"latest {deployment['latest_version']}"
+            )
+        else:
+            problems.append(
+                f"deployment freshness {deployment['state']}"
+                + (f": {deployment['error']}" if deployment["error"] else "")
+            )
+
+    healthy = not problems
+    body = {
+        "status": "ok" if healthy else "degraded",
+        "version": APP_VERSION,
+        "build": build_info(),
+        "db_ok": db_ok,
+        "platforms": platforms,
+        "deployment": deployment,
+        "problems": problems,
+    }
+    return JSONResponse(status_code=200 if healthy else 503, content=body)
 
 
 # --- Static Files & SPA Fallback ---

@@ -210,7 +210,7 @@ export default function MixDetail() {
                 {approve.isPending ? 'Approving...' : 'Approve & Upload'}
               </button>
             )}
-            {mix.pipeline_status === 'failed' && (
+            {(mix.pipeline_status === 'failed' || mix.pipeline_status === 'partial') && (
               <button
                 onClick={handleRetry}
                 disabled={retry.isPending}

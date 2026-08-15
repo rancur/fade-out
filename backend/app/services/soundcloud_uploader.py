@@ -10,6 +10,7 @@ import httpx
 from playwright.async_api import BrowserContext, Page, async_playwright
 
 from app.config import settings
+from app.services.platform_errors import PlatformAuthError
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ API_MAX_UPLOAD_BYTES = 450 * 1024 * 1024
 TRANSCODE_BITRATE = "320k"
 
 
-class SoundCloudAuthError(RuntimeError):
+class SoundCloudAuthError(PlatformAuthError):
     """Every SoundCloud credential path was rejected.
 
     Carries the per-grant rejections so the surfaced error names the real
@@ -43,11 +44,21 @@ class SoundCloudAuthError(RuntimeError):
     operator action — no retry will clear it.
     """
 
+    platform = "soundcloud"
+
     def __init__(self, attempts: Optional[List[str]] = None):
-        self.attempts = attempts or []
-        detail = "; ".join(self.attempts) if self.attempts else "no credentials configured"
+        attempts = attempts or []
+        detail = "; ".join(attempts) if attempts else "no credentials configured"
+        # Name the credential that has to be replaced — the NAME only. No
+        # token value is ever put into an exception, a log, or an alert.
+        credential = "SOUNDCLOUD_REFRESH_TOKEN / SOUNDCLOUD_ACCESS_TOKEN"
+        if any("no refresh token" in a for a in attempts):
+            credential = "SOUNDCLOUD_REFRESH_TOKEN (not configured)"
         super().__init__(
-            f"SoundCloud authorization failed and needs re-authorization: {detail}"
+            f"SoundCloud authorization failed and needs re-authorization: {detail}",
+            platform="soundcloud",
+            credential=credential,
+            attempts=attempts,
         )
 
 

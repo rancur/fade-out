@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -30,6 +31,12 @@ NOTIFICATION_TYPES = {
     "error",
     "draft_ready",
     "upgrade_available",
+    # One platform leg failed while others may still have published, and the
+    # mix finished only partly live. Both are actionable on their own.
+    "platform_failed",
+    "publish_incomplete",
+    "stuck_mix",
+    "deployment_stale",
 }
 
 # Per-event-type default toggles when notification_events is not configured.
@@ -41,11 +48,19 @@ DEFAULT_EVENT_TOGGLES: Dict[str, bool] = {
     "error": True,
     "draft_ready": True,
     "upgrade_available": True,
+    "platform_failed": True,
+    "publish_incomplete": True,
+    "stuck_mix": True,
+    "deployment_stale": True,
 }
 
 # Severity of each notification type, checked against notification_min_level.
 TYPE_LEVELS: Dict[str, str] = {
     "error": "error",
+    "platform_failed": "error",
+    "publish_incomplete": "error",
+    "stuck_mix": "warn",
+    "deployment_stale": "warn",
 }
 LEVEL_RANK = {"info": 0, "warn": 1, "error": 2}
 
@@ -62,6 +77,10 @@ DISCORD_COLORS: Dict[str, int] = {
     "error": 0xE74C3C,              # red
     "draft_ready": 0xF39C12,        # orange
     "upgrade_available": 0x1ABC9C,  # teal
+    "platform_failed": 0xE74C3C,    # red
+    "publish_incomplete": 0xE67E22, # dark orange
+    "stuck_mix": 0xE67E22,          # dark orange
+    "deployment_stale": 0xE67E22,   # dark orange
 }
 
 
@@ -241,12 +260,87 @@ class NotificationService:
             await self.notify("upload_complete", mix_id=mix_id,
                               message="Mix finished: all uploads complete.", data=data)
         elif event_type == "error":
-            await self.notify("error", mix_id=mix_id,
-                              message=f"Mix failed at step {data.get('step')}.", data=data)
+            # Name the proximate cause, not just the step. "Mix failed at step
+            # upload_soundcloud" plus a Playwright timeout is what sent the
+            # 08-12 reader to the browser automation instead of to the dead
+            # OAuth grant.
+            cause = data.get("cause") or {}
+            headline = cause.get("summary") or data.get("error") or "failed"
+            await self.notify(
+                "error", mix_id=mix_id,
+                title=self._failure_title(data, cause),
+                message=f"Mix failed at step {data.get('step')}: {headline}",
+                data=data,
+            )
+        elif event_type == "platform_failed":
+            cause = data.get("cause") or {}
+            platform = data.get("platform", "platform")
+            headline = cause.get("summary") or data.get("error") or "failed"
+            await self.notify(
+                "platform_failed", mix_id=mix_id,
+                title=self._failure_title(data, cause),
+                message=(
+                    f"{platform} did not publish ({data.get('step')}): {headline} "
+                    "Other platforms were attempted independently."
+                ),
+                data=data,
+            )
+        elif event_type == "publish_incomplete":
+            published = data.get("published") or []
+            failed = data.get("failed") or []
+            await self.notify(
+                "publish_incomplete", mix_id=mix_id,
+                title=(
+                    f"Partial publish — {', '.join(published)} live, "
+                    f"{', '.join(failed)} not"
+                    if published else "Publish failed on every target"
+                ),
+                message=data.get("error", "Publish incomplete."),
+                data=data,
+            )
         elif event_type == "draft_ready":
             await self.notify("draft_ready", mix_id=mix_id,
                               message="Mix is ready for draft review.", data=data)
         # step_progress and anything else: intentionally not notified.
+
+    @staticmethod
+    def _rate_key(payload: Dict[str, Any]) -> str:
+        """Rate-limit bucket for a payload.
+
+        Per (mix, type, platform, step): two DIFFERENT platforms failing on
+        the same mix are two different facts, and collapsing them into one
+        bucket would hide the second one entirely.
+        """
+        data = payload.get("data") or {}
+        cause = data.get("cause") or {}
+        parts = [
+            payload.get("type", ""),
+            str(cause.get("platform") or data.get("platform") or ""),
+            str(data.get("step") or ""),
+        ]
+        return ":".join(p for p in parts if p)
+
+    @staticmethod
+    def _failure_title(data: Dict[str, Any], cause: Dict[str, Any]) -> str:
+        """Subject line that states the KIND of failure and where it is.
+
+        An auth failure has to read as an auth failure at a glance, in the
+        subject, before anyone opens the mail.
+        """
+        platform = cause.get("platform") or data.get("platform")
+        kind = cause.get("kind", "error")
+        labels = {
+            "auth": "Authorization failed",
+            "quota": "Quota/rate limit",
+            "missing_file": "Source file missing",
+            "video_not_ready": "Video source incomplete",
+            "network": "Network failure",
+            "unknown": "Pipeline error",
+        }
+        label = labels.get(kind, "Pipeline error")
+        if platform:
+            return f"{label} — {platform}"
+        return label
 
     def _passes_filters(self, ntype: str, cfg: Dict[str, Any]) -> bool:
         if not cfg["events"].get(ntype, True):
@@ -348,7 +442,7 @@ class NotificationService:
         mix_id = payload.get("mix_id")
         ntype = payload.get("type", "")
 
-        if not self._check_rate_limit(mix_id, ntype, "discord"):
+        if not self._check_rate_limit(mix_id, self._rate_key(payload), "discord"):
             return False
 
         color = DISCORD_COLORS.get(ntype, 0x95A5A6)
@@ -359,8 +453,21 @@ class NotificationService:
             fields.append({"name": "Step", "value": data["step"], "inline": True})
         if data.get("elapsed_seconds"):
             fields.append({"name": "Duration", "value": f"{data['elapsed_seconds']:.1f}s", "inline": True})
-        if data.get("error"):
-            fields.append({"name": "Error", "value": data["error"][:1024], "inline": False})
+        cause = data.get("cause") or {}
+        if cause:
+            fields.append({
+                "name": "Cause",
+                "value": str(cause.get("summary") or data.get("error", ""))[:1024],
+                "inline": False,
+            })
+            fields.append({"name": "Type", "value": str(cause.get("kind", "unknown")), "inline": True})
+            if cause.get("platform"):
+                fields.append({"name": "Platform", "value": str(cause["platform"]), "inline": True})
+            if cause.get("credential"):
+                # Key name only. Never a value.
+                fields.append({"name": "Credential", "value": str(cause["credential"]), "inline": True})
+        elif data.get("error"):
+            fields.append({"name": "Error", "value": str(data["error"])[:1024], "inline": False})
 
         # Add platform links if available
         for key in ("soundcloud_url", "youtube_url"):
@@ -408,7 +515,7 @@ class NotificationService:
         mix_id = payload.get("mix_id")
         ntype = payload.get("type", "")
 
-        if not self._check_rate_limit(mix_id, ntype, "email"):
+        if not self._check_rate_limit(mix_id, self._rate_key(payload), "email"):
             return False
 
         subject = f"[Fade-Out] {payload.get('title', ntype)}"
@@ -466,9 +573,53 @@ class NotificationService:
                 label = key.replace("_url", "").replace("_", " ").title()
                 links_html += f'<p><a href="{data[key]}">{label}</a></p>'
 
+        # --- Cause block -------------------------------------------------
+        # The failure mail's job is to point at the thing that is actually
+        # broken. It names the kind of failure, the platform, and the
+        # credential KEY that needs attention — never a credential value.
+        cause = data.get("cause") or {}
+        cause_html = ""
+        if cause:
+            rows = [
+                ("Cause", cause.get("summary") or data.get("error", "")),
+                ("Type", cause.get("kind", "unknown")),
+                ("Platform", cause.get("platform") or data.get("platform") or "—"),
+                ("Credential", cause.get("credential") or "—"),
+                ("Retryable", "no — operator action required"
+                              if cause.get("retryable") is False else "yes"),
+            ]
+            if cause.get("remediation"):
+                rows.append(("Fix", cause["remediation"]))
+            row_html = "".join(
+                f'<tr><td style="padding:4px 10px 4px 0;color:#666;'
+                f'vertical-align:top;white-space:nowrap">{escape(str(k))}</td>'
+                f'<td style="padding:4px 0"><strong>{escape(str(v))}</strong></td></tr>'
+                for k, v in rows
+            )
+            cause_html = (
+                '<table style="margin:12px 0;border-collapse:collapse;font-size:13px">'
+                f"{row_html}</table>"
+            )
+
+        legs_html = ""
+        legs = data.get("legs") or {}
+        if legs:
+            items = "".join(
+                f"<li><strong>{escape(str(name))}</strong>: {escape(str(info.get('status')))}"
+                + (f" — {escape(str(info.get('error')))}" if info.get("error") else "")
+                + (f' — <a href="{escape(str(info["url"]))}">link</a>' if info.get("url") else "")
+                + "</li>"
+                for name, info in legs.items()
+            )
+            legs_html = f'<ul style="font-size:13px;padding-left:18px">{items}</ul>'
+
         error_html = ""
-        if data.get("error"):
-            error_html = f'<div style="background:#FDECEA;padding:10px;border-radius:4px;margin:10px 0"><code>{data["error"]}</code></div>'
+        raw_error = data.get("error")
+        if raw_error and raw_error != cause.get("summary"):
+            error_html = (
+                '<div style="background:#FDECEA;padding:10px;border-radius:4px;'
+                f'margin:10px 0"><code>{escape(str(raw_error))}</code></div>'
+            )
 
         return f"""
         <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
@@ -477,6 +628,8 @@ class NotificationService:
             </div>
             <div style="background:#F8F9FA;padding:20px;border-radius:0 0 8px 8px">
                 <p>{message}</p>
+                {cause_html}
+                {legs_html}
                 {error_html}
                 {links_html}
                 <hr style="border:none;border-top:1px solid #DDD;margin:20px 0">
@@ -495,7 +648,7 @@ class NotificationService:
         mix_id = payload.get("mix_id")
         ntype = payload.get("type", "")
 
-        if not self._check_rate_limit(mix_id, ntype, f"webhook:{url}"):
+        if not self._check_rate_limit(mix_id, self._rate_key(payload), f"webhook:{url}"):
             return False
 
         try:
