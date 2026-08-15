@@ -563,6 +563,10 @@ class NotificationService:
 
         color = {
             "error": "#E74C3C",
+            "platform_failed": "#E74C3C",
+            "publish_incomplete": "#E67E22",
+            "stuck_mix": "#E67E22",
+            "deployment_stale": "#E67E22",
             "upload_complete": "#9B59B6",
             "draft_ready": "#F39C12",
         }.get(ntype, "#3498DB")
