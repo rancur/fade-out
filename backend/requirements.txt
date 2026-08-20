@@ -6,6 +6,7 @@ python-multipart>=0.0.9
 watchdog>=4.0.2
 librosa>=0.10.2
 shazamio>=0.7.0
+pyacoustid>=2.2.2
 httpx>=0.27.0
 openai>=1.47.0
 playwright>=1.47.0

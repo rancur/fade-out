@@ -1,4 +1,4 @@
-"""Audio analysis service -- extracts features and identifies tracks via Shazam."""
+"""Audio analysis service -- extracts features and identifies tracks via Shazam + AcoustID fallback."""
 
 import asyncio
 import logging
@@ -7,6 +7,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import acoustid
 import librosa
 import numpy as np
 import soundfile as sf
@@ -200,10 +201,11 @@ class AudioAnalyzer:
     async def _identify_tracks(
         self, path: str, sample_times: List[float], sr_native: int
     ) -> List[TrackHit]:
-        """Use Shazam to identify tracks at sample points.
+        """Use Shazam + AcoustID fallback to identify tracks at sample points.
 
         For each sample point, tries two clips (primary and +30s offset) to
-        catch transitions. If the primary clip fails Shazam, retries at +45s.
+        catch transitions. If the primary clip fails Shazam, tries AcoustID,
+        then retries Shazam at +45s offset as last resort.
         Consecutive duplicate tracks are deduplicated (keep first occurrence).
         """
         identified: List[TrackHit] = []
@@ -214,10 +216,13 @@ class AudioAnalyzer:
         title_hit_count: dict[str, int] = {}
 
         for t in sample_times:
-            # Primary clip at sample point
+            # Primary clip at sample point - try Shazam first (better metadata)
             hit = await self._shazam_segment(path, t, sr_native)
             if not hit:
-                # Retry with offset if primary fails
+                # Fallback to AcoustID (free tier)
+                hit = await self._acoustid_segment(path, t, sr_native)
+            if not hit:
+                # Last resort: retry Shazam with offset
                 hit = await self._shazam_segment(path, t + RETRY_CLIP_OFFSET, sr_native)
 
             if hit:
@@ -232,6 +237,9 @@ class AudioAnalyzer:
             # Only add if we didn't already get a hit at this point
             if not hit:
                 hit2 = await self._shazam_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
+                if not hit2:
+                    # Try AcoustID on secondary clip too
+                    hit2 = await self._acoustid_segment(path, t + SECONDARY_CLIP_OFFSET, sr_native)
                 if hit2:
                     title_key = hit2.title.lower()
                     title_hit_count[title_key] = title_hit_count.get(title_key, 0) + 1
@@ -307,6 +315,54 @@ class AudioAnalyzer:
         title = track_info.get("title", "Unknown")
         artist = track_info.get("subtitle", "Unknown")
         return TrackHit(title=title, artist=artist, timestamp_seconds=offset)
+
+    async def _acoustid_segment(
+        self, path: str, offset: float, sr_native: int
+    ) -> Optional[TrackHit]:
+        """Extract a segment and run AcoustID on it (free fallback)."""
+        if not settings.ACOUSTID_API_KEY:
+            return None
+
+        try:
+            y, sr = await asyncio.to_thread(
+                librosa.load, path, sr=sr_native, offset=offset, duration=SEGMENT_DURATION
+            )
+        except Exception:
+            return None
+
+        # Write segment to a temp WAV file for AcoustID
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        try:
+            sf.write(tmp.name, y, sr)
+            tmp.close()
+
+            # AcoustID lookup (synchronous, so wrap in thread)
+            results = await asyncio.to_thread(
+                acoustid.match,
+                settings.ACOUSTID_API_KEY,
+                tmp.name,
+                meta="recordings releasegroups"
+            )
+
+            # Parse first result
+            for score, recording_id, title, artist in results:
+                if score >= 0.5 and title:  # confidence threshold
+                    logger.debug("AcoustID matched at %.1fs: %s - %s (score: %.2f)", offset, artist or "Unknown", title, score)
+                    return TrackHit(
+                        title=title,
+                        artist=artist or "Unknown",
+                        timestamp_seconds=offset
+                    )
+            return None
+
+        except Exception as exc:
+            logger.debug("AcoustID failed at %.1fs: %s", offset, exc)
+            return None
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
 
     def _classify_genres(
         self,
