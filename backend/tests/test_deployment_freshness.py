@@ -6,7 +6,6 @@ never contained and returned ``0.0.0``, while ``/api/upgrade/status`` reported
 July went unnoticed into the middle of August.
 """
 
-import pytest
 
 from app.services import upgrade_service
 from app.version import __version__, build_info

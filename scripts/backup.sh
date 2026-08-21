@@ -37,31 +37,37 @@ info "Starting backup: ${BACKUP_NAME}"
 # ---------------------------------------------------------------------------
 # Backup SQLite database
 # ---------------------------------------------------------------------------
-DB_FILE="data/fade-out.db"
+# The application writes /data/fadeout.db (see DATABASE_URL in
+# backend/app/config.py), which is bind-mounted to ./data on the host.
+DB_NAME="${DB_NAME:-fadeout.db}"
+DB_FILE="data/${DB_NAME}"
+
 if [ -f "$DB_FILE" ]; then
     info "Backing up database..."
     # Use sqlite3 .backup for a safe copy (handles WAL mode correctly)
     if command -v sqlite3 &>/dev/null; then
-        sqlite3 "$DB_FILE" ".backup '${STAGING_DIR}/fade-out.db'"
+        sqlite3 "$DB_FILE" ".backup '${STAGING_DIR}/${DB_NAME}'"
+    elif docker exec fade-out sqlite3 "/data/${DB_NAME}" ".backup '/tmp/${DB_NAME}.backup'" 2>/dev/null; then
+        docker cp "fade-out:/tmp/${DB_NAME}.backup" "${STAGING_DIR}/${DB_NAME}"
+        docker exec fade-out rm "/tmp/${DB_NAME}.backup"
     else
-        # Fallback: try docker exec if sqlite3 not available locally
-        if docker exec fade-out sqlite3 /data/fade-out.db ".backup '/tmp/fade-out-backup.db'" 2>/dev/null; then
-            docker cp fade-out:/tmp/fade-out-backup.db "${STAGING_DIR}/fade-out.db"
-            docker exec fade-out rm /tmp/fade-out-backup.db
-        else
-            warn "sqlite3 not available. Copying database file directly (may be inconsistent if writes are in progress)."
-            cp "$DB_FILE" "${STAGING_DIR}/fade-out.db"
-        fi
+        warn "sqlite3 not available. Copying database file directly (may be inconsistent if writes are in progress)."
+        cp "$DB_FILE" "${STAGING_DIR}/${DB_NAME}"
     fi
     info "Database backed up."
 else
-    warn "No database found at ${DB_FILE}. Skipping."
+    # A "backup" with no database in it is not a backup. Fail loudly rather
+    # than printing "Backup complete!" over an archive that cannot restore.
+    error "No database found at ${DB_FILE}.
+       Run this from the project root, after the app has created its database.
+       If your database lives elsewhere, set DB_NAME (file name under ./data)."
 fi
 
 # Backup WAL and SHM files if they exist
+DB_STEM="${DB_NAME%.db}"
 for ext in db-wal db-shm; do
-    if [ -f "data/fade-out.${ext}" ]; then
-        cp "data/fade-out.${ext}" "${STAGING_DIR}/"
+    if [ -f "data/${DB_STEM}.${ext}" ]; then
+        cp "data/${DB_STEM}.${ext}" "${STAGING_DIR}/"
     fi
 done
 
@@ -122,6 +128,6 @@ echo "  Size: ${BACKUP_SIZE}"
 echo ""
 echo "  Restore with:"
 echo "    tar -xzf ${BACKUP_NAME}.tar.gz"
-echo "    cp ${BACKUP_NAME}/fade-out.db data/"
+echo "    cp ${BACKUP_NAME}/${DB_NAME} data/"
 echo "    cp ${BACKUP_NAME}/.env ."
 echo "========================================"

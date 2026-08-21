@@ -49,7 +49,7 @@ from app.services.description_generator import (  # noqa: E402
     TITLE_MAX_CHARS,
     TITLE_TARGET_CHARS,
     enforce_title_shape,
-    genre_in_title,
+    genre_in_title,  # noqa: F401  — re-exported for callers and tests
     resolve_title_genre,
 )
 
@@ -72,31 +72,83 @@ OVERUSED_TITLE_WORDS = ["odyssey", "sonic", "journey", "voyage", "exploration"]
 # Order matters for the deterministic strip: the specific series names run
 # before the bare "Will See" channel prefix so "Will See Wednesdays" is removed
 # as a series name rather than half-eaten by the prefix rule.
-BANNED_TITLE_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
-    (
-        'contains the series name "Will See Wednesdays"',
-        re.compile(r"\bwill\s*[-–—]?\s*see\s+wednesdays?\b", re.IGNORECASE),
-    ),
-    (
-        'contains the series name "Second Saturdays"',
-        re.compile(r"\b(?:second|2nd)\s+saturdays?\b", re.IGNORECASE),
-    ),
-    (
-        'contains "Raid Train"',
-        re.compile(r"\braid[\s\-_]*trains?\b", re.IGNORECASE),
-    ),
-    (
-        'starts with the channel name "Will See" as a prefix',
-        re.compile(r"^\s*will\s+see\s*[|\-–—:]+\s*", re.IGNORECASE),
-    ),
-    (
+# Written-out ordinals and their numeric forms are used interchangeably in
+# stream titles ("Second Saturdays" / "2nd Saturdays"), so a series name
+# containing one should match either spelling.
+_ORDINAL_ALIASES = {
+    "first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th",
+    "fifth": "5th", "sixth": "6th", "seventh": "7th", "eighth": "8th",
+    "ninth": "9th", "tenth": "10th",
+}
+_ORDINAL_ALIASES.update({v: k for k, v in _ORDINAL_ALIASES.items()})
+
+
+def _word_pattern(word: str) -> str:
+    """A word, plus its ordinal counterpart when it has one."""
+    alias = _ORDINAL_ALIASES.get(word.lower())
+    if alias:
+        return f"(?:{re.escape(word)}|{re.escape(alias)})"
+    return re.escape(word)
+
+
+def _series_pattern(name: str) -> "re.Pattern[str]":
+    """Match a series name tolerantly.
+
+    Any run of whitespace/dashes between words, ordinal spellings treated as
+    equivalent, and singular/plural treated as the same series — so a name
+    configured either way ("Will See Wednesdays" or "Will See Wednesday")
+    matches both spellings in a title.
+    """
+    words = name.split()
+    if words:
+        # Normalise the final word to its stem so the optional "s" below
+        # covers both spellings regardless of how the name was configured.
+        last = words[-1]
+        if len(last) > 1 and last[-1].lower() == "s" and last.lower() not in _ORDINAL_ALIASES:
+            words[-1] = last[:-1]
+    body = r"\s*[-–—]?\s*".join(_word_pattern(w) for w in words)
+    return re.compile(rf"\b{body}s?\b", re.IGNORECASE)
+
+
+def _channel_prefix_pattern(name: str) -> "re.Pattern[str]":
+    """Match the channel name only where it is used as a leading prefix."""
+    body = r"\s+".join(re.escape(w) for w in name.split())
+    return re.compile(rf"^\s*{body}\s*[|\-–—:]+\s*", re.IGNORECASE)
+
+
+def _build_banned_title_patterns() -> List[Tuple[str, "re.Pattern[str]"]]:
+    """Assemble the ban list: configured series/channel names first, then the
+    universal markers.
+
+    Order matters for the deterministic strip: the specific series names run
+    before the bare channel prefix, so a series name is removed whole rather
+    than half-eaten by the prefix rule.
+    """
+    patterns: List[Tuple[str, "re.Pattern[str]"]] = []
+
+    for name in settings.catalog_series_names:
+        patterns.append((f'contains the series name "{name}"', _series_pattern(name)))
+
+    patterns.append(('contains "Raid Train"', re.compile(r"\braid[\s\-_]*trains?\b", re.IGNORECASE)))
+
+    channel = settings.CATALOG_CHANNEL_NAME.strip()
+    if channel:
+        patterns.append((
+            f'starts with the channel name "{channel}" as a prefix',
+            _channel_prefix_pattern(channel),
+        ))
+
+    patterns.append((
         "contains a date",
         re.compile(
             r"\(?\b(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"
             r"|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\b\)?"
         ),
-    ),
-]
+    ))
+    return patterns
+
+
+BANNED_TITLE_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = _build_banned_title_patterns()
 
 # Left over when a banned phrase is the entire creative half of a title
 # ("Will See Wednesdays | House Mix" -> "" | House Mix"). Neutral, on-brand,
@@ -149,6 +201,10 @@ MAX_USED_TITLES_IN_PROMPT = 40
 # Heuristic title classifier
 # ---------------------------------------------------------------------------
 
+# Mostly universal markers. The "dj … see live/set" entry is a leftover from
+# the original author's channel and is harmless for everyone else (it simply
+# never matches); the configurable ban list in BANNED_TITLE_PATTERNS is where
+# per-channel wording belongs.
 GENERIC_PATTERNS = [
     re.compile(r"raid.?train", re.IGNORECASE),
     re.compile(r"^dj (will )?see (live|set|stream)", re.IGNORECASE),

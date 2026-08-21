@@ -2,6 +2,80 @@
 
 ## Unreleased
 
+### Prepared for public release
+
+fade-out is now a public repository. Nothing about the pipeline changed; this
+is packaging, hardening, and honesty about what the project is.
+
+**Security**
+
+- **`claude.yml` is gated on `author_association`.** On a public repo the old
+  trigger let any stranger start a Claude run — with write access to the
+  repository and the owner's OAuth token — by opening an issue or commenting
+  "@claude". Only the owner, org members, and invited collaborators can now.
+- **CORS is an explicit allowlist instead of `"*"`.** The API has no
+  authentication, so a credentialed wildcard let any website the operator
+  visited read their stored credential metadata and drive their pipeline.
+  Configurable via `CORS_ALLOW_ORIGINS`; `PUBLIC_URL` is folded in
+  automatically, and setting `"*"` now disables credentialed CORS.
+- **Removed the unused `python-jose` dependency**, the only source of the sole
+  known Python vulnerability (`ecdsa`, PYSEC-2026-1325, no fix available).
+  `pip-audit` is now clean.
+- Merged the outstanding dependency bumps for `undici`, `postcss`,
+  `react-router`, and `react-router-dom`. `npm audit` is now clean.
+- The roadmap workflow passes its input through the environment rather than
+  interpolating it into the prompt.
+- Added `SECURITY.md`, including the deployment guidance this project has
+  always needed: **fade-out has no authentication and must not be exposed
+  directly to the internet.**
+
+**Fixed**
+
+- **`scripts/backup.sh` never backed up the database.** It looked for
+  `data/fade-out.db`; the application writes `fadeout.db`. The database was
+  silently skipped and the script still printed "Backup complete!" over an
+  archive that could not restore. It now uses the correct name and fails loudly
+  when the database is missing.
+- The YouTube OAuth code-exchange error path parsed Google's
+  `error_description` and then logged the raw response body instead, so the
+  useful reason never reached the log.
+- The DJCTL WebSocket listener no longer starts a reconnect loop when no URL is
+  configured. `DJCTL_WS_URL` now defaults to empty (opt-in) rather than to a
+  hardcoded LAN address.
+
+**Configuration**
+
+- Host paths are read from `.env` (`WATCH_AUDIO_DIR`, `WATCH_VIDEO_DIR`,
+  `WATCH_CUE_DIR`, `WATCH_SHORTS_DIR`, `OUTPUT_THUMBNAILS_DIR`,
+  `OUTPUT_COVER_ART_DIR`), so `docker-compose.yml` works unmodified anywhere.
+  They default to `./media/*` beside the compose file.
+- Back-catalog title cleanup is configurable via `CATALOG_CHANNEL_NAME` and
+  `CATALOG_SERIES_NAMES` instead of hardcoding one channel's retired show
+  names. Defaults preserve existing behaviour; series matching now also treats
+  singular/plural and written/numeric ordinals as equivalent.
+- `TZ` defaults to `UTC`, and the SoundCloud automation browser follows it
+  rather than a fixed timezone.
+- `AUDD_API_TOKEN`, `PUBLIC_URL`, and `CORS_ALLOW_ORIGINS` are documented in
+  `.env.example`, which had drifted from the README.
+
+**Project**
+
+- **Added CI** (`.github/workflows/ci.yml`): backend tests, lint, frontend
+  typecheck/test/build, a Docker build, and a dependency audit. The README's CI
+  badge pointed at a `build.yml` that never existed.
+- Added `CONTRIBUTING.md` and a `ruff.toml` with a deliberately conservative
+  rule set; fixed the 39 findings it reported.
+- `CLAUDE.md` claimed no test suite existed. There are now 1015 backend tests
+  and 30 frontend tests, and the documented commands are the real ones.
+- `ROADMAP.md` listed a dozen already-shipped features as pending work — which
+  the autonomous roadmap driver would have re-implemented on top of working
+  code. Rewritten against what is actually in the tree.
+- Documented that **Python 3.12 is required**: 3.13 removed the stdlib
+  `audioop` module that `pydub` (via `shazamio`) imports at start-up.
+- Removed `IMPROVEMENT_PLAN.md` and `docs/superpowers/`, internal planning
+  documents that referenced personal infrastructure.
+- Scrubbed personal email addresses, NAS paths, and a LAN IP from the tree.
+
 ### The deployment freshness check can actually reach a private repo
 - `GITHUB_TOKEN` is now **passed through to the container** in
   `docker-compose.yml` / `docker-compose.dev.yml` and documented in

@@ -1,12 +1,20 @@
 # fade-out
 
 [![Docker](https://img.shields.io/badge/docker-ready-blue?logo=docker)](https://ghcr.io/rancur/fade-out)
-[![CI](https://github.com/rancur/fade-out/actions/workflows/build.yml/badge.svg)](https://github.com/rancur/fade-out/actions/workflows/build.yml)
+[![CI](https://github.com/rancur/fade-out/actions/workflows/ci.yml/badge.svg)](https://github.com/rancur/fade-out/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Automated DJ mix upload pipeline for SoundCloud & YouTube.**
 
 Drop a recorded mix into a watch folder. fade-out analyzes the audio, generates tracklists, creates branded thumbnails and cover art, uploads to SoundCloud and YouTube, verifies each upload, and notifies you on Discord. Zero manual steps after the initial recording.
+
+> [!IMPORTANT]
+> **fade-out has no authentication. Do not expose it directly to the internet.**
+>
+> Anyone who can reach the port can read your configured credentials and publish
+> to your accounts. It is built as a single-user tool for a trusted home
+> network — run it on your LAN, behind an authenticating reverse proxy, or on a
+> private overlay network like Tailscale. See [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -68,6 +76,18 @@ Drop a recorded mix into a watch folder. fade-out analyzes the audio, generates 
   └──────────────────────────────────────────────────────────────────┘
 ```
 
+## Requirements
+
+- **Docker** and Docker Compose (the recommended path — everything else is baked in), or
+- **Python 3.12**, Node 20, and `ffmpeg` for a local install.
+
+> Python 3.13+ is not supported. It removed the stdlib `audioop` module that
+> `pydub` — pulled in by `shazamio` — imports at start-up. The Docker image
+> pins 3.12 for this reason.
+
+You will also need API credentials for the services you intend to use; see
+[Configuration](#configuration).
+
 ## Quick Start
 
 ### Docker (recommended)
@@ -79,7 +99,9 @@ cd fade-out
 
 # Configure environment
 cp .env.example .env
-# Edit .env with your API keys and credentials
+# Edit .env with your API keys, credentials, and media paths.
+# By default fade-out watches ./media/* next to the compose file; point
+# WATCH_AUDIO_DIR and friends at your own folders (a NAS share, for example).
 
 # Build and start
 docker compose up -d
@@ -88,17 +110,20 @@ docker compose up -d
 open http://localhost:8500
 ```
 
-### NAS Deployment
+### NAS / server deployment
 
 ```bash
-# Run the setup script (creates directories, configures .env)
+# Interactive setup: creates the media directories and fills in .env
 bash scripts/setup.sh
 
 # Or manually:
 docker compose up -d --build
 ```
 
-The web dashboard will be available at `http://<nas-ip>:8500`.
+Set the `WATCH_*` and `OUTPUT_*` variables in `.env` to your shares — for
+example `WATCH_AUDIO_DIR=/volume1/music/mixes` on a Synology. The dashboard is
+then available at `http://<host-ip>:8500`; keep it on the LAN, or put an
+authenticating proxy in front of it.
 
 ## Configuration
 
@@ -116,7 +141,38 @@ The web dashboard will be available at `http://<nas-ip>:8500`.
 | `YOUTUBE_REFRESH_TOKEN` | Yes | YouTube Data API OAuth2 refresh token |
 | `NOTIFICATION_DISCORD_WEBHOOK_URL` | No | Discord webhook for upload notifications |
 | `GITHUB_TOKEN` | Only for a private repo | Read-only credential for the deployment freshness check (see below) |
-| `TZ` | No | Timezone (default: `America/Phoenix`) |
+| `TZ` | No | IANA timezone (default: `UTC`) |
+| `PUBLIC_URL` | For YouTube OAuth | Publicly resolvable URL used for OAuth callbacks |
+| `CORS_ALLOW_ORIGINS` | No | Comma-separated browser origins allowed to call the API. Defaults to the Vite dev-server origins; `PUBLIC_URL` is added automatically. **Do not set to `*`** — see [SECURITY.md](SECURITY.md) |
+| `DJCTL_WS_URL` | No | Live DJCTL WebSocket feed. Empty (default) disables it |
+| `CATALOG_CHANNEL_NAME` | No | Your channel name, stripped when used as a title prefix during back-catalog import |
+| `CATALOG_SERIES_NAMES` | No | Comma-separated recurring show names to strip from imported titles |
+
+> [!NOTE]
+> `CATALOG_CHANNEL_NAME` and `CATALOG_SERIES_NAMES` default to the original
+> author's own Twitch-era show names, so that existing deployments keep working.
+> **Set them to your own** (or to empty) — a phrase that never matches simply
+> does nothing. The universal markers (`Raid Train`, `Twitch`, `untitled`, bare
+> dates) always apply and need no configuration.
+
+### Host paths
+
+`docker-compose.yml` reads these from `.env`, so the compose file works
+unmodified on any machine. Each defaults to a folder under `./media/` next to
+the compose file — point them at your own shares instead.
+
+| Variable | Mount | Mode |
+|---|---|---|
+| `WATCH_AUDIO_DIR` | `/watch/audio` | read-write |
+| `WATCH_VIDEO_DIR` | `/watch/video` | read-write |
+| `WATCH_CUE_DIR` | `/watch/djctl-cue` | read-only |
+| `WATCH_SHORTS_DIR` | `/watch/shorts` | read-only |
+| `OUTPUT_THUMBNAILS_DIR` | `/output/thumbnails` | read-write |
+| `OUTPUT_COVER_ART_DIR` | `/output/cover-art` | read-write |
+
+Audio and video are mounted read-write only so the optional source-file renaming
+feature can work; it is off by default. Set them to `:ro` in `docker-compose.yml`
+if you never want fade-out to touch your source recordings.
 
 ### Deployment freshness
 
@@ -324,14 +380,20 @@ cd frontend && npm run typecheck
 
 ## Roadmap
 
-- [ ] Mixcloud upload support
-- [ ] Automatic chapter markers from tracklist timestamps
-- [ ] Shazam-based track identification fallback
-- [ ] Scheduled uploads (release queue with configurable timing)
-- [ ] Analytics dashboard (play counts, listener stats across platforms)
-- [ ] Multi-brand support (different visual presets per genre/series)
-- [ ] RSS podcast feed generation
-- [ ] Waveform video generation for YouTube (audio-reactive visuals)
+Mixcloud upload, YouTube chapter markers, Shazam/AudD track identification, and
+scheduled publishing have all shipped. See [ROADMAP.md](ROADMAP.md) for what is
+done and what is next.
+
+## Contributing
+
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md)
+for setup, the test commands, and the couple of things worth being careful with.
+
+## Security
+
+fade-out ships no authentication of its own; the deployment model is the
+security boundary. Please read [SECURITY.md](SECURITY.md) before exposing it
+anywhere, and report vulnerabilities privately rather than in a public issue.
 
 ## License
 

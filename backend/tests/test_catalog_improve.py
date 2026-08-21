@@ -272,7 +272,7 @@ class TestRunImprove:
     async def test_generic_mix_gets_title_and_description_drafts(
         self, prepared_db, fake_llm
     ):
-        mix_id = await _make_mix()
+        await _make_mix()
         summary = await run_improve("all_generic")
 
         assert summary["generic"] == 1
@@ -775,3 +775,62 @@ class TestUnifiedCatalogTitles:
             c for g in FakeGenerator.instances for c in g.calls if "triaging" not in c
         ]
         assert len(draft_prompts) == 2  # the claimed title forced a retry
+
+
+class TestBrandingIsConfigurable:
+    """Retired show wording is per-channel, so it comes from settings.
+
+    The defaults are the original author's own Twitch-era show names; anyone
+    else needs their own. These tests cover the assembly, not the defaults.
+    """
+
+    def test_configured_series_name_is_detected(self, monkeypatch):
+        from app.services import catalog_improve as ci
+
+        monkeypatch.setattr(ci.settings, "CATALOG_SERIES_NAMES", "Basement Fridays")
+        monkeypatch.setattr(ci.settings, "CATALOG_CHANNEL_NAME", "")
+        patterns = ci._build_banned_title_patterns()
+
+        assert any(p.search("Basement Fridays | House Mix") for _, p in patterns)
+        # Singular and the dash spelling are the same series.
+        assert any(p.search("Basement Friday") for _, p in patterns)
+        assert any(p.search("Basement-Fridays") for _, p in patterns)
+
+    def test_ordinal_spellings_are_equivalent(self, monkeypatch):
+        from app.services import catalog_improve as ci
+
+        monkeypatch.setattr(ci.settings, "CATALOG_SERIES_NAMES", "Third Thursdays")
+        monkeypatch.setattr(ci.settings, "CATALOG_CHANNEL_NAME", "")
+        patterns = ci._build_banned_title_patterns()
+
+        assert any(p.search("Third Thursdays") for _, p in patterns)
+        assert any(p.search("3rd Thursdays") for _, p in patterns)
+
+    def test_channel_name_matches_only_as_a_prefix(self, monkeypatch):
+        from app.services import catalog_improve as ci
+
+        monkeypatch.setattr(ci.settings, "CATALOG_SERIES_NAMES", "")
+        monkeypatch.setattr(ci.settings, "CATALOG_CHANNEL_NAME", "Night Owl")
+        patterns = ci._build_banned_title_patterns()
+
+        assert any(p.search("Night Owl | Techno Mix") for _, p in patterns)
+        # Mid-title use is part of the creative hook, not a channel prefix.
+        assert not any(p.search("Dancing With A Night Owl") for _, p in patterns)
+
+    def test_empty_branding_keeps_the_universal_markers(self, monkeypatch):
+        from app.services import catalog_improve as ci
+
+        monkeypatch.setattr(ci.settings, "CATALOG_SERIES_NAMES", "")
+        monkeypatch.setattr(ci.settings, "CATALOG_CHANNEL_NAME", "")
+        patterns = ci._build_banned_title_patterns()
+
+        reasons = [r for r, _ in patterns]
+        assert reasons == ['contains "Raid Train"', "contains a date"]
+        assert any(p.search("Raid Train hour 3") for _, p in patterns)
+        assert any(p.search("Live 2024-05-01") for _, p in patterns)
+
+    def test_series_names_are_parsed_and_trimmed(self):
+        from app.config import Settings
+
+        cfg = Settings(_env_file=None, CATALOG_SERIES_NAMES=" A Nights , B Days ,, ")
+        assert cfg.catalog_series_names == ["A Nights", "B Days"]
