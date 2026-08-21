@@ -7,7 +7,6 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import websockets
@@ -287,7 +286,14 @@ class DJCTLWebSocketListener:
         self._task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
-        """Start listening in background."""
+        """Start listening in background.
+
+        No-op when no WebSocket URL is configured: the live DJCTL feed is
+        opt-in, and without a URL there is nothing to connect to.
+        """
+        if not self._ws_url:
+            logger.info("DJCTL WebSocket listener not started: DJCTL_WS_URL is unset")
+            return
         self._running = True
         self._task = asyncio.create_task(self._listen())
         logger.info("DJCTL WebSocket listener started: %s", self._ws_url)

@@ -1,6 +1,5 @@
 """Tests for the WebSocket ConnectionManager fan-out (no real sockets)."""
 
-import pytest
 
 from app.routers.ws import ConnectionManager
 

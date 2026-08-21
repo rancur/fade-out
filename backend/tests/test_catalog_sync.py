@@ -6,7 +6,6 @@ YouTubeUploader._get_service, SoundCloud via a monkeypatched httpx.AsyncClient
 DescriptionGenerator.
 """
 
-import json
 from datetime import datetime, timezone
 
 import pytest

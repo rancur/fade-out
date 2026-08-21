@@ -32,7 +32,6 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select
 
-from app.config import settings
 from app.database import async_session_factory
 from app.models import AppSettings, Mix, MixProposal
 from app.services import activity_log

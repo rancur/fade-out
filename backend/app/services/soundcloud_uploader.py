@@ -7,7 +7,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 import httpx
-from playwright.async_api import BrowserContext, Page, async_playwright
+from playwright.async_api import Page, async_playwright
 
 from app.config import settings
 from app.services.platform_errors import PlatformAuthError
@@ -20,6 +20,9 @@ SOUNDCLOUD_WEB_BASE = "https://soundcloud.com"
 
 BROWSER_PROFILE_DIR = "/data/playwright-profile"
 VIEWPORT = {"width": 1920, "height": 1080}
+# Browser timezone for the automation context. Follows the container's TZ so
+# scheduled-time handling matches the operator's locale rather than a fixed one.
+BROWSER_TIMEZONE = os.environ.get("TZ") or "UTC"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -634,7 +637,7 @@ class SoundCloudUploader:
             viewport=VIEWPORT,
             user_agent=USER_AGENT,
             locale="en-US",
-            timezone_id="America/Phoenix",
+            timezone_id=BROWSER_TIMEZONE,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",

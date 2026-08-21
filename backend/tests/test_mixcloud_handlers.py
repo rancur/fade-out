@@ -2,7 +2,6 @@
 
 from types import SimpleNamespace
 
-import pytest
 
 import app.services.handlers as handlers
 from app.services.handlers import (

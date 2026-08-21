@@ -4,7 +4,6 @@ Covers both arrival orders, expiry (audio-only proceeds, video-only is dropped),
 and duplicate-drop protection.
 """
 
-import os
 
 import pytest
 

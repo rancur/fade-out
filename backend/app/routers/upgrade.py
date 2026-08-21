@@ -3,14 +3,12 @@
 import logging
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.services.upgrade_service import (
-    BACKUP_DIR,
     UpgradeService,
     _get_current_version,
     deployment_status,

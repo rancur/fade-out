@@ -26,7 +26,7 @@ services:
       # Persistent data
       - ./data:/data
     environment:
-      - TZ=America/Phoenix
+      - TZ=${TZ:-UTC}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - FAL_API_KEY=${FAL_API_KEY}
       - SOUNDCLOUD_EMAIL=${SOUNDCLOUD_EMAIL}

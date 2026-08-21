@@ -6,7 +6,6 @@ min-level, the write-only SMTP password on the settings API, and the
 per-channel test endpoint.
 """
 
-import pytest
 from sqlalchemy import select
 
 from app.config import settings
@@ -46,13 +45,13 @@ class TestResolveConfigPrecedence:
         assert cfg["email_smtp_host"] is None
 
     def test_email_from_falls_back_to_smtp_user(self):
-        cfg = resolve_config({"notification_email_smtp_user": "barry@x.com"})
-        assert cfg["email_from"] == "barry@x.com"
+        cfg = resolve_config({"notification_email_smtp_user": "dj@example.com"})
+        assert cfg["email_from"] == "dj@example.com"
         cfg2 = resolve_config({
-            "notification_email_smtp_user": "barry@x.com",
-            "notification_email_from": "noreply@x.com",
+            "notification_email_smtp_user": "dj@example.com",
+            "notification_email_from": "noreply@example.com",
         })
-        assert cfg2["email_from"] == "noreply@x.com"
+        assert cfg2["email_from"] == "noreply@example.com"
 
     def test_webhook_urls_parsed_from_csv(self):
         cfg = resolve_config({"notification_webhook_urls": "https://a/1, https://b/2 ,"})
@@ -212,12 +211,12 @@ class TestSettingsAPI:
     async def test_roundtrip_with_write_only_password(self, client):
         put = await client.put("/api/notifications/settings", json={
             "discord_webhook_url": "https://discord.example/hook",
-            "email_smtp_host": "smtp.seer.example",
+            "email_smtp_host": "smtp.example.com",
             "email_smtp_port": 587,
-            "email_smtp_user": "will@seer.example",
+            "email_smtp_user": "dj@example.com",
             "email_smtp_password": "hunter2",
-            "email_from": "fadeout@seer.example",
-            "email_to": "flash@willcurran.com",
+            "email_from": "fadeout@example.com",
+            "email_to": "alerts@example.com",
             "email_smtp_secure": True,
             "webhook_urls": "https://hooks.example/a",
             "events": {"step_completed": True},
@@ -226,8 +225,8 @@ class TestSettingsAPI:
         assert put.status_code == 200
         body = put.json()
         assert body["discord_webhook_url"] == "https://discord.example/hook"
-        assert body["email_smtp_host"] == "smtp.seer.example"
-        assert body["email_from"] == "fadeout@seer.example"
+        assert body["email_smtp_host"] == "smtp.example.com"
+        assert body["email_from"] == "fadeout@example.com"
         assert body["has_password"] is True
         assert "hunter2" not in put.text
         assert "email_smtp_password" not in body
@@ -246,10 +245,10 @@ class TestSettingsAPI:
         })
         # Update an unrelated field without resending the password.
         resp = await client.put("/api/notifications/settings", json={
-            "email_to": "flash@willcurran.com",
+            "email_to": "alerts@example.com",
         })
         assert resp.json()["has_password"] is True
-        assert resp.json()["email_to"] == "flash@willcurran.com"
+        assert resp.json()["email_to"] == "alerts@example.com"
 
     async def test_invalid_min_level_rejected(self, client):
         resp = await client.put("/api/notifications/settings", json={"min_level": "loud"})

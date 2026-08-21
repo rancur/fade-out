@@ -1,0 +1,21 @@
+# Conservative, high-signal lint configuration.
+#
+# This is ruff's default rule set (pyflakes + a slice of pycodestyle): real
+# problems like undefined names, unused imports, and broken f-strings. Style and
+# import-ordering rules are deliberately left off — the codebase predates any
+# linter and mass-reformatting it would bury real changes in noise.
+line-length = 100
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    # Imports below the top of a file are deliberate in a few places: settings
+    # must be loaded before the modules that read them at import time.
+    "E402",
+]
+
+[lint.per-file-ignores]
+# One-off maintenance scripts, written in a compact throwaway style.
+"backend/scripts/*" = ["E401", "E702"]
+# Package re-exports.
+"**/__init__.py" = ["F401"]

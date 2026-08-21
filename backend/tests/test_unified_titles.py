@@ -226,7 +226,7 @@ class TestUnifiedTitleGeneration:
         assert title == "Mirage Reverberation | Drum & Bass Mix"
 
     async def test_abstract_brand_voice_survives(self, prepared_db, monkeypatch):
-        # Will's evocative style is the point — the genre rides along with it,
+        # The operator's evocative style is the point — the genre rides along with it,
         # it does not replace it.
         mid = await _add_mix(title="Untitled")
         gen, _ = _generator(monkeypatch, ["Neon Cactus After Dark"])

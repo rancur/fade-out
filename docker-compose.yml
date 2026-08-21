@@ -16,25 +16,30 @@ services:
     ports:
       - "8500:8000"
     volumes:
-      # Audio + video watch folders on NAS. READ-WRITE so the optional
-      # "Rename source files to match titles" setting (Settings -> Advanced,
-      # OFF by default) can rename finished recordings in place. Change these
-      # back to :ro if you never want fade-out to touch the source files — with
-      # the setting on and a :ro mount every rename is simply skipped and
-      # logged, and nothing else about the pipeline changes.
-      - /volume1/music/DJ Will See:/watch/audio:rw
-      - /volume1/twitch/Recordings:/watch/video:rw
-      - /volume1/homes/willcurran/djctl/cue-sheets:/watch/djctl-cue:ro
-      # Vertical OBS Backtrack clips for the Shorts auto-uploader (READ-ONLY —
-      # the pipeline only ever reads the source recordings)
-      - /volume1/twitch/Vertical Backtrack:/watch/shorts:ro
-      # Output folders on NAS
-      - /volume1/homes/willcurran/will-see/youtube-thumbnails:/output/thumbnails
-      - /volume1/homes/willcurran/will-see/soundcloud-cover-art:/output/cover-art
+      # Host paths come from .env so this file works unmodified on any machine.
+      # Defaults drop everything under ./media/ next to the compose file; point
+      # them at your NAS shares (e.g. /volume1/music/mixes) by setting the
+      # matching variables in .env.
+      #
+      # Audio + video watch folders are READ-WRITE so the optional "Rename
+      # source files to match titles" setting (Settings -> Advanced, OFF by
+      # default) can rename finished recordings in place. Change them to :ro if
+      # you never want fade-out to touch the source files — with the setting on
+      # and a :ro mount every rename is simply skipped and logged, and nothing
+      # else about the pipeline changes.
+      - ${WATCH_AUDIO_DIR:-./media/audio}:/watch/audio:rw
+      - ${WATCH_VIDEO_DIR:-./media/video}:/watch/video:rw
+      - ${WATCH_CUE_DIR:-./media/cue-sheets}:/watch/djctl-cue:ro
+      # Vertical clips for the Shorts auto-uploader (READ-ONLY — the pipeline
+      # only ever reads the source recordings)
+      - ${WATCH_SHORTS_DIR:-./media/shorts}:/watch/shorts:ro
+      # Output folders
+      - ${OUTPUT_THUMBNAILS_DIR:-./media/thumbnails}:/output/thumbnails
+      - ${OUTPUT_COVER_ART_DIR:-./media/cover-art}:/output/cover-art
       # Persistent data (SQLite DB, state, tokens)
       - ./data:/data
     environment:
-      - TZ=America/Phoenix
+      - TZ=${TZ:-UTC}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - FAL_API_KEY=${FAL_API_KEY}
       - SOUNDCLOUD_CLIENT_ID=${SOUNDCLOUD_CLIENT_ID}
@@ -54,6 +59,11 @@ services:
       # private repo the check could only ever answer "cannot determine".
       # Optional: unset, the check stays honestly unknown rather than green.
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+    # Run unprivileged if your bind mounts allow it. Left commented because the
+    # container must be able to read the watch folders and write the output
+    # folders, and the right UID/GID depends on your NAS share permissions.
+    # See SECURITY.md.
+    # user: "1000:1000"
     mem_limit: 4g
     logging:
       driver: json-file

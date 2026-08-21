@@ -19,7 +19,7 @@ Design goals:
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from sqlalchemy import delete, desc, func, select
 

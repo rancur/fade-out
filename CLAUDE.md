@@ -25,10 +25,27 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 ## Testing
-No test suite exists yet. When adding tests:
-- Use `pytest` for backend tests
-- Place tests in `backend/tests/` or `tests/`
-- Run with: `python3 -m pytest tests/ -v`
+The project has a substantial test suite. Keep it green and add to it.
+
+```bash
+# Backend — 993 tests, ~45s. Requires Python 3.12 (see below) and ffmpeg.
+cd backend && python -m pytest -q
+
+# Frontend — 30 tests, plus typecheck and build
+cd frontend && npm test && npx tsc --noEmit && npm run build
+```
+
+- Backend tests live in `backend/tests/`, config in `backend/pytest.ini`
+  (`asyncio_mode = auto`, so async tests need no decorator).
+- Frontend tests live beside their components in `__tests__/` directories.
+- Tests must never make live calls to SoundCloud, YouTube, or Mixcloud — mock
+  the client, as the existing tests do. Uploads hit real accounts.
+- All of the above runs in CI (`.github/workflows/ci.yml`).
+
+## Python Version
+Use **Python 3.12** — the version the Dockerfile ships. Python 3.13+ removed the
+stdlib `audioop` module that `pydub` (via `shazamio`) imports at start-up, so
+the backend does not run there.
 
 ## Coding Standards
 - **Python**: Follow PEP 8. Use type hints. FastAPI dependency injection patterns.
@@ -50,7 +67,7 @@ The Dockerfile is a two-stage build:
 Health check: `GET /api/health` on port 8000.
 
 ## Environment Variables
-All secrets are passed via environment variables (never committed):
+All secrets are passed via environment variables (never committed). `.env.example` is the complete, documented list; the highlights:
 - `OPENAI_API_KEY` — AI-powered metadata generation
 - `FAL_API_KEY` — Image generation for thumbnails
 - `SOUNDCLOUD_*` — SoundCloud OAuth credentials

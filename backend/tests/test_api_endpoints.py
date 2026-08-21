@@ -6,7 +6,6 @@ pipeline launch methods are stubbed, so these assert the HTTP + DB behavior of
 the routers, not the background pipeline.
 """
 
-import pytest
 
 
 class TestHealth:

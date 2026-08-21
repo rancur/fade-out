@@ -35,24 +35,12 @@ fi
 info "Using: $COMPOSE"
 
 # ---------------------------------------------------------------------------
-# NAS directory creation (if paths exist)
+# Media directory creation
+#
+# Each of these is a host path that docker-compose.yml bind-mounts into the
+# container. They default to ./media/* next to the compose file; override any
+# of them in .env to point at a NAS share instead (see .env.example).
 # ---------------------------------------------------------------------------
-NAS_DIRS=(
-    "/volume1/will-see/YouTube Thumbnails"
-    "/volume1/will-see/SoundCloud Cover Art"
-)
-
-for dir in "${NAS_DIRS[@]}"; do
-    parent=$(dirname "$dir")
-    if [ -d "$parent" ]; then
-        if [ ! -d "$dir" ]; then
-            info "Creating NAS directory: $dir"
-            mkdir -p "$dir"
-        else
-            info "NAS directory exists: $dir"
-        fi
-    fi
-done
 
 # ---------------------------------------------------------------------------
 # Local data directory
@@ -64,6 +52,30 @@ cd "$PROJECT_DIR"
 
 info "Creating local data directory..."
 mkdir -p data
+
+# Load any host-path overrides the user has already set in .env.
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+fi
+
+info "Creating media directories..."
+for dir in \
+    "${WATCH_AUDIO_DIR:-./media/audio}" \
+    "${WATCH_VIDEO_DIR:-./media/video}" \
+    "${WATCH_CUE_DIR:-./media/cue-sheets}" \
+    "${WATCH_SHORTS_DIR:-./media/shorts}" \
+    "${OUTPUT_THUMBNAILS_DIR:-./media/thumbnails}" \
+    "${OUTPUT_COVER_ART_DIR:-./media/cover-art}"; do
+    if [ -d "$dir" ]; then
+        info "  exists:  $dir"
+    else
+        info "  creating: $dir"
+        mkdir -p "$dir"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Environment file
@@ -100,7 +112,7 @@ else
 
     $SED_INPLACE "s|OPENAI_API_KEY=sk-...|OPENAI_API_KEY=${openai_key}|" .env
     $SED_INPLACE "s|FAL_API_KEY=fal-...|FAL_API_KEY=${fal_key}|" .env
-    $SED_INPLACE "s|SOUNDCLOUD_EMAIL=your@email.com|SOUNDCLOUD_EMAIL=${sc_email}|" .env
+    $SED_INPLACE "s|SOUNDCLOUD_EMAIL=you@example.com|SOUNDCLOUD_EMAIL=${sc_email}|" .env
     $SED_INPLACE "s|SOUNDCLOUD_PASSWORD=your-password|SOUNDCLOUD_PASSWORD=${sc_pass}|" .env
     $SED_INPLACE "s|YOUTUBE_CLIENT_ID=your-client-id.apps.googleusercontent.com|YOUTUBE_CLIENT_ID=${yt_client_id}|" .env
     $SED_INPLACE "s|YOUTUBE_CLIENT_SECRET=your-client-secret|YOUTUBE_CLIENT_SECRET=${yt_client_secret}|" .env

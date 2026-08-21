@@ -3,11 +3,10 @@
 import json
 from types import SimpleNamespace
 
-import pytest
 from sqlalchemy import select
 
 from app.models import Mix, UsedCreative
-from app.services import thumbnail_design, uniqueness
+from app.services import thumbnail_design
 from app.services.uniqueness import (
     KIND_HOOK,
     KIND_SCENE,

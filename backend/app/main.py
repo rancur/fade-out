@@ -182,11 +182,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow all for local use
+# CORS — explicit allowlist, not "*".
+#
+# The dashboard is served from the same origin as the API, so normal use needs
+# no entry at all; the defaults cover the Vite dev server, and PUBLIC_URL is
+# folded in automatically. Because the API is unauthenticated, a wildcard here
+# would let any site the operator visits read their stored credentials and
+# drive their pipeline. Configure via CORS_ALLOW_ORIGINS.
+_cors_origins = settings.cors_allow_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials="*" not in _cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

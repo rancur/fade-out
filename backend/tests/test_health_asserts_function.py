@@ -17,7 +17,6 @@ from app.services.platform_health import (
     CredentialState,
     PlatformHealth,
 )
-from app.services.platform_errors import PlatformAuthError
 
 
 def _state(platform, state, **kw):
