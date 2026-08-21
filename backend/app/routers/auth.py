@@ -30,6 +30,13 @@ async def _emit_auth(level: str, event: str, message: str, **kwargs) -> None:
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
+# Google blocks private-IP (LAN) redirect URIs for the OAuth loopback flow unless the
+# authorization request carries a stable device_id + human-readable device_name.
+# fade-out runs on the NAS LAN IP, so we always send these. device_id is a fixed,
+# deterministic UUID (stable across restarts); do not randomize it.
+FADEOUT_DEVICE_ID = "39598050-d99d-5d74-8260-983d3f88e82b"
+FADEOUT_DEVICE_NAME = "fade-out-nas"
+
 YOUTUBE_OAUTH_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube",
@@ -623,6 +630,9 @@ async def youtube_oauth_url(
         "scope": " ".join(YOUTUBE_OAUTH_SCOPES),
         "access_type": "offline",
         "prompt": "consent",
+        # Required by Google to permit a private-IP (LAN) redirect_uri.
+        "device_id": FADEOUT_DEVICE_ID,
+        "device_name": FADEOUT_DEVICE_NAME,
     }
     url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
     return OAuthURL(url=url, redirect_uri=redirect_uri)
