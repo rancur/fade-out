@@ -10,10 +10,34 @@ on:
 
 jobs:
   claude:
+    # TRUST GATE — do not remove.
+    #
+    # This repository is public, and this job runs Claude with write access to
+    # the repo plus the owner's CLAUDE_CODE_OAUTH_TOKEN. Without the author
+    # check below, any stranger could trigger it by opening an issue or
+    # commenting "@claude", spending the owner's Claude quota and steering an
+    # agent that can push branches and open pull requests.
+    #
+    # Only the repo owner, org members, and invited collaborators can start it.
+    # Note that `pull_request` (as opposed to `pull_request_target`) already
+    # withholds secrets from fork PRs; the association check is what closes the
+    # issue and comment paths.
+    # The association lives on the issue / pull request / comment object —
+    # `github.event.sender.author_association` does not exist and evaluates to
+    # empty, which would silently disable this workflow for everyone.
     if: |
-      (github.event_name == 'issues' && github.event.action == 'opened') ||
-      (github.event_name == 'pull_request') ||
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude'))
+      (
+        github.event_name == 'issues' &&
+        github.event.action == 'opened' &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association)
+      ) || (
+        github.event_name == 'pull_request' &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+      ) || (
+        github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -6,7 +6,7 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -490,7 +490,7 @@ async def soundcloud_callback(
 
         if resp.status_code != 200:
             logger.error("SoundCloud code exchange failed: %s", resp.text[:300])
-            return RedirectResponse(url=f"/settings?auth=soundcloud&error=code_exchange_failed")
+            return RedirectResponse(url="/settings?auth=soundcloud&error=code_exchange_failed")
 
         token_data = resp.json()
         access_token = token_data.get("access_token", "")
@@ -679,9 +679,18 @@ async def youtube_callback(
             )
 
         if resp.status_code != 200:
-            error_detail = resp.json().get("error_description", "unknown")
-            logger.error("YouTube code exchange failed: %s", resp.text[:300])
-            return RedirectResponse(url=f"/settings?auth=youtube&error=code_exchange_failed")
+            # Google returns a JSON body with a human-readable reason; fall back
+            # to the raw text when the response is not JSON at all.
+            try:
+                error_detail = resp.json().get("error_description", "unknown")
+            except ValueError:
+                error_detail = resp.text[:300]
+            logger.error(
+                "YouTube code exchange failed (HTTP %s): %s",
+                resp.status_code,
+                error_detail,
+            )
+            return RedirectResponse(url="/settings?auth=youtube&error=code_exchange_failed")
 
         token_data = resp.json()
         refresh_token = token_data.get("refresh_token")

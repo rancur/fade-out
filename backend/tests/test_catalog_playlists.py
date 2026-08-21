@@ -107,7 +107,7 @@ class TestFindMatchingPlaylist:
         assert find_matching_playlist("House", pls)["id"] == "x"
 
     def test_partial_token_playlist_matches_wider_bucket(self):
-        # Will's existing "EDM Mixes" is respected for the EDM & Big Room bucket
+        # A pre-existing "EDM Mixes" playlist is respected for the EDM & Big Room bucket
         pls = [{"id": "e", "title": "EDM Mixes"}]
         assert find_matching_playlist("EDM & Big Room", pls)["id"] == "e"
 

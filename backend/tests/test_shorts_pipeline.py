@@ -2,7 +2,7 @@
 
 import json
 import os
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest

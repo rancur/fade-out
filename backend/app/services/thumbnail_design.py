@@ -58,7 +58,7 @@ _BUNDLED_FONT_PATH = os.path.normpath(
 # ---------------------------------------------------------------------------
 # One dramatic desert-psychedelic focal subject per genre bucket, each with an
 # eye motif, a distinct <=3-word hook, and an accent from the brand palette.
-# The first five are Will's approved prototypes, ported verbatim.
+# The first five are the original approved prototypes, ported verbatim.
 
 GENRE_MOTIFS: Dict[str, Dict[str, object]] = {
     "drum and bass": {

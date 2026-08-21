@@ -1,6 +1,6 @@
 """Application configuration using pydantic-settings."""
 
-from typing import List, Optional
+from typing import List
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,7 +28,9 @@ class Settings(BaseSettings):
     OUTPUT_THUMBNAILS_PATH: str = "/output/thumbnails"
     OUTPUT_COVER_ART_PATH: str = "/output/cover-art"
     DJCTL_CUE_PATH: str = "/watch/djctl-cue"
-    DJCTL_WS_URL: str = "ws://192.168.1.221:8081/ws"
+    # Optional live DJCTL WebSocket feed. Empty = disabled (the default);
+    # set it to your DJCTL host, e.g. "ws://192.0.2.10:8081/ws".
+    DJCTL_WS_URL: str = ""
 
     # --- Database ---
     DATABASE_URL: str = "sqlite:////data/fadeout.db"
@@ -165,6 +167,46 @@ class Settings(BaseSettings):
 
     # --- Public URL (required for OAuth callbacks with Google/SoundCloud) ---
     PUBLIC_URL: str = ""  # e.g. https://fadeout.example.com — must be a real domain for Google OAuth
+
+    # --- Back-catalog title cleanup ---
+    # Retired show/stream wording stripped from imported back-catalog titles.
+    #
+    # The defaults are this project author's own legacy Twitch-era show names,
+    # kept so existing deployments behave unchanged. THEY ARE ALMOST CERTAINLY
+    # NOT YOURS — set both to your own channel name and series names, or to
+    # empty strings if you have none. A phrase that never matches simply does
+    # nothing, so leaving the defaults in place is harmless but useless.
+    #
+    # The universal generic markers (raid train, twitch, untitled, bare dates)
+    # are always applied and are not configurable.
+    CATALOG_CHANNEL_NAME: str = "Will See"
+    CATALOG_SERIES_NAMES: str = "Will See Wednesdays,Second Saturdays"
+
+    @property
+    def catalog_series_names(self) -> List[str]:
+        """Series names to strip from back-catalog titles."""
+        return [n.strip() for n in self.CATALOG_SERIES_NAMES.split(",") if n.strip()]
+
+    # --- CORS ---
+    # Comma-separated list of browser origins allowed to call the API with
+    # credentials. The dashboard is served from the same origin as the API in
+    # production, so it needs no entry here; the defaults exist only for the
+    # Vite dev server. PUBLIC_URL, when set, is added automatically.
+    #
+    # Deliberately NOT "*": this API is unauthenticated (see SECURITY.md), so a
+    # wildcard would let any website a user happens to visit read their stored
+    # credentials and drive their pipeline. Set to "*" only if you fully
+    # understand that trade-off.
+    CORS_ALLOW_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    @property
+    def cors_allow_origins(self) -> List[str]:
+        """Parsed CORS origin allowlist, with PUBLIC_URL folded in."""
+        origins = [o.strip() for o in self.CORS_ALLOW_ORIGINS.split(",") if o.strip()]
+        public = self.PUBLIC_URL.strip().rstrip("/")
+        if public and public not in origins:
+            origins.append(public)
+        return origins
 
     # --- Logging ---
     LOG_LEVEL: str = "INFO"

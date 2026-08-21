@@ -2,12 +2,9 @@
 
 import sqlite3
 
-import pytest
 
 from app.services.file_watcher import (
     MIN_AUDIO_FILE_BYTES,
-    STATUS_DONE,
-    STATUS_PROCESSING,
     FileWatcherService,
     _compute_file_hash,
     _SeenFilesDB,
@@ -206,7 +203,8 @@ class TestScanExistingGate:
 
         audio = tmp_path / "audio"
         video = tmp_path / "video"
-        audio.mkdir(); video.mkdir()
+        audio.mkdir()
+        video.mkdir()
         (audio / "old.flac").write_bytes(b"x")
 
         async def _noop(_p):

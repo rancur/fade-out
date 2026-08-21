@@ -253,3 +253,25 @@ class TestMergeTracklists:
         result = merge_tracklists(cue_tracks=None, shazam_tracks=None)
         assert result.source == "none"
         assert result.tracklist == []
+
+
+class TestWebSocketListenerIsOptIn:
+    """The live DJCTL feed is opt-in; DJCTL_WS_URL is empty by default.
+
+    Without a guard, an unset URL would start a background task that
+    reconnect-loops against nothing for the life of the process.
+    """
+
+    async def test_start_is_a_noop_without_a_url(self):
+        from app.services.djctl_integration import DJCTLWebSocketListener
+
+        listener = DJCTLWebSocketListener(ws_url="")
+        await listener.start()
+        assert listener._task is None
+        assert listener._running is False
+        await listener.stop()  # must stay safe when nothing was started
+
+    async def test_default_config_does_not_enable_the_feed(self):
+        from app.config import Settings
+
+        assert Settings(_env_file=None).DJCTL_WS_URL == ""
