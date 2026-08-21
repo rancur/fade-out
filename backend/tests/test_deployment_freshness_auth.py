@@ -1,8 +1,10 @@
 """The freshness check must not turn "I cannot see the repo" into "up to date".
 
-``rancur/fade-out`` is private. GitHub answers **404** — not 403 — both for a
-repo with no releases and for a repo the caller has no access to, so a 404 is
-only an answer once we know the credential can actually see the repository.
+GitHub answers **404** — not 403 — both for a repo with no releases and for a
+repo the caller has no access to, so a 404 is only an answer once we know the
+credential can actually see the repository. ``rancur/fade-out`` is public now,
+so its own check needs no credential, but ``GITHUB_REPO`` is configurable and
+the private case is the one that goes wrong quietly.
 
 Three failures are covered here, in the order they were found:
 
