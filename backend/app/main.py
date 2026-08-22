@@ -36,7 +36,11 @@ from app.services.file_watcher import FileWatcherService
 from app.services.handlers import register_all_handlers
 from app.services.ingest import IngestCoordinator
 from app.services.notification_service import get_notification_service
-from app.services.pipeline import PipelineOrchestrator, sweep_interrupted_at_boot
+from app.services.pipeline import (
+    PipelineOrchestrator,
+    resume_interrupted_at_boot,
+    sweep_interrupted_at_boot,
+)
 from app.services.platform_health import get_platform_health
 from app.services.shorts_pipeline import get_shorts_service
 from app.services.stuck_mix_watchdog import get_stuck_mix_watchdog
@@ -60,8 +64,9 @@ async def lifespan(app: FastAPI):
     logger.info("Database ready.")
 
     # Startup sweep: anything still marked "running" was cut off by the last
-    # shutdown (no orchestrator task can exist at boot). Steps become
-    # "interrupted", their mixes "failed" with a retryable error.
+    # shutdown (no orchestrator task can exist at boot). Steps and their mixes
+    # become "interrupted" — a restart says nothing about the mix, so it is
+    # never terminal.
     await sweep_interrupted_at_boot()
 
     # Register all pipeline step handlers
@@ -131,6 +136,14 @@ async def lifespan(app: FastAPI):
         catalog.kickoff_backfill_auto_resume()
     )
 
+    # Pipeline self-heal: re-drive the mixes the boot sweep just parked in
+    # "interrupted". A crash mid-pipeline used to be permanent silent loss —
+    # the mix sat there failed and the set never published. Bounded inside
+    # (MAX_INTERRUPT_RESUMES) so a mix that kills the process cannot loop.
+    interrupted_resume_task = asyncio.create_task(
+        resume_interrupted_at_boot(orchestrator)
+    )
+
     # Credential health: probes each configured platform's auth on a timer so
     # /api/health can assert real function instead of process liveness.
     platform_health = get_platform_health()
@@ -158,6 +171,11 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     await shorts_service.stop_watcher()
+    interrupted_resume_task.cancel()
+    try:
+        await interrupted_resume_task
+    except asyncio.CancelledError:
+        pass
     backfill_resume_task.cancel()
     try:
         await backfill_resume_task

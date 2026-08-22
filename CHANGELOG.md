@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### An interrupted mix is resumed, not quietly buried
+
+On 2026-08-21 the container was OOM-killed at 4.19 GB while analyzing a long
+set. Two failures compounded: the memory ceiling was too low for the work, and
+the boot sweep then marked the in-flight mix **failed** and never touched it
+again. The set simply never published, and nobody found out for days.
+
+- **`mem_limit` raised 4g → 12g.** Analysis of a multi-hour set is the memory
+  high-water mark and 4g did not cover it. An OOM kill mid-pipeline is data
+  loss, not a slowdown, so the ceiling now carries real headroom.
+- **The boot sweep no longer fails an interrupted mix.** A restart says
+  nothing about the mix, only about the process. Mixes cut off mid-flight are
+  parked in `interrupted` (already a retryable, UI-visible status) instead of
+  `failed`.
+- **`resume_interrupted_at_boot` re-drives them.** Shortly after startup, every
+  interrupted mix has its interrupted/failed/blocked steps reset and its
+  pipeline restarted — completed steps are not redone. Gated by the new
+  **Resume interrupted mixes** setting (Advanced, on by default).
+- **Bounded, so a poisonous mix cannot loop.** Each automatic resume is counted
+  in `metadata_json.interrupt_resumes`; after 3 the mix is left `failed` with
+  an explicit reason and an error-level activity entry. Manual retries are not
+  spent against the bound.
+- Interrupted mixes stay counted in the dashboard's failed bucket
+  (`/api/pipeline/status` and the WS snapshot) rather than vanishing from every
+  bucket while they wait, and the stuck-mix watchdog still reports them.
+
 ### Prepared for public release
 
 fade-out is now a public repository. Nothing about the pipeline changed; this

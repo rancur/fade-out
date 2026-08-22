@@ -397,6 +397,18 @@ SETTINGS_SCHEMA: Tuple[SettingDef, ...] = (
         type="bool", category="Advanced", fallback=True,
     ),
     SettingDef(
+        key="resume_interrupted_mixes",
+        label="Resume interrupted mixes",
+        help="Automatically re-drive a mix whose pipeline was cut off by a "
+             "restart, crash or OOM kill. Without this a transient crash is "
+             "permanent silent loss: the mix sits interrupted and the set never "
+             "publishes. Bounded — after 3 automatic resumes a mix is left "
+             "failed for a human, so a mix that kills the process cannot loop. "
+             "Off, interrupted mixes stay retryable by hand and are still "
+             "reported by the stuck-mix watchdog.",
+        type="bool", category="Advanced", fallback=True,
+    ),
+    SettingDef(
         key="mixcloud_enabled",
         label="Mixcloud uploads",
         help="Enable the optional Mixcloud publishing target (requires an access "
