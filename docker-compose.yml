@@ -43,7 +43,10 @@ services:
       - YOUTUBE_REFRESH_TOKEN=${YOUTUBE_REFRESH_TOKEN}
       - PUBLIC_URL=${PUBLIC_URL}
       - NOTIFICATION_DISCORD_WEBHOOK_URL=${NOTIFICATION_DISCORD_WEBHOOK_URL}
-    mem_limit: 4g
+    # 4g was not enough: on 2026-08-21 the container was OOM-killed at
+    # 4.19 GB while analyzing a long set and the mix never published.
+    # Matches main. This branch is stale — deploy from main.
+    mem_limit: 12g
     logging:
       driver: json-file
       options:
