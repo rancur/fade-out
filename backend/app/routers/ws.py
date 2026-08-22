@@ -98,7 +98,9 @@ async def status_snapshot() -> Dict[str, int]:
             "active": await _count(_ACTIVE_STATUSES),
             "queued": await _count(_QUEUED_STATUSES),
             "completed": await _count(["completed"]),
-            "failed": await _count(["failed"]),
+            # See routers/pipeline.pipeline_status: an interrupted mix has not
+            # shipped either, so it stays counted rather than disappearing.
+            "failed": await _count(["failed", "interrupted"]),
         }
 
 

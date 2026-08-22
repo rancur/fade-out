@@ -260,7 +260,9 @@ class TestInterruptedSweep:
         async with async_session_factory() as session:
             m1 = await session.get(Mix, "m1")
             m2 = await session.get(Mix, "m2")
-            assert m1.pipeline_status == "failed"
+            # NOT "failed": a restart says nothing about the mix. The boot
+            # resume re-drives it from here (test_interrupted_resume.py).
+            assert m1.pipeline_status == "interrupted"
             assert m1.pipeline_error == "interrupted by restart"
             assert m2.pipeline_status == "completed"
 

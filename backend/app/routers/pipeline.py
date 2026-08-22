@@ -50,7 +50,10 @@ async def pipeline_status(db: AsyncSession = Depends(get_db)):
     active_statuses = ["analyzing", "generating", "uploading_soundcloud", "uploading_youtube", "verifying"]
     queued_statuses = ["pending"]
     completed_statuses = ["completed"]
-    failed_statuses = ["failed"]
+    # "interrupted" counts here too: a mix a restart cut off is awaiting an
+    # automatic resume, and until it lands it is a mix that has not shipped.
+    # Leaving it out of every bucket is how it would vanish from the dashboard.
+    failed_statuses = ["failed", "interrupted"]
 
     active_result = await db.execute(
         select(sa_func.count()).select_from(Mix).where(Mix.pipeline_status.in_(active_statuses))

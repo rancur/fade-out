@@ -1252,14 +1252,38 @@ class PipelineOrchestrator:
         return list(self._running_pipelines.keys())
 
 
+# --------------------------------------------------------------------------
+# Boot recovery
+# --------------------------------------------------------------------------
+
+# A mix cut off by a restart is re-driven automatically, but only so many
+# times. A mix that reliably kills the process (an OOM on analysis, say) must
+# not turn into a restart loop, so after this many automatic resumes it is
+# left "failed" for a human with the reason spelled out.
+MAX_INTERRUPT_RESUMES = 3
+
+# Let the app finish wiring handlers and watchers before re-driving anything,
+# and stagger the resumes so several interrupted mixes do not all start heavy
+# analysis at the same moment.
+RESUME_SETTLE_SECONDS = 20.0
+RESUME_STAGGER_SECONDS = 5.0
+
+# Bookkeeping key inside Mix.metadata_json.
+RESUME_COUNT_KEY = "interrupt_resumes"
+
+
 async def sweep_interrupted_at_boot() -> dict:
     """Mark orphaned in-flight work as interrupted after a restart.
 
     At boot no orchestrator tasks exist, so any PipelineStep still "running"
     and any Mix still pipeline_status "running" was cut off mid-flight by the
-    previous shutdown. Steps become "interrupted"; mixes become "failed" with
-    pipeline_error "interrupted by restart" so the retry endpoints can pick
-    them back up.
+    previous shutdown. Both become "interrupted".
+
+    "interrupted" is deliberately NOT "failed": a restart says nothing about
+    the mix, only about the process, and a terminal status is how a crash used
+    to turn into silent data loss (the set simply never published and nobody
+    found out for days). ``resume_interrupted_at_boot`` re-drives these; until
+    it does, the status is retryable from the API and visible in the UI.
     """
     swept = {"steps": 0, "mixes": 0}
     try:
@@ -1280,7 +1304,7 @@ async def sweep_interrupted_at_boot() -> dict:
                 )
             ).scalars().all()
             for mix in mixes:
-                mix.pipeline_status = "failed"
+                mix.pipeline_status = StepStatus.INTERRUPTED.value
                 mix.pipeline_error = "interrupted by restart"
             swept["mixes"] = len(mixes)
 
@@ -1288,8 +1312,8 @@ async def sweep_interrupted_at_boot() -> dict:
 
         if swept["steps"] or swept["mixes"]:
             logger.warning(
-                "Startup sweep: %d running step(s) marked interrupted, "
-                "%d running mix(es) marked failed (interrupted by restart)",
+                "Startup sweep: %d running step(s) and %d running mix(es) "
+                "marked interrupted (cut off by restart)",
                 swept["steps"], swept["mixes"],
             )
             try:
@@ -1297,8 +1321,9 @@ async def sweep_interrupted_at_boot() -> dict:
 
                 await activity_log.warn(
                     "interrupted_sweep",
-                    f"Startup sweep: {swept['steps']} in-flight step(s) marked interrupted, "
-                    f"{swept['mixes']} running mix(es) marked failed after restart",
+                    f"Startup sweep: {swept['steps']} in-flight step(s) and "
+                    f"{swept['mixes']} running mix(es) marked interrupted after "
+                    "restart — queued for automatic resume",
                     context=swept,
                 )
             except Exception:  # pragma: no cover - defensive
@@ -1316,3 +1341,119 @@ class _VideoNotReady(Exception):
 
 
 VideoNotReady = _VideoNotReady
+
+
+async def resume_interrupted_at_boot(
+    orchestrator: "PipelineOrchestrator",
+    delay_seconds: float = RESUME_SETTLE_SECONDS,
+) -> dict:
+    """Re-drive mixes that a restart cut off mid-pipeline.
+
+    ``sweep_interrupted_at_boot`` parks them in "interrupted"; this puts them
+    back to work. Without it a transient crash (OOM, deploy, power blip) was a
+    permanent, silent loss: the mix sat there failed and the set never
+    published.
+
+    Bounded on purpose. Each automatic resume increments
+    ``metadata_json[RESUME_COUNT_KEY]``; past ``MAX_INTERRUPT_RESUMES`` the mix
+    is left "failed" with an explicit reason instead of being restarted again,
+    so a mix that kills the process cannot loop forever. The counter is only
+    ever bumped by the automatic path — a human retry is not spent against it.
+
+    Off (config ``resume_interrupted_mixes``) the mixes stay "interrupted":
+    still retryable from the API/UI and still reported by the stuck-mix
+    watchdog. Nothing is ever silently dropped either way.
+    """
+    result = {"resumed": 0, "exhausted": 0, "skipped": False}
+    from app.services import activity_log
+
+    try:
+        if not bool(await app_config.resolve("resume_interrupted_mixes")):
+            result["skipped"] = True
+            return result
+
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+
+        async with async_session_factory() as session:
+            mixes = (
+                await session.execute(
+                    select(Mix).where(
+                        Mix.pipeline_status == StepStatus.INTERRUPTED.value
+                    )
+                )
+            ).scalars().all()
+
+            to_resume: List[str] = []
+            exhausted: List[Tuple[str, str]] = []
+
+            for mix in mixes:
+                meta = dict(mix.metadata_json or {})
+                attempts = int(meta.get(RESUME_COUNT_KEY) or 0)
+                if attempts >= MAX_INTERRUPT_RESUMES:
+                    mix.pipeline_status = StepStatus.FAILED.value
+                    mix.pipeline_error = (
+                        f"interrupted by restart {attempts} times "
+                        f"(limit {MAX_INTERRUPT_RESUMES}) — not resumed again "
+                        "automatically; retry manually once the cause is fixed"
+                    )
+                    exhausted.append((mix.id, mix.title))
+                    continue
+
+                meta[RESUME_COUNT_KEY] = attempts + 1
+                mix.metadata_json = meta  # reassign: JSON columns don't track mutation
+                mix.pipeline_status = StepStatus.PENDING.value
+                mix.pipeline_error = None
+                to_resume.append(mix.id)
+
+            if to_resume:
+                steps = (
+                    await session.execute(
+                        select(PipelineStep).where(
+                            PipelineStep.mix_id.in_(to_resume),
+                            PipelineStep.status.in_(
+                                [
+                                    StepStatus.INTERRUPTED.value,
+                                    StepStatus.FAILED.value,
+                                    StepStatus.BLOCKED.value,
+                                ]
+                            ),
+                        )
+                    )
+                ).scalars().all()
+                for step in steps:
+                    step.status = StepStatus.PENDING.value
+                    step.error = None
+                    step.retry_count = (step.retry_count or 0) + 1
+
+            await session.commit()
+
+        for mix_id, title in exhausted:
+            result["exhausted"] += 1
+            logger.error(
+                "Mix %s (%s) hit the interrupted-resume limit; leaving it failed",
+                mix_id, title,
+            )
+            await activity_log.error(
+                "interrupted_resume",
+                f"'{title}' has been interrupted by a restart "
+                f"{MAX_INTERRUPT_RESUMES} times and was NOT resumed again — "
+                "something is killing the pipeline; retry it by hand once fixed",
+                mix_id=mix_id,
+            )
+
+        for mix_id in to_resume:
+            logger.warning("Resuming mix %s after restart interruption", mix_id)
+            await activity_log.warn(
+                "interrupted_resume",
+                "Mix was cut off by a restart — resuming the pipeline "
+                "automatically from the interrupted step",
+                mix_id=mix_id,
+            )
+            await orchestrator.start_pipeline(mix_id)
+            result["resumed"] += 1
+            if RESUME_STAGGER_SECONDS:
+                await asyncio.sleep(RESUME_STAGGER_SECONDS)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Boot resume of interrupted mixes failed")
+    return result
