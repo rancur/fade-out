@@ -64,7 +64,13 @@ services:
     # folders, and the right UID/GID depends on your NAS share permissions.
     # See SECURITY.md.
     # user: "1000:1000"
-    mem_limit: 4g
+    # Analysis of a long DJ set (beat/energy/track detection over a multi-hour
+    # WAV) is the memory high-water mark. 4g was not enough: on 2026-08-21 the
+    # container was OOM-killed at 4.19 GB mid-analysis, the boot sweep then
+    # marked the mix failed, and the set silently never published. Keep real
+    # headroom here — an OOM kill in the middle of the pipeline is data loss,
+    # not a slowdown.
+    mem_limit: 12g
     logging:
       driver: json-file
       options:
