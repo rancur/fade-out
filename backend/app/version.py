@@ -17,7 +17,7 @@ import subprocess
 from functools import lru_cache
 from typing import Dict, Optional
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 
 def _env(name: str) -> Optional[str]:
