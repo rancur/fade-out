@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v2.4.1 — 2026-08-22
 
 ### An interrupted mix is resumed, not quietly buried
 

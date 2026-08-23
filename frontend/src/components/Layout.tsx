@@ -124,7 +124,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         {/* Version */}
         {!collapsed && (
           <div className="px-4 py-2 border-t border-primary/10">
-            <p className="text-[10px] text-gray-600 font-mono">v2.3.0</p>
+            <p className="text-[10px] text-gray-600 font-mono">v2.4.1</p>
           </div>
         )}
       </aside>
