@@ -31,6 +31,12 @@ rules Will asked for:
 4. **Honest unknowns.** A gap-filling candidate whose confidence is below
    ``name_confidence_threshold`` is kept as an ``ID - ID`` marker (we know
    *something* played there, but won't assert a probably-wrong name).
+5. **Tracks last minutes, not seconds.** Two fingerprint guesses closer together
+   than ``min_track_spacing_seconds`` describe one track, however differently
+   they were named; the stronger one keeps the slot. Without this, the analyzer's
+   75s sampling grid turned every adjacent-probe disagreement into a new entry.
+   Authoritative entries are exempt — a short cut the deck actually reported is
+   real.
 
 The result is normalized through :func:`tracklist_utils.clean_tracklist` so
 every consumer (descriptions, YouTube chapters, cross-links) sees a sorted,
@@ -66,8 +72,29 @@ SHAZAM_SINGLE_CONFIDENCE = 0.50
 AUTHORITATIVE_SOURCES = frozenset({"cue", "djctl"})
 
 # Two candidates whose timestamps are within this many seconds are treated as
-# describing the same moment in the mix.
+# describing the same moment in the mix. This is a *same-moment* window: it
+# decides when an authoritative entry owns a fingerprint guess, so it stays
+# narrow.
 DEFAULT_OVERLAP_SECONDS = 45.0
+
+# The shortest time a track plausibly holds the floor in a DJ set. This is a
+# different question from the overlap window above, and it needs its own (much
+# wider) number.
+#
+# The analyzer probes every AUDIO_SAMPLE_INTERVAL_SECONDS (75s) and takes a
+# second clip 30s later. On blended DJ audio, fingerprinting adjacent probes
+# routinely yields two different names for one track — a cover, an edit, or a
+# plain mis-ID. With only a 45s same-moment window, two probes 75s apart could
+# never be reconciled, so every such disagreement minted a new "track": a 2h
+# house set came back with 38 entries, 10 of them spaced at exactly the sample
+# interval, for what was really ~29 tracks.
+#
+# 90s sits above the sampler's own grid (75s, and the 60s primary/secondary
+# beat against it) and below any real track's stay, so it removes sampler
+# artifacts without touching genuine short cuts. Applies to fingerprint sources
+# only — CUE/djctl entries are the deck's ground truth and are never collapsed
+# by it.
+DEFAULT_MIN_TRACK_SPACING_SECONDS = 90.0
 
 # A gap-filling candidate scoring strictly below this keeps its timestamp but is
 # rendered as ``ID - ID`` instead of asserting a low-confidence name. Kept at the
@@ -146,6 +173,7 @@ def merge_detections(
     *,
     overlap_seconds: float = DEFAULT_OVERLAP_SECONDS,
     name_confidence_threshold: float = DEFAULT_NAME_CONFIDENCE_THRESHOLD,
+    min_track_spacing_seconds: float = DEFAULT_MIN_TRACK_SPACING_SECONDS,
 ) -> MergeResult:
     """Merge candidate tracklists into one confidence-weighted tracklist.
 
@@ -201,6 +229,24 @@ def merge_detections(
     #    gap-filler claims a slot before weaker duplicates.
     for cand in sorted(others, key=lambda c: (-c.confidence, c.timestamp_seconds)):
         near = _nearest(accepted, cand.timestamp_seconds, overlap_seconds)
+
+        if near is None:
+            # Nothing owns this exact moment, but a fingerprint guess still has
+            # to clear the minimum track spacing against other *fingerprint*
+            # entries: two probes a sample-interval apart naming different
+            # songs are one track seen twice, not two tracks. Authoritative
+            # neighbours are excluded — the deck reporting a 40s cut is real,
+            # and it already had its shot at this candidate via the narrower
+            # same-moment window above.
+            guess_neighbours = [
+                c for c in accepted if c.source not in AUTHORITATIVE_SOURCES
+            ]
+            crowded = _nearest(
+                guess_neighbours, cand.timestamp_seconds, min_track_spacing_seconds
+            )
+            if crowded is not None:
+                # The stronger candidate was accepted first and owns the slot.
+                continue
 
         if near is not None and near.source in AUTHORITATIVE_SOURCES:
             # Authoritative already owns this moment. Only borrow the name to

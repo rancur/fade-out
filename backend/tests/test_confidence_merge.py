@@ -1,6 +1,7 @@
 """Tests for the confidence-scored multi-source detection merge."""
 
 from app.services.confidence_merge import (
+    DEFAULT_MIN_TRACK_SPACING_SECONDS,
     DEFAULT_NAME_CONFIDENCE_THRESHOLD,
     DetectionSource,
     SHAZAM_CONFIRMED_CONFIDENCE,
@@ -180,3 +181,82 @@ class TestDjctlSource:
         result = merge_detections([djctl, shazam])
         assert len(result.tracklist) == 1
         assert result.tracklist[0]["title"] == "NowPlaying"
+
+
+class TestMinimumTrackSpacing:
+    """A DJ track holds the floor for minutes, not seconds.
+
+    The analyzer probes every ``AUDIO_SAMPLE_INTERVAL_SECONDS`` (75s) plus a
+    +30s secondary clip. On blended audio Shazam routinely names two adjacent
+    probes differently, which without a spacing floor mints a bogus track per
+    disagreement — the 2h set that prompted this had 10 of its 38 entries
+    spaced at exactly the sample interval.
+    """
+
+    def test_detections_closer_than_min_spacing_collapse(self):
+        # Two Shazam hits one sample-interval apart: one real track, two names.
+        shazam = _shazam(
+            [
+                _t("Antoine Clamaran", "Do What You Wanna Do (Extended Mix)", 75,
+                   confidence=SHAZAM_CONFIRMED_CONFIDENCE),
+                _t("T-Connection", "Do What You Wanna Do", 150,
+                   confidence=SHAZAM_CONFIRMED_CONFIDENCE),
+            ]
+        )
+        result = merge_detections([shazam], min_track_spacing_seconds=90.0)
+        assert len(result.tracklist) == 1
+        # Equal confidence -> the earlier stamp wins, so the track starts where
+        # it actually started.
+        assert result.tracklist[0]["timestamp_seconds"] == 75
+
+    def test_detections_beyond_min_spacing_both_survive(self):
+        shazam = _shazam(
+            [
+                _t("A", "First", 75, confidence=SHAZAM_CONFIRMED_CONFIDENCE),
+                _t("B", "Second", 285, confidence=SHAZAM_CONFIRMED_CONFIDENCE),
+            ]
+        )
+        result = merge_detections([shazam], min_track_spacing_seconds=90.0)
+        assert [t["title"] for t in result.tracklist] == ["First", "Second"]
+
+    def test_stronger_detection_wins_the_slot(self):
+        shazam = _shazam(
+            [
+                _t("Weak", "WeakTitle", 300, confidence=SHAZAM_SINGLE_CONFIDENCE),
+                _t("Strong", "StrongTitle", 375, confidence=SHAZAM_CONFIRMED_CONFIDENCE),
+            ]
+        )
+        result = merge_detections([shazam], min_track_spacing_seconds=90.0)
+        assert len(result.tracklist) == 1
+        assert result.tracklist[0]["title"] == "StrongTitle"
+
+    def test_authoritative_entries_are_never_spacing_collapsed(self):
+        # The deck reporting two tracks 60s apart is ground truth — a short edit
+        # or a quick double-drop really happened. That gap is under the 90s
+        # spacing floor but clear of the 45s same-moment window, so it isolates
+        # the new rule: only fingerprint guesses are subject to the floor.
+        cue = _cue([_t("A", "Short Edit", 100), _t("B", "Next", 160)])
+        result = merge_detections([cue], min_track_spacing_seconds=90.0)
+        assert [t["title"] for t in result.tracklist] == ["Short Edit", "Next"]
+
+    def test_spacing_does_not_widen_authoritative_overlap(self):
+        # A Shazam hit 60s from a CUE entry is beyond the 45s overlap window,
+        # so it is still its own (gap-filling) moment rather than being
+        # swallowed by the CUE entry.
+        cue = _cue([_t("Deck", "Real", 100)])
+        shazam = _shazam([_t("Guess", "Other", 160,
+                             confidence=SHAZAM_CONFIRMED_CONFIDENCE)])
+        result = merge_detections([cue, shazam], min_track_spacing_seconds=90.0)
+        assert len(result.tracklist) == 2
+
+    def test_default_spacing_suppresses_sample_interval_artifacts(self):
+        # Same as the first case but relying on the shipped default.
+        shazam = _shazam(
+            [
+                _t("A", "Real", 1230, confidence=SHAZAM_SINGLE_CONFIDENCE),
+                _t("B", "Artifact", 1305, confidence=SHAZAM_SINGLE_CONFIDENCE),
+            ]
+        )
+        result = merge_detections([shazam])
+        assert len(result.tracklist) == 1
+        assert DEFAULT_MIN_TRACK_SPACING_SECONDS >= 75

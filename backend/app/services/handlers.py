@@ -364,6 +364,9 @@ async def analyze_audio_with_cue(
         name_confidence_threshold=float(
             await app_config.resolve("detection_name_confidence_threshold")
         ),
+        min_track_spacing_seconds=float(
+            await app_config.resolve("detection_min_track_spacing_seconds")
+        ),
     )
 
     final_tracklist = merged.tracklist if merged.tracklist else result.tracklist
