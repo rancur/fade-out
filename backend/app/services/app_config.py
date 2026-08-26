@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings as env_settings
+from app.services.confidence_merge import DEFAULT_MIN_TRACK_SPACING_SECONDS
 from app.database import async_session_factory
 from app.models import AppSettings
 
@@ -139,6 +140,18 @@ SETTINGS_SCHEMA: Tuple[SettingDef, ...] = (
         type="float", category="Pipeline",
         env_attr="DETECTION_NAME_CONFIDENCE_THRESHOLD",
         min_value=0.0, max_value=1.0,
+    ),
+    SettingDef(
+        key="detection_min_track_spacing_seconds",
+        label="Minimum track spacing (s)",
+        help="Two fingerprint detections closer together than this are treated "
+             "as one track (the stronger name wins), so the sampler's own "
+             "interval can't mint a new track every time Shazam changes its "
+             "mind mid-transition. Lower it only if real tracks are being "
+             "merged; CUE/djctl entries are never affected.",
+        type="int", category="Pipeline",
+        fallback=int(DEFAULT_MIN_TRACK_SPACING_SECONDS),
+        min_value=0, max_value=600,
     ),
     SettingDef(
         key="file_stable_seconds",
