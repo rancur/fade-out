@@ -20,6 +20,8 @@ from app.services.shorts_pipeline import (
     _enforce_title,
     generate_short_metadata,
     parse_recording_date,
+    recording_stem,
+    resolve_recording_sources,
     serialize_short,
 )
 
@@ -956,3 +958,199 @@ def test_serialize_short_includes_filename():
     assert data["filename"] == "Backtrack 2026-05-14 21-03-22.mp4"
     assert data["status"] == "ready"
     assert data["detected_at"] == "2026-05-14T21:05:00"
+
+
+# ---------------------------------------------------------------------------
+# .mkv sources
+# ---------------------------------------------------------------------------
+
+
+class TestRecordingStemAndSourceResolution:
+    """One recording is one row, whatever containers it exists in.
+
+    OBS writes the .mkv first and remuxes to .mp4, so a recording can appear as
+    either or both. The .mp4 wins when present (it is what YouTube accepts, and
+    it is what every already-uploaded short was ingested from); the .mkv is the
+    source only when it is the only copy.
+    """
+
+    def test_stem_ignores_extension(self):
+        a = recording_stem("/w/Backtrack 2026-06-01 12-00-00.mkv")
+        b = recording_stem("/w/Backtrack 2026-06-01 12-00-00.mp4")
+        assert a == b
+
+    def test_mp4_wins_over_mkv_sibling(self, tmp_path):
+        (tmp_path / "Backtrack 2026-06-01 12-00-00.mkv").write_bytes(b"a")
+        (tmp_path / "Backtrack 2026-06-01 12-00-00.mp4").write_bytes(b"b")
+        picked = resolve_recording_sources(tmp_path.iterdir())
+        assert [p.name for p in picked] == ["Backtrack 2026-06-01 12-00-00.mp4"]
+
+    def test_lone_mkv_is_kept(self, tmp_path):
+        (tmp_path / "Backtrack 2026-06-01 12-00-00.mkv").write_bytes(b"a")
+        picked = resolve_recording_sources(tmp_path.iterdir())
+        assert [p.name for p in picked] == ["Backtrack 2026-06-01 12-00-00.mkv"]
+
+    def test_unrelated_extensions_are_dropped(self, tmp_path):
+        (tmp_path / "notes.txt").write_bytes(b"a")
+        (tmp_path / "Backtrack 2026-06-01 12-00-00.mkv").write_bytes(b"a")
+        picked = resolve_recording_sources(tmp_path.iterdir())
+        assert [p.name for p in picked] == ["Backtrack 2026-06-01 12-00-00.mkv"]
+
+    def test_result_is_sorted_by_name(self, tmp_path):
+        for n in ("Backtrack 2026-06-03 12-00-00.mkv",
+                  "Backtrack 2026-06-01 12-00-00.mp4",
+                  "Backtrack 2026-06-02 12-00-00.mkv"):
+            (tmp_path / n).write_bytes(b"a")
+        picked = [p.name for p in resolve_recording_sources(tmp_path.iterdir())]
+        assert picked == sorted(picked)
+
+
+class TestMkvIngest:
+    async def test_scan_ingests_a_lone_mkv(self, prepared_db, tmp_path, monkeypatch):
+        _patch_pipeline(monkeypatch)
+        (tmp_path / "Backtrack 2026-06-01 12-00-00.mkv").write_bytes(b"a" * 2048)
+        service = ShortsService(watch_path=str(tmp_path))
+        summary = await service.scan()
+
+        assert summary["files_seen"] == 1
+        assert summary["ingested"] == 1
+        async with async_session_factory() as session:
+            rows = (await session.execute(select(Short))).scalars().all()
+        assert [os.path.basename(r.file_path) for r in rows] == [
+            "Backtrack 2026-06-01 12-00-00.mkv"
+        ]
+
+    async def test_ingesting_the_sibling_of_a_known_recording_is_a_no_op(
+        self, prepared_db, tmp_path
+    ):
+        """The remux case: a short was ingested and uploaded from one container,
+        then the other container shows up. Hashes differ, so only a stem check
+        stops it becoming a second row and a duplicate upload."""
+        mp4 = tmp_path / "Backtrack 2026-06-01 12-00-00.mp4"
+        mkv = tmp_path / "Backtrack 2026-06-01 12-00-00.mkv"
+        mp4.write_bytes(b"mp4 bytes" * 500)
+        mkv.write_bytes(b"totally different mkv bytes" * 500)
+        service = ShortsService(watch_path=str(tmp_path))
+
+        first = await service.ingest_file(str(mp4))
+        assert first is not None
+        assert await service.ingest_file(str(mkv)) is None
+
+        async with async_session_factory() as session:
+            rows = (await session.execute(select(Short))).scalars().all()
+        assert len(rows) == 1
+
+    async def test_mkv_ingested_first_then_mp4_appears(
+        self, prepared_db, tmp_path, monkeypatch
+    ):
+        _patch_pipeline(monkeypatch)
+        mkv = tmp_path / "Backtrack 2026-06-01 12-00-00.mkv"
+        mkv.write_bytes(b"a" * 2048)
+        service = ShortsService(watch_path=str(tmp_path))
+        await service.scan()
+
+        # OBS finishes its remux after we already ingested the .mkv.
+        (tmp_path / "Backtrack 2026-06-01 12-00-00.mp4").write_bytes(b"b" * 2048)
+        summary = await service.scan()
+
+        assert summary["ingested"] == 0
+        async with async_session_factory() as session:
+            rows = (await session.execute(select(Short))).scalars().all()
+        assert len(rows) == 1
+
+
+class TestMkvUploadRemux:
+    """YouTube's accepted containers do not include Matroska, and
+    ``upload_short`` declares ``video/mp4``. A .mkv source is remuxed to a temp
+    .mp4 (stream copy) for the upload only — the watch folder is read-only."""
+
+    async def test_mkv_is_remuxed_before_upload(
+        self, prepared_db, tmp_path, monkeypatch
+    ):
+        _, uploader = _patch_pipeline(monkeypatch)
+        remuxed = tmp_path / "temp-remuxed.mp4"
+        calls = []
+
+        async def fake_remux(path):
+            calls.append(path)
+            remuxed.write_bytes(b"remuxed")
+            return str(remuxed)
+
+        monkeypatch.setattr(shorts_pipeline, "remux_to_mp4", fake_remux)
+
+        src = str(tmp_path / "Backtrack 2026-06-01 12-00-00.mkv")
+        short_id = await _make_short(
+            path=src, status="ready", title="T", description="D", tags=["x"]
+        )
+        await shorts_pipeline.ShortsService(
+            watch_path=str(tmp_path)
+        ).upload_short_by_id(short_id, manual=True)
+
+        assert calls == [src]
+        assert uploader.calls[0]["file_path"] == str(remuxed)
+        assert not remuxed.exists(), "temp remux must be cleaned up"
+        # The row still points at the real source, not the temp file.
+        assert (await _get_short(short_id)).file_path == src
+
+    async def test_mp4_is_uploaded_directly(self, prepared_db, tmp_path, monkeypatch):
+        _, uploader = _patch_pipeline(monkeypatch)
+
+        async def fail_remux(path):  # pragma: no cover - must not be called
+            raise AssertionError("mp4 must not be remuxed")
+
+        monkeypatch.setattr(shorts_pipeline, "remux_to_mp4", fail_remux)
+
+        src = str(tmp_path / "Backtrack 2026-06-01 12-00-00.mp4")
+        short_id = await _make_short(
+            path=src, status="ready", title="T", description="D", tags=["x"]
+        )
+        await shorts_pipeline.ShortsService(
+            watch_path=str(tmp_path)
+        ).upload_short_by_id(short_id, manual=True)
+        assert uploader.calls[0]["file_path"] == src
+
+    async def test_temp_remux_is_cleaned_up_when_the_upload_fails(
+        self, prepared_db, tmp_path, monkeypatch
+    ):
+        _patch_pipeline(monkeypatch, uploader=FakeUploader(fail=True))
+        remuxed = tmp_path / "temp-remuxed.mp4"
+
+        async def fake_remux(path):
+            remuxed.write_bytes(b"remuxed")
+            return str(remuxed)
+
+        monkeypatch.setattr(shorts_pipeline, "remux_to_mp4", fake_remux)
+
+        short_id = await _make_short(
+            path=str(tmp_path / "Backtrack 2026-06-01 12-00-00.mkv"),
+            status="ready", title="T", description="D", tags=["x"],
+        )
+        await shorts_pipeline.ShortsService(
+            watch_path=str(tmp_path)
+        ).upload_short_by_id(short_id, manual=True)
+
+        assert (await _get_short(short_id)).status == "failed"
+        assert not remuxed.exists(), "temp remux must be cleaned up on failure too"
+
+    async def test_remux_failure_marks_the_short_failed(
+        self, prepared_db, tmp_path, monkeypatch
+    ):
+        _, uploader = _patch_pipeline(monkeypatch)
+
+        async def boom(path):
+            raise RuntimeError("ffmpeg exploded")
+
+        monkeypatch.setattr(shorts_pipeline, "remux_to_mp4", boom)
+
+        short_id = await _make_short(
+            path=str(tmp_path / "Backtrack 2026-06-01 12-00-00.mkv"),
+            status="ready", title="T", description="D", tags=["x"],
+        )
+        await shorts_pipeline.ShortsService(
+            watch_path=str(tmp_path)
+        ).upload_short_by_id(short_id, manual=True)
+
+        short = await _get_short(short_id)
+        assert short.status == "failed"
+        assert "ffmpeg exploded" in (short.error or "")
+        assert uploader.calls == []
