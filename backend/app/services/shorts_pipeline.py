@@ -67,7 +67,7 @@ import re
 import tempfile
 from datetime import date, datetime, time as dt_time, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from shazamio import Shazam
 from sqlalchemy import func as sa_func, select
@@ -127,6 +127,77 @@ MIN_SHORT_FILE_BYTES = 1024 * 1024  # 1 MB floor — same rationale as the mix w
 _FILENAME_DATE_RE = re.compile(
     r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})-(\d{2})-(\d{2})"
 )
+
+# Containers a recording can arrive in, MOST PREFERRED FIRST. OBS writes the
+# .mkv during capture and remuxes to .mp4 afterwards, so both can exist for one
+# recording. The .mp4 wins: it is the container YouTube accepts, and it is what
+# every already-uploaded short was ingested from, so preferring it keeps the
+# existing rows stable and costs no remux when OBS already did the work. A .mkv
+# is the source only when it is the only copy.
+SHORTS_SOURCE_EXTENSIONS: Tuple[str, ...] = (".mp4", ".mkv")
+
+# Containers that must be remuxed before upload. YouTube's accepted formats do
+# not include Matroska, and upload_short declares video/mp4.
+REMUX_REQUIRED_EXTENSIONS = frozenset({".mkv"})
+
+
+def recording_stem(path: Any) -> str:
+    """The recording's identity: its filename without the container extension.
+
+    Backtrack 2026-06-01 12-00-00.mkv and ....mp4 are one recording.
+    Their bytes differ, so the first-10MB hash cannot see that they are the
+    same clip — this is what the ingest de-duplication keys on instead.
+    """
+    return Path(str(path)).stem
+
+
+def resolve_recording_sources(paths: Iterable[Any]) -> List[Path]:
+    """Collapse a folder listing to one source file per recording.
+
+    Groups by :func: and keeps the most preferred container in
+    :data:. Files in any other format are dropped.
+    Returns the winners sorted by name — the Backtrack filename embeds the
+    recording timestamp, so a name sort is a date sort.
+    """
+    priority = {ext: i for i, ext in enumerate(SHORTS_SOURCE_EXTENSIONS)}
+    best: Dict[str, Tuple[int, Path]] = {}
+    for raw in paths:
+        p = Path(str(raw))
+        rank = priority.get(p.suffix.lower())
+        if rank is None:
+            continue
+        stem = recording_stem(p)
+        current = best.get(stem)
+        if current is None or rank < current[0]:
+            best[stem] = (rank, p)
+    return sorted((p for _, p in best.values()), key=lambda p: p.name)
+
+
+async def remux_to_mp4(path: str) -> str:
+    """Stream-copy a clip into a temporary .mp4 and return its path.
+
+    No re-encode: the video and audio streams are copied verbatim, so this is
+    lossless and takes seconds. The watch folder is mounted read-only, so the
+    result goes to a temp file the caller is responsible for deleting.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp.close()
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", path, "-c", "copy", "-movflags", "+faststart", tmp.name,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"remux to mp4 failed for {os.path.basename(path)}: "
+            f"{(stderr or b'').decode(errors='replace').strip()[:500]}"
+        )
+    return tmp.name
 
 VALID_STATUSES = {
     "detected", "analyzing", "ready", "queued",
@@ -562,7 +633,7 @@ class ShortsService:
         loop = asyncio.get_running_loop()
         self._observer = Observer()
         self._observer.schedule(
-            _WatchHandler({".mp4"}, "shorts", self._tracker, loop),
+            _WatchHandler(set(SHORTS_SOURCE_EXTENSIONS), "shorts", self._tracker, loop),
             self._watch_path,
             recursive=False,
         )
@@ -644,11 +715,17 @@ class ShortsService:
     async def ingest_file(self, path: str) -> Optional[str]:
         """Create a ``detected`` row for a file, or None when already known.
 
-        Dedupe key is the first-10MB MD5 (same as the mix watcher) checked
-        against the shorts table itself — re-drops, renames, and re-scans of
-        the same recording never create a second row.
+        Two dedupe keys, because either alone lets a duplicate through:
+
+        * the first-10MB MD5 (same as the mix watcher) catches re-drops and
+          renames of identical bytes;
+        * the :func: catches the *same recording in a different
+          container*. OBS writes the .mkv and remuxes to .mp4, so those two
+          files hash differently while being one clip — without this check the
+          sibling would become a second row and a duplicate upload.
         """
         file_hash = await asyncio.to_thread(_compute_file_hash, path)
+        stem = recording_stem(path)
         async with async_session_factory() as session:
             existing = (
                 await session.execute(select(Short).where(Short.file_hash == file_hash))
@@ -656,6 +733,16 @@ class ShortsService:
             if existing:
                 logger.info("Shorts: already known file %s (hash=%s)", path, file_hash)
                 return None
+            for row in (
+                await session.execute(select(Short).where(Short.file_path.is_not(None)))
+            ).scalars():
+                if recording_stem(row.file_path) == stem:
+                    logger.info(
+                        "Shorts: %s is the %s sibling of an already-known recording (%s)",
+                        os.path.basename(path), Path(path).suffix,
+                        os.path.basename(row.file_path),
+                    )
+                    return None
             short = Short(
                 file_path=path,
                 file_hash=file_hash,
@@ -674,7 +761,7 @@ class ShortsService:
         return short_id
 
     async def scan(self) -> Dict[str, Any]:
-        """Backlog import: ingest + process every not-yet-seen .mp4 in the folder.
+        """Backlog import: ingest + process every not-yet-seen clip in the folder.
 
         Three phases, so the catalog dedupe sees the WHOLE backlog at once:
 
@@ -709,8 +796,10 @@ class ShortsService:
                 platform="youtube",
             )
             try:
-                files = sorted(
-                    p for p in Path(self._watch_path).glob("*.mp4") if p.is_file()
+                # One source per recording: a .mkv with a remuxed .mp4
+                # sibling resolves to the .mp4, so a pair is never seen twice.
+                files = resolve_recording_sources(
+                    p for p in Path(self._watch_path).iterdir() if p.is_file()
                 )
             except OSError as exc:
                 summary["status"] = "failed"
@@ -1260,9 +1349,19 @@ class ShortsService:
         await self._record_quota(session)
         _, _, sj = await self._quota_state(session)
         uploader = get_youtube_uploader(sj)
+
+        # YouTube does not accept Matroska and upload_short declares
+        # video/mp4, so a .mkv source is stream-copied into a temp .mp4 for
+        # the upload only. The watch folder is read-only and the row keeps
+        # pointing at the real source file.
+        upload_path = short.file_path
+        temp_path: Optional[str] = None
         try:
+            if Path(short.file_path).suffix.lower() in REMUX_REQUIRED_EXTENSIONS:
+                temp_path = await remux_to_mp4(short.file_path)
+                upload_path = temp_path
             result = await uploader.upload_short(
-                short.file_path,
+                upload_path,
                 title=short.title or os.path.basename(short.file_path),
                 description=short.description or "",
                 tags=list(short.tags or []),
@@ -1278,6 +1377,12 @@ class ShortsService:
                 platform="youtube",
             )
             return
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:  # pragma: no cover - best effort cleanup
+                    pass
 
         short.youtube_video_id = result["video_id"]
         short.youtube_url = result["video_url"]
