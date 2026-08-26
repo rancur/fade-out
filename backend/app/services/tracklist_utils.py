@@ -21,6 +21,17 @@ _UNKNOWN_MARKERS = {"", "unknown", "unknown artist", "unknown title", "id", "n/a
 # are unidentified tracks and should also collapse to the ID label.
 _TRACK_PLACEHOLDER_RE = re.compile(r"^track\s+\d+$")
 
+# Trailing release/version decorations on a recognized title: "(Extended Mix)",
+# "[Casamena Stripped Remix]", "(feat. X)", "- Single", "- EP". Fingerprinting a
+# blended transition frequently returns a different release of the track already
+# playing, so the consecutive-duplicate key compares base titles and ignores
+# these. Only *trailing* groups are stripped, and never all of them — a title
+# that is entirely a parenthetical keeps its full text.
+_VERSION_SUFFIX_RE = re.compile(
+    r"\s*(?:\((?:[^()]*)\)|\[(?:[^\[\]]*)\]|-\s*(?:single|ep))\s*$",
+    re.IGNORECASE,
+)
+
 # YouTube only renders chapters when: the first stamp is exactly 0:00, there are
 # at least 3 chapters, and each is >= 10 seconds after the previous one.
 YOUTUBE_MIN_CHAPTERS = 3
@@ -68,6 +79,22 @@ def label_or_id(value: Any) -> str:
     return str(value).strip()
 
 
+def base_title(value: Any) -> str:
+    """Return a title's comparison key with trailing version decorations removed.
+
+    ``"Do What You Wanna Do (Extended Mix)"`` and ``"Do What You Wanna Do"`` are
+    the same record as far as a tracklist is concerned. Used only for
+    de-duplication — the displayed label always keeps its full text.
+    """
+    text = _norm(value)
+    while True:
+        stripped = _VERSION_SUFFIX_RE.sub("", text).strip()
+        if not stripped or stripped == text:
+            break
+        text = stripped
+    return text
+
+
 def clean_tracklist(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Return a cleaned copy of a tracklist.
 
@@ -75,8 +102,10 @@ def clean_tracklist(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     - Normalizes unidentified artist/title fields (unknown/blank/"Track N") to
       the canonical ``ID`` label, so unidentified tracks render as ``ID - ID``
       (DJ convention) rather than ``Unknown - Unknown`` or blank.
-    - Collapses consecutive duplicate detections (same artist+title, including
-      consecutive ``ID - ID`` recognition gaps), keeping the earliest timestamp.
+    - Collapses consecutive duplicate detections (same artist and base title —
+      trailing "(Extended Mix)" / "[Remix]" / "- Single" decorations are ignored
+      — including consecutive ``ID - ID`` recognition gaps), keeping the
+      earliest timestamp.
     - Recomputes ``timestamp_formatted`` from ``timestamp_seconds`` so every
       consumer sees a consistently formatted stamp.
 
@@ -94,7 +123,12 @@ def clean_tracklist(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         artist = label_or_id(track.get("artist", ""))
         title = label_or_id(track.get("title", ""))
 
-        key = (artist.lower(), title.lower())
+        # Compare base titles so the same record recognized under two release
+        # names ("... (Extended Mix)" then "...") collapses instead of showing
+        # twice. Artist still has to match exactly: a cover by someone else is a
+        # different record, and it is the merge's spacing floor that decides
+        # whether both belong.
+        key = (artist.lower(), base_title(title))
         if key == last_key:
             # Consecutive duplicate (or a run of unidentified ID - ID segments) —
             # keep the first (earlier) occurrence only.

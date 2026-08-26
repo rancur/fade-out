@@ -176,3 +176,67 @@ class TestBuildYoutubeChapters:
         titles = [c["title"] for c in chapters]
         assert "U" not in titles
         assert titles == ["T", "V", "W"]
+
+
+class TestVersionInsensitiveConsecutiveDedupe:
+    """The same song recognized under two release names is one track.
+
+    Fingerprinting a blended transition often returns a cover, an edit, or a
+    differently-titled release of the track already playing. Those land
+    adjacent in time, so the consecutive-duplicate collapse should see through
+    the trailing version parenthetical.
+    """
+
+    def test_extended_mix_collapses_into_base_title(self):
+        tracks = [
+            {"artist": "Antoine Clamaran", "title": "Do What You Wanna Do (Extended Mix)",
+             "timestamp_seconds": 75},
+            {"artist": "Antoine Clamaran", "title": "Do What You Wanna Do",
+             "timestamp_seconds": 150},
+        ]
+        cleaned = clean_tracklist(tracks)
+        assert len(cleaned) == 1
+        # The first (fuller) label is what survives, at the earlier stamp.
+        assert cleaned[0]["title"] == "Do What You Wanna Do (Extended Mix)"
+        assert cleaned[0]["timestamp_seconds"] == 75
+
+    def test_bracketed_version_also_collapses(self):
+        tracks = [
+            {"artist": "Ezel", "title": "You Got Worked [Casamena Stripped Remix]",
+             "timestamp_seconds": 100},
+            {"artist": "Ezel", "title": "You Got Worked", "timestamp_seconds": 200},
+        ]
+        assert len(clean_tracklist(tracks)) == 1
+
+    def test_single_suffix_collapses(self):
+        tracks = [
+            {"artist": "Alvaro Albarran", "title": "Tubah - Single", "timestamp_seconds": 10},
+            {"artist": "Alvaro Albarran", "title": "Tubah", "timestamp_seconds": 20},
+        ]
+        assert len(clean_tracklist(tracks)) == 1
+
+    def test_genuinely_different_titles_are_kept(self):
+        tracks = [
+            {"artist": "A", "title": "Bumping", "timestamp_seconds": 10},
+            {"artist": "A", "title": "Bumping Harder", "timestamp_seconds": 20},
+        ]
+        assert len(clean_tracklist(tracks)) == 2
+
+    def test_different_artists_same_title_are_kept(self):
+        # A cover by a different artist is a different record; only the
+        # spacing floor in the merge should decide whether both belong.
+        tracks = [
+            {"artist": "Antoine Clamaran", "title": "Do What You Wanna Do",
+             "timestamp_seconds": 10},
+            {"artist": "T-Connection", "title": "Do What You Wanna Do",
+             "timestamp_seconds": 20},
+        ]
+        assert len(clean_tracklist(tracks)) == 2
+
+    def test_non_adjacent_reprise_is_kept(self):
+        tracks = [
+            {"artist": "A", "title": "Loop (Extended Mix)", "timestamp_seconds": 10},
+            {"artist": "B", "title": "Other", "timestamp_seconds": 300},
+            {"artist": "A", "title": "Loop", "timestamp_seconds": 600},
+        ]
+        assert len(clean_tracklist(tracks)) == 3
