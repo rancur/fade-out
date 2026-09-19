@@ -145,10 +145,61 @@ class PlatformHealth:
                 # re-stamp it: that would keep a skipped check looking fresh
                 # forever, which is the false green in miniature.
                 if state is not self._states.get(platform):
+                    previous = self._states.get(platform)
                     state.checked_at = datetime.now(timezone.utc).isoformat()
                     state.checked_monotonic = time.monotonic()
                     self._states[platform] = state
+                    await self._announce_if_newly_dead(previous, state)
         return self.snapshot()
+
+    @staticmethod
+    async def _announce_if_newly_dead(
+        previous: Optional[CredentialState], current: CredentialState
+    ) -> None:
+        """Page once when a credential goes dead, on the transition only.
+
+        The probe loop re-checks every few minutes, so notifying on state
+        rather than on transition would emit the same page indefinitely --
+        one dead SoundCloud grant produced 855 silent retries over six days
+        and not a single notification, because nothing here ever spoke to
+        the notification service at all.
+
+        Deliberately one-directional: recovery is not announced. An all-clear
+        that nobody asked for is noise, and the health endpoint already shows
+        the current state for anyone who wants to look.
+        """
+        if current.state != DEAD:
+            return
+        if previous is not None and previous.state == DEAD:
+            return  # already reported; don't re-page every probe
+
+        try:
+            from app.services.notification_service import get_notification_service
+
+            detail = current.detail or "credential rejected"
+            credential = current.credential or "(credential not identified)"
+            await get_notification_service().notify(
+                "credential_dead",
+                title=f"{current.platform} credentials need re-authorisation",
+                message=(
+                    f"{current.platform} authorisation is no longer accepted, so "
+                    f"nothing will publish there until it is renewed.\n\n"
+                    f"Cause: {detail}\n"
+                    f"Credential: {credential}\n\n"
+                    f"This is not retryable -- the stored grant has to be replaced."
+                ),
+                data={
+                    "platform": current.platform,
+                    "state": current.state,
+                    "previous_state": previous.state if previous else None,
+                    "detail": detail,
+                    "credential": credential,
+                },
+            )
+        except Exception:  # pragma: no cover - never let alerting break probing
+            logger.exception(
+                "Failed to send credential_dead notification for %s", current.platform
+            )
 
     def snapshot(self) -> Dict[str, Dict[str, Any]]:
         now = time.monotonic()
