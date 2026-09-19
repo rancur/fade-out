@@ -37,6 +37,12 @@ NOTIFICATION_TYPES = {
     "publish_incomplete",
     "stuck_mix",
     "deployment_stale",
+    # A platform credential stopped working. This fires on the TRANSITION into
+    # dead, not on every probe: the health loop re-checks every few minutes and
+    # would otherwise emit the same page forever. Without this, a dead grant is
+    # visible in /api/health and nowhere else, and the first anyone hears of it
+    # is a mix half-publishing days later.
+    "credential_dead",
 }
 
 # Per-event-type default toggles when notification_events is not configured.
@@ -52,6 +58,7 @@ DEFAULT_EVENT_TOGGLES: Dict[str, bool] = {
     "publish_incomplete": True,
     "stuck_mix": True,
     "deployment_stale": True,
+    "credential_dead": True,
 }
 
 # Severity of each notification type, checked against notification_min_level.
@@ -61,6 +68,9 @@ TYPE_LEVELS: Dict[str, str] = {
     "publish_incomplete": "error",
     "stuck_mix": "warn",
     "deployment_stale": "warn",
+    # Nothing publishes to that platform until a human re-authorises, so this
+    # is an error, not a warning.
+    "credential_dead": "error",
 }
 LEVEL_RANK = {"info": 0, "warn": 1, "error": 2}
 
