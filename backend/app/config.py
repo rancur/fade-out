@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     SOUNDCLOUD_CLIENT_SECRET: str = ""
     SOUNDCLOUD_ACCESS_TOKEN: str = ""  # OAuth access token (obtained via auth flow)
     SOUNDCLOUD_REFRESH_TOKEN: str = ""  # OAuth refresh token
+    # The registered redirect URI of the SoundCloud OAuth app. SoundCloud
+    # string-matches this against the app's registration, so "localhost" and
+    # "127.0.0.1" are NOT interchangeable -- only the exact registered string
+    # works. Deriving it from the request Host header (the old behaviour) meant
+    # reaching the container on any other name silently produced a URI that
+    # could never match, and SoundCloud renders that as a BLANK authorize page
+    # rather than an error. Pin it here instead of inferring it.
+    SOUNDCLOUD_REDIRECT_URI: str = "http://127.0.0.1:8500/api/auth/soundcloud/callback"
     SOUNDCLOUD_EMAIL: str = ""  # Fallback for password grant or browser auth
     SOUNDCLOUD_PASSWORD: str = ""  # Fallback for password grant or browser auth
 
