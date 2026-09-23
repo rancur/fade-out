@@ -102,11 +102,13 @@ def test_truncated_staged_copy_is_rejected(tmp_path, monkeypatch):
     half the file's bytes still reports the full duration, passes
     ``if not actual``, passes the ``abs(actual - expected) > 1.0`` check, and
     would be promoted over the original. Only a raw size comparison against
-    the source catches it. This is the single most important test on this
-    branch -- it must fail if the size check in write_tagged_copy is
-    removed (verified by hand: with that check commented out, this test
-    fails because write_tagged_copy returns the truncated path instead of
-    raising).
+    the source catches it -- specifically a comparison of the AUDIO PAYLOAD
+    (everything after the last metadata block), not of total file size; see
+    ``_audio_payload_offset``. This is the single most important test on
+    this branch -- it must fail if the payload-size check in
+    write_tagged_copy is removed (verified by hand: with that check
+    commented out, this test fails because write_tagged_copy returns the
+    truncated path instead of raising).
     """
     src = tmp_path / "orig.flac"
     _make_flac_with_audio_data(src)
@@ -144,7 +146,7 @@ def test_truncated_staged_copy_is_rejected(tmp_path, monkeypatch):
 
     monkeypatch.setattr(RealFLAC, "save", truncating_save)
 
-    with pytest.raises(RuntimeError, match="not larger than the source"):
+    with pytest.raises(RuntimeError, match="audio payload.*smaller than the source"):
         source_tagger.write_tagged_copy(
             str(src), {"ARTIST": "Will See"}, None, None
         )
@@ -152,6 +154,64 @@ def test_truncated_staged_copy_is_rejected(tmp_path, monkeypatch):
     leftovers = list((tmp_path / source_tagger.TEMP_DIRNAME).glob("*")) \
         if (tmp_path / source_tagger.TEMP_DIRNAME).exists() else []
     assert leftovers == [], "a truncated write must not leave a temp file behind"
+
+
+class _FakeSeenDB:
+    """Minimal stand-in for ``_SeenFilesDB``, just enough for register_and_promote."""
+
+    def __init__(self):
+        self.done = set()
+
+    def mark_done(self, file_hash, file_path, file_type):
+        self.done.add(file_hash)
+
+    def is_done(self, file_hash):
+        return file_hash in self.done
+
+    def close(self):
+        pass
+
+
+def test_retagging_an_already_tagged_file_succeeds(tmp_path):
+    """Regression test for the false positive fixed in write_tagged_copy:
+    once a file already carries the 64 KB padding block this module adds,
+    mutagen writes new metadata INTO that padding on a re-tag, so the total
+    file size does not change even though the write is perfectly healthy --
+    ``pipeline.py`` tags on every ``pipeline_complete``, so any mix re-run
+    after already being tagged must not be rejected as "truncated".
+
+    Verified by hand: reverting the check in ``write_tagged_copy`` to the
+    old ``temp_size <= src_size`` form makes this test fail, because the
+    second (byte-identical-size) tagging raises instead of succeeding.
+    """
+    src = tmp_path / "orig.flac"
+    _make_flac_with_audio_data(src)
+
+    tags = {"ARTIST": "Will See", "TITLE": "T"}
+
+    once = source_tagger.write_tagged_copy(str(src), tags, None, None)
+    once_path = tmp_path / "once.flac"
+    os.replace(once, once_path)
+
+    # Re-tag the already-tagged file with the SAME tags -- this is the
+    # byte-identical case: the new metadata fits inside the existing
+    # padding block, so total file size does not change.
+    twice = source_tagger.write_tagged_copy(str(once_path), tags, None, None)
+
+    assert os.path.getsize(twice) == os.path.getsize(once_path), (
+        "a re-tag of an already-tagged file with identical tags should not "
+        "change the total file size -- the new metadata fits in the "
+        "existing padding block; if this assertion fails the test fixture, "
+        "not the check under test, needs attention"
+    )
+
+    # Prove it survives the full pipeline, not just write_tagged_copy: the
+    # file must be promotable.
+    final = tmp_path / "final.flac"
+    db = _FakeSeenDB()
+    source_tagger.register_and_promote(twice, str(final), "audio", seen_db=db)
+    assert os.path.isfile(final), "a healthy re-tag must be promoted, not rejected"
+    assert not os.path.exists(twice)
 
 
 def test_zero_duration_read_fails_with_expected_duration(tmp_path, monkeypatch):

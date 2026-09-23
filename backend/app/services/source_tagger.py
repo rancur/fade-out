@@ -106,6 +106,37 @@ def temp_dir_for(path: str) -> str:
     return os.path.join(os.path.dirname(path), TEMP_DIRNAME)
 
 
+def _audio_payload_offset(path: str) -> int:
+    """Byte offset where FLAC audio frames begin, walking the metadata block
+    chain the same way a real FLAC decoder would.
+
+    Total file size is not a reliable stand-in for "did the audio payload
+    survive the write": once a file already carries the 64 KB padding block
+    this module adds, re-tagging writes new metadata INTO that padding, so
+    the total file size does not change even though the write is perfectly
+    healthy -- a byte-identical re-tag of an already-tagged file is the
+    normal, expected case, not corruption. The only size comparison that
+    actually means anything is over the audio payload itself: everything
+    from this offset to the end of the file.
+    """
+    with open(path, "rb") as fh:
+        magic = fh.read(4)
+        if magic != b"fLaC":
+            raise RuntimeError(f"{path} is not a FLAC file (bad magic {magic!r})")
+        offset = 4
+        while True:
+            block_header = fh.read(4)
+            if len(block_header) < 4:
+                raise RuntimeError(f"{path}: truncated metadata block header")
+            is_last = bool(block_header[0] & 0x80)
+            block_len = int.from_bytes(block_header[1:4], "big")
+            fh.seek(block_len, 1)
+            offset = fh.tell()
+            if is_last:
+                break
+        return offset
+
+
 def write_tagged_copy(
     src: str,
     tags: Dict[str, str],
@@ -177,20 +208,31 @@ def write_tagged_copy(
         # I/O error on the NAS, a disk that fills after ``_has_free_space``
         # passed -- produces a file whose header still claims the full
         # original duration while the audio payload itself is truncated. That
-        # passes both checks above. Only a raw size comparison against the
-        # source catches it: the tagged copy is the same audio plus 64 KB of
-        # padding plus any cover art minus a small old tag block, so it must
-        # always come out larger than the source. Anything smaller than the
-        # source is definitionally a truncated write.
+        # passes both checks above. Only a size comparison against the source
+        # catches it -- but it must be a comparison of the AUDIO PAYLOAD, not
+        # of total file size: once a source already carries the 64 KB padding
+        # block this module adds, a healthy re-tag writes new metadata INTO
+        # that padding and the total file size does not change at all, which
+        # made a plain ``temp_size <= src_size`` check a false positive on
+        # every re-tag of an already-tagged file. Walking to the start of the
+        # audio frames and comparing what follows is the real invariant: the
+        # staged copy must carry at least as many audio bytes as the source,
+        # however its metadata happens to be sized.
         src_size = os.path.getsize(src)
         temp_size = os.path.getsize(temp_path)
-        if temp_size <= src_size:
+        src_audio_offset = _audio_payload_offset(src)
+        temp_audio_offset = _audio_payload_offset(temp_path)
+        src_payload = src_size - src_audio_offset
+        temp_payload = temp_size - temp_audio_offset
+        if temp_payload < src_payload:
             raise RuntimeError(
-                f"tagged copy ({temp_size} bytes) is not larger than the source "
-                f"({src_size} bytes) -- this means the audio payload was "
-                "truncated during the write (e.g. ENOSPC or an I/O error), even "
-                "though the header still parses and reports a valid duration; "
-                "refusing to promote a short write over an irreplaceable original"
+                f"tagged copy's audio payload ({temp_payload} bytes, after a "
+                f"{temp_audio_offset}-byte metadata header) is smaller than the "
+                f"source's ({src_payload} bytes, after a {src_audio_offset}-byte "
+                "metadata header) -- this means the audio payload was truncated "
+                "during the write (e.g. ENOSPC or an I/O error), even though the "
+                "header still parses and reports a valid duration; refusing to "
+                "promote a short write over an irreplaceable original"
             )
 
         # Force the tagged copy's data to disk before the caller can promote
