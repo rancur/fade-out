@@ -255,6 +255,143 @@ curl -X POST "$FADEOUT/api/catalog/mixes/<mix_id>/rename-source?dry_run=true"
 `dry_run=true` reports the plan without touching anything, and works even while
 the setting is off.
 
+### Source File Tagging
+
+Turning on **Write metadata into source files** (Settings → Advanced,
+`tag_source_files`, OFF by default) writes library metadata directly into a
+completed mix's source FLAC, so the recording is identifiable in Plex or any
+local player — not just on SoundCloud/YouTube. It writes:
+
+| Tag | Value |
+|---|---|
+| `ARTIST` | `Will See` |
+| `TITLE` | the mix title |
+| `DATE` | the same `YYYY-MM-DD` token used for renaming (see above) |
+| `GENRE` | the mix's genres, `; `-separated |
+| `ALBUM` | `Will See Mixes` |
+| `DESCRIPTION` | the tracklist |
+| `URL` | the SoundCloud or YouTube URL |
+| cover picture block | the generated cover art |
+
+This is a separate setting from **Rename source files to match titles**
+(`rename_source_files`, above) and does not change it — renaming moves/renames
+the file, tagging rewrites its metadata, and either can be on, off, or both.
+
+**Why this can't just be a mutagen call in place.** The file watcher dedupes
+on `md5(first 10 MB)`, and FLAC metadata blocks live at the very start of the
+file, so writing tags changes a file's dedupe hash. If a freshly tagged file
+appeared in the watch folder before the watcher knew its new hash, it would be
+re-ingested as a new recording and the mix re-uploaded a second time. Tagging
+is therefore done out-of-place and promoted in a fixed order:
+
+1. copy the source into a hidden `.fadeout-tagging/` folder inside the watch
+   directory (same filesystem, and invisible to the watcher's non-recursive
+   directory listing),
+2. write the tags and cover art into the copy,
+3. re-read the copy to confirm it still parses as valid FLAC, that its audio
+   payload (everything past the last metadata block) is at least as large as
+   the source's (a truncated write — e.g. the disk filling mid-copy — still
+   parses and still reports the original's full duration, since that
+   duration comes from a header field a short write leaves untouched; only a
+   size check catches it — and it has to be a payload-size check, not a
+   total-file-size check, because a healthy re-tag of an already-tagged file
+   writes its new metadata into the existing padding block and doesn't grow
+   the file at all), and, when a duration is known for the mix, that it
+   still matches,
+4. register the copy's new hash with the file watcher,
+5. only then move it into place with an atomic rename, followed by an fsync
+   of the containing directory so a crash right after promotion can't lose
+   the rename.
+
+**Registering the hash before promoting the file is the safety property, not
+an implementation detail — do not reorder steps 4 and 5.** A tagged file
+registered too late is a tagged file the watcher can pick up as new.
+
+These FLACs carry no padding (audio frames measured to begin at byte 86), so
+the first tag write on a given file is always a full rewrite; 64 KB of padding
+is added on write so later edits can happen in place. The rewrite is skipped —
+logged, never fatal to the pipeline run — when free space on the volume is
+under 2x the file's size, since the out-of-place copy needs room to exist
+alongside the original while it is written.
+
+`.fadeout-tagging/` is operator-visible, not a temp directory the OS
+reclaims on its own. Every failure path removes its own staged file, but it
+is not swept on a schedule or on startup — a run that fails between writing
+the copy and any cleanup running (a killed process, an OS-level crash) can
+leave a multi-gigabyte orphan behind. Check it after any run that didn't
+finish cleanly.
+
+**Re-tagging is not idempotent, but it is safe.** There's no "already
+tagged, skip it" check — a mix that already has all its tags written gets
+the exact same full out-of-place rewrite on every run that touches it, and
+that rewrite succeeds: once a file already carries the 64 KB padding block
+this module adds, mutagen writes new metadata *into* that padding, so a
+healthy re-tag's total file size doesn't change at all. The truncation guard
+accounts for this — it compares the audio payload (everything past the last
+metadata block), not total file size, so a byte-identical-size re-tag is not
+mistaken for a truncated write. Running the backfill twice over the same
+mixes redoes the full multi-gigabyte rewrite twice, not zero — that's wasted
+I/O and time on an irreplaceable file, not a failure.
+
+To backfill renames and tags across already-published mixes:
+
+```bash
+curl -X POST "$FADEOUT/api/catalog/retag"
+```
+
+**Both `tag_source_files` and `rename_source_files` must be turned on** for a
+real (`dry_run=false`) backfill run to actually do anything. When a flag is
+off, that half comes back as a no-op, but the two report it in different
+shapes: the tagger's result carries `"status": "disabled"` directly; the
+renamer's result has no top-level `status` key at all (its shape is
+`{mix_id, reason, dry_run, enabled, renamed, skipped, errors}`) and instead
+carries `"enabled": false` plus `"skipped": [{"reason": "disabled"}]`.
+`GET /retag/status`'s `summary` (below) normalizes both into the same
+`disabled` bucket so you don't need to know the shape difference yourself —
+check it before trusting a run. Since both settings default to OFF, it's
+easy to run a green dry-run pre-flight and then have the real run silently
+do nothing.
+
+`dry_run` **defaults to true**, so a bare POST is the safe, report-only form —
+per mix, it reports whether the source file exists, whether there is
+sufficient free space, and whether each of the two settings is actually on,
+via an `enabled` field in each half's result, without touching anything. The
+two halves differ here too: the tagger's dry run short-circuits with an
+explicit "`tag_source_files is off`" reason when its own flag is disabled;
+the renamer's dry run does **not** short-circuit — it always reports the
+rename plan it would execute (`planned`) regardless of the flag, and relies
+on its `enabled` field to tell you separately whether a real run would
+actually apply that plan. Pass `dry_run=false` to actually rewrite files, and
+poll progress while it runs:
+
+```bash
+curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false"
+curl "$FADEOUT/api/catalog/retag/status"
+```
+
+Pass `limit=<n>` to cap how many completed mixes a single run touches — e.g.
+`curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&limit=5"`. This caps
+a *single* run; it does not paginate. `_run_retag`'s selection query has no
+`ORDER BY` and applies no offset, so calling it again with the same `limit`
+is not guaranteed to reach a different batch of mixes rather than
+re-selecting the same ones. Don't rely on repeated limited calls to sweep the
+full backlog in "supervised batches" — use `limit` to bound the size of one
+run (e.g. a smoke test before committing to all ~80 mixes / ~498 GB), and run
+without it (or with a limit covering everything) once you're ready to cover
+the full completed-mix backlog in a single pass.
+The `candidates` count returned by the POST already reflects `limit`.
+
+`GET /retag/status` includes a `summary` — `{ok, skipped, disabled, failed,
+dry_run, unknown}` counts across every rename *and* tag outcome of the run.
+Any outcome shape the summary doesn't recognise lands in `unknown` rather
+than being silently dropped, so `sum(summary.values())` always equals
+`2 * processed` — a run where everything came back `disabled` can't be
+mistaken for one that actually did the work; `processed == total` alone
+can't tell those apart.
+
+A retag run started while one is already in progress gets `409` rather than
+starting a second concurrent pass over the same files.
+
 ### Output Directories
 
 | Path | Purpose |

@@ -238,6 +238,11 @@ class Settings(BaseSettings):
     # to do anything at all (with :ro every rename is skipped and logged).
     RENAME_SOURCE_FILES: bool = False
 
+    # --- Source-file tagging ---
+    # When True, a finished run writes artist/title/date/genre/tracklist and
+    # cover art into the source FLAC's metadata. OFF by default.
+    TAG_SOURCE_FILES: bool = False
+
     # --- Track-detection merge ---
     # Gap-filling detections (Shazam/AudD) scoring strictly below this confidence
     # keep their timestamp but render as the "ID - ID" placeholder instead of

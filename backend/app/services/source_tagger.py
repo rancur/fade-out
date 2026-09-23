@@ -1,0 +1,455 @@
+"""Write library metadata into a mix's source recording.
+
+fade-out publishes a generated title, artwork and tracklist to SoundCloud and
+YouTube, but the FLAC on the NAS carries none of it. Opened in Plex or any
+local player a mix has no artist, no title, no date and no artwork. This module
+closes that gap for the file itself; ``source_renamer`` closes it for the name.
+
+**Why this is not a simple mutagen call.** The watcher dedupes on
+``md5(first 10 MB)`` and FLAC metadata blocks live at the very start of the
+file -- measured on this library, audio frames begin at byte 86 with zero
+padding. So writing tags (a) changes the dedupe hash, which would make the
+watcher re-ingest a published mix and upload it a second time, and (b) cannot
+fit in place, forcing a full rewrite of a multi-gigabyte file.
+
+The rewrite is therefore done out-of-place and promoted atomically:
+
+    1. copy+tag  -> <watch_audio>/.fadeout-tagging/<name>   (same filesystem,
+                    and invisible to the watcher, which uses a non-recursive
+                    os.listdir)
+    2. verify    -> re-read; duration must still match the database
+    3. register  -> md5(first 10 MB of temp) -> seen_files, marked done
+    4. promote   -> atomic os.rename into place
+
+Registering before promoting means a file is never visible to the watcher
+while unregistered. Writing out-of-place means the original survives a crash,
+a full disk, or a corrupt write. In-place tagging gives neither guarantee.
+"""
+
+import logging
+import os
+import shutil
+import uuid
+from typing import Any, Dict, List, Optional
+
+from app.services import source_renamer
+from app.services.source_renamer import is_within_allowed_roots
+from app.services.tracklist_utils import format_timestamp
+
+logger = logging.getLogger("fadeout.source_tagger")
+
+ARTIST = "Will See"
+ALBUM = "Will See Mixes"
+TEMP_DIRNAME = ".fadeout-tagging"
+FLAC_PADDING_BYTES = 65536
+
+
+def _format_tracklist(tracklist: Optional[List[Dict[str, Any]]]) -> str:
+    lines = []
+    for entry in tracklist or []:
+        if not isinstance(entry, dict):
+            continue
+        artist = (entry.get("artist") or "").strip()
+        title = (entry.get("title") or "").strip()
+        if not title:
+            continue
+        # Prefer pre-formatted timestamp; fall back to formatting from seconds
+        ts = (entry.get("timestamp_formatted") or "").strip()
+        if not ts:
+            seconds = entry.get("timestamp_seconds")
+            if seconds is not None:
+                ts = format_timestamp(float(seconds or 0))
+        label = f"{artist} - {title}" if artist else title
+        line = f"{ts} {label}".strip() if ts else label
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def build_tags(mix: Any) -> Dict[str, str]:
+    """The Vorbis comments to write for this mix. Pure; touches no disk."""
+    tags: Dict[str, str] = {"ARTIST": ARTIST, "ALBUM": ALBUM}
+
+    if getattr(mix, "title", None):
+        tags["TITLE"] = mix.title
+
+    date_token = source_renamer.resolve_date_token(
+        getattr(mix, "audio_file_path", None) or "",
+        getattr(mix, "video_file_path", None) or "",
+        source=getattr(mix, "source", None),
+        created_at=getattr(mix, "created_at", None),
+    )
+    if date_token:
+        tags["DATE"] = date_token
+
+    genre_value = "; ".join(str(g) for g in (getattr(mix, "genres", None) or []) if g)
+    if genre_value:
+        tags["GENRE"] = genre_value
+
+    description = _format_tracklist(getattr(mix, "tracklist", None))
+    if description:
+        tags["DESCRIPTION"] = description
+
+    url = getattr(mix, "soundcloud_url", None) or getattr(mix, "youtube_url", None)
+    if url:
+        tags["URL"] = url
+
+    return tags
+
+
+def temp_dir_for(path: str) -> str:
+    """The staging directory for a source file's tagged copy.
+
+    A dot-subdirectory of the file's own folder: same filesystem, so the final
+    promote is an atomic rename rather than a second multi-gigabyte copy, and
+    invisible to the watcher, which scans with a non-recursive ``os.listdir``.
+    """
+    return os.path.join(os.path.dirname(path), TEMP_DIRNAME)
+
+
+def _audio_payload_offset(path: str) -> int:
+    """Byte offset where FLAC audio frames begin, walking the metadata block
+    chain the same way a real FLAC decoder would.
+
+    Total file size is not a reliable stand-in for "did the audio payload
+    survive the write": once a file already carries the 64 KB padding block
+    this module adds, re-tagging writes new metadata INTO that padding, so
+    the total file size does not change even though the write is perfectly
+    healthy -- a byte-identical re-tag of an already-tagged file is the
+    normal, expected case, not corruption. The only size comparison that
+    actually means anything is over the audio payload itself: everything
+    from this offset to the end of the file.
+    """
+    with open(path, "rb") as fh:
+        magic = fh.read(4)
+        if magic != b"fLaC":
+            raise RuntimeError(f"{path} is not a FLAC file (bad magic {magic!r})")
+        offset = 4
+        while True:
+            block_header = fh.read(4)
+            if len(block_header) < 4:
+                raise RuntimeError(f"{path}: truncated metadata block header")
+            is_last = bool(block_header[0] & 0x80)
+            block_len = int.from_bytes(block_header[1:4], "big")
+            fh.seek(block_len, 1)
+            offset = fh.tell()
+            if is_last:
+                break
+        return offset
+
+
+def write_tagged_copy(
+    src: str,
+    tags: Dict[str, str],
+    cover_art_path: Optional[str],
+    expected_duration: Optional[float],
+) -> str:
+    """Copy ``src``, write ``tags`` into the copy, verify it, return its path.
+
+    The original is never opened for writing. On any failure the temp file is
+    removed and the caller is left exactly as it started.
+
+    The file is always re-read after writing to prove it still parses as valid
+    FLAC, and its size is always compared against the source, which are the
+    two checks that do not depend on the caller passing anything -- the size
+    check exists because the STREAMINFO duration a parse gives back is a
+    header read, not a measurement, and survives truncation unchanged. If
+    ``expected_duration`` is provided, the duration is also compared; if
+    None, only the parse and size checks are performed.
+    """
+    from mutagen.flac import FLAC, Picture
+
+    staging = temp_dir_for(src)
+    os.makedirs(staging, exist_ok=True)
+    temp_path = os.path.join(
+        staging, f"{os.getpid()}-{uuid.uuid4().hex[:8]}-{os.path.basename(src)}"
+    )
+
+    try:
+        shutil.copy2(src, temp_path)
+
+        audio = FLAC(temp_path)
+        for key, value in tags.items():
+            audio[key] = value
+
+        if cover_art_path and os.path.isfile(cover_art_path):
+            picture = Picture()
+            picture.type = 3  # front cover
+            picture.mime = "image/png" if cover_art_path.lower().endswith(".png") else "image/jpeg"
+            picture.desc = "Cover"
+            with open(cover_art_path, "rb") as fh:
+                picture.data = fh.read()
+            audio.clear_pictures()
+            audio.add_picture(picture)
+
+        audio.save(padding=lambda _info: FLAC_PADDING_BYTES)
+
+        # Always re-read: this proves the file we just wrote still parses as
+        # FLAC. It is the one check that does not depend on the caller passing
+        # anything, and a corrupt-but-parseable write is exactly what this
+        # module exists to stop from being promoted.
+        verify = FLAC(temp_path)
+
+        if expected_duration is not None:
+            actual = verify.info.length
+            if not actual:
+                raise RuntimeError(
+                    "tagged copy reports no audio duration -- the write is empty or "
+                    "unreadable, refusing to treat it as good"
+                )
+            if abs(actual - float(expected_duration)) > 1.0:
+                raise RuntimeError(
+                    f"tagged copy duration {actual:.1f}s does not match the expected "
+                    f"{float(expected_duration):.1f}s"
+                )
+
+        # ``verify.info.length`` is a HEADER READ, not a measurement: it comes
+        # from the FLAC STREAMINFO block, which shutil.copy2 carries over
+        # verbatim from the original. A short write -- ENOSPC part-way, an
+        # I/O error on the NAS, a disk that fills after ``_has_free_space``
+        # passed -- produces a file whose header still claims the full
+        # original duration while the audio payload itself is truncated. That
+        # passes both checks above. Only a size comparison against the source
+        # catches it -- but it must be a comparison of the AUDIO PAYLOAD, not
+        # of total file size: once a source already carries the 64 KB padding
+        # block this module adds, a healthy re-tag writes new metadata INTO
+        # that padding and the total file size does not change at all, which
+        # made a plain ``temp_size <= src_size`` check a false positive on
+        # every re-tag of an already-tagged file. Walking to the start of the
+        # audio frames and comparing what follows is the real invariant: the
+        # staged copy must carry at least as many audio bytes as the source,
+        # however its metadata happens to be sized.
+        src_size = os.path.getsize(src)
+        temp_size = os.path.getsize(temp_path)
+        src_audio_offset = _audio_payload_offset(src)
+        temp_audio_offset = _audio_payload_offset(temp_path)
+        src_payload = src_size - src_audio_offset
+        temp_payload = temp_size - temp_audio_offset
+        if temp_payload < src_payload:
+            raise RuntimeError(
+                f"tagged copy's audio payload ({temp_payload} bytes, after a "
+                f"{temp_audio_offset}-byte metadata header) is smaller than the "
+                f"source's ({src_payload} bytes, after a {src_audio_offset}-byte "
+                "metadata header) -- this means the audio payload was truncated "
+                "during the write (e.g. ENOSPC or an I/O error), even though the "
+                "header still parses and reports a valid duration; refusing to "
+                "promote a short write over an irreplaceable original"
+            )
+
+        # Force the tagged copy's data to disk before the caller can promote
+        # it over the original with an atomic rename. POSIX gives no
+        # ordering guarantee between written data blocks and a later rename,
+        # so without this a crash or power loss right after the rename can
+        # leave the directory entry pointing at unwritten blocks with the
+        # original already gone.
+        with open(temp_path, "rb+") as fh:
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        return temp_path
+    except Exception:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            logger.warning("could not clean up temp file %s", temp_path, exc_info=True)
+        raise
+
+
+def _fsync_dir(path: str) -> None:
+    """Fsync the directory containing ``path`` so a promote survives a crash.
+
+    A successful ``os.rename`` only guarantees the new directory entry is
+    visible; POSIX gives no ordering guarantee between that and the entry
+    actually reaching disk, so without this a crash or power loss right
+    after the rename can lose the rename on some filesystems even though the
+    renamed file's own data was already fsynced. Not every platform supports
+    fsyncing a directory, so a refusal here degrades to a logged warning
+    rather than failing an otherwise-successful promote.
+    """
+    directory = os.path.dirname(path) or "."
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        logger.warning(
+            "could not fsync directory %s after promoting %s (platform may not "
+            "support directory fsync)", directory, path, exc_info=True,
+        )
+
+
+def register_and_promote(
+    temp_path: str,
+    final_path: str,
+    file_type: str = "audio",
+    seen_db: Any = None,
+) -> None:
+    """Register the tagged file's hash, then move it into place.
+
+    **The order is the safety property.** Tagging changes the dedupe hash, so
+    between a tagged file appearing in a watch folder and its hash being known,
+    the watcher would treat it as a new recording and start a pipeline run that
+    re-uploads an already-published mix. Registering first closes that window
+    entirely; the file is never visible while unknown.
+
+    The previous hash's row is deliberately left in place -- a restored backup
+    of the untagged original must still dedupe.
+
+    Any failure in this function -- a raising ``compute_file_hash`` (an I/O
+    error reading the multi-gigabyte temp file), a raising ``mark_done``
+    (``sqlite3.OperationalError: database is locked`` is a live failure mode
+    while the running watcher holds its own connection to the same
+    ``seen_files.db``), or a raising ``os.rename`` -- removes the temp file
+    before re-raising. The staging dir is hidden from the watcher, so an
+    orphan left behind here is invisible debris that nothing else will ever
+    reclaim.
+    """
+    from app.services import file_watcher
+
+    db = seen_db if seen_db is not None else file_watcher.open_seen_files_db()
+    opened_here = seen_db is None
+    try:
+        try:
+            new_hash = file_watcher.compute_file_hash(temp_path)
+            db.mark_done(new_hash, final_path, file_type)
+            os.rename(temp_path, final_path)
+        except Exception:
+            # The mark_done row above (if it already landed) is deliberately
+            # NOT rolled back: it is keyed on a hash no file now has, so it
+            # is inert, and a restored backup of the untagged original still
+            # dedupes on its own (different) hash.
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                logger.warning("could not clean up temp file %s", temp_path, exc_info=True)
+            raise
+
+        _fsync_dir(final_path)
+        logger.info(
+            "promoted tagged file %s (hash %s registered first)", final_path, new_hash
+        )
+    finally:
+        if opened_here:
+            db.close()
+
+
+MIN_FREE_SPACE_MULTIPLE = 2
+
+
+async def _tagging_enabled() -> bool:
+    """Mirror how source_renamer reads its own flag: app_config.resolve is async."""
+    from app.services import app_config
+
+    return bool(await app_config.resolve("tag_source_files"))
+
+
+async def _load_mix(mix_id: str) -> Any:
+    from sqlalchemy import select
+
+    from app.database import async_session_factory
+    from app.models import Mix
+
+    async with async_session_factory() as session:
+        return (await session.execute(select(Mix).where(Mix.id == mix_id))).scalar_one_or_none()
+
+
+def _has_free_space(path: str) -> bool:
+    """Refuse to rewrite a file we cannot fit a second copy of.
+
+    The rewrite is out-of-place, so it needs room for the copy alongside the
+    original. Running the volume dry mid-write is how an irreplaceable
+    multi-gigabyte recording gets truncated.
+    """
+    try:
+        need = os.path.getsize(path) * MIN_FREE_SPACE_MULTIPLE
+        return shutil.disk_usage(os.path.dirname(path)).free >= need
+    except OSError:
+        return False
+
+
+async def tag_sources_for_mix(
+    mix_id: str, *, reason: str, dry_run: bool = False
+) -> Dict[str, Any]:
+    """Tag this mix's source audio. Best-effort: never raises, never fails a run."""
+    actions: List[Dict[str, Any]] = []
+
+    try:
+        # Evaluated unconditionally -- including during a dry run. Both
+        # tag_source_files and rename_source_files default to OFF, so a dry
+        # run that never looked at the flag could report "would tag all N
+        # mixes", green-light a real run, and have every mix come back
+        # "disabled" with nothing done: a full pre-flight report and a real
+        # run that silently does nothing look identical unless the dry run
+        # checks the same flag the real run gates on.
+        enabled = await _tagging_enabled()
+        if not dry_run and not enabled:
+            return {"status": "disabled", "actions": [], "reason": "tag_source_files is off"}
+
+        mix = await _load_mix(mix_id)
+        if mix is None:
+            return {"status": "skipped", "actions": [], "reason": f"no mix {mix_id}"}
+
+        status = getattr(mix, "pipeline_status", None)
+        if status != "completed":
+            return {
+                "status": "skipped", "actions": [],
+                "reason": f"pipeline_status is {status!r}, not 'completed' -- "
+                          "only published mixes are tagged",
+            }
+
+        src = getattr(mix, "audio_file_path", None)
+        if not src:
+            return {"status": "skipped", "actions": [], "reason": "no audio_file_path"}
+
+        if not is_within_allowed_roots(src):
+            return {
+                "status": "skipped", "actions": [],
+                "reason": f"{src} is outside the allowed roots",
+            }
+
+        tags = build_tags(mix)
+        exists = os.path.isfile(src)
+        has_space = _has_free_space(src) if exists else False
+        actions.append({
+            "path": src,
+            "tags": tags,
+            "cover_art": getattr(mix, "cover_art_path", None),
+            "source_exists": exists,
+            "sufficient_space": has_space,
+            "enabled": enabled,
+        })
+
+        if dry_run:
+            if not enabled:
+                return {"status": "dry_run", "actions": actions,
+                        "reason": "tag_source_files is off -- a real run would do nothing"}
+            if not exists:
+                return {"status": "dry_run", "actions": actions,
+                        "reason": f"source missing: {src} -- would be skipped"}
+            if not has_space:
+                return {"status": "dry_run", "actions": actions,
+                        "reason": f"insufficient free space for {src} -- would be skipped"}
+            return {"status": "dry_run", "actions": actions, "reason": "no changes made"}
+
+        if not exists:
+            return {"status": "skipped", "actions": actions,
+                    "reason": f"{src} does not exist"}
+
+        if not has_space:
+            return {"status": "skipped", "actions": actions,
+                    "reason": f"insufficient free space to rewrite {src} safely"}
+
+        temp = write_tagged_copy(
+            src, tags, getattr(mix, "cover_art_path", None),
+            getattr(mix, "duration_seconds", None),
+        )
+        register_and_promote(temp, src, "audio")
+        logger.info("tagged %s (%s)", src, reason)
+        return {"status": "ok", "actions": actions, "reason": reason}
+
+    except Exception as exc:  # never fatal -- see module docstring
+        logger.exception("tagging failed for mix %s", mix_id)
+        return {"status": "failed", "actions": actions, "reason": str(exc)}
