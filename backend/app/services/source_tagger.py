@@ -117,9 +117,12 @@ def write_tagged_copy(
     removed and the caller is left exactly as it started.
 
     The file is always re-read after writing to prove it still parses as valid
-    FLAC, which is the one check that does not depend on the caller passing
-    anything. If ``expected_duration`` is provided, the duration is also
-    compared; if None, only the parse-check is performed.
+    FLAC, and its size is always compared against the source, which are the
+    two checks that do not depend on the caller passing anything -- the size
+    check exists because the STREAMINFO duration a parse gives back is a
+    header read, not a measurement, and survives truncation unchanged. If
+    ``expected_duration`` is provided, the duration is also compared; if
+    None, only the parse and size checks are performed.
     """
     from mutagen.flac import FLAC, Picture
 
@@ -166,6 +169,39 @@ def write_tagged_copy(
                     f"tagged copy duration {actual:.1f}s does not match the expected "
                     f"{float(expected_duration):.1f}s"
                 )
+
+        # ``verify.info.length`` is a HEADER READ, not a measurement: it comes
+        # from the FLAC STREAMINFO block, which shutil.copy2 carries over
+        # verbatim from the original. A short write -- ENOSPC part-way, an
+        # I/O error on the NAS, a disk that fills after ``_has_free_space``
+        # passed -- produces a file whose header still claims the full
+        # original duration while the audio payload itself is truncated. That
+        # passes both checks above. Only a raw size comparison against the
+        # source catches it: the tagged copy is the same audio plus 64 KB of
+        # padding plus any cover art minus a small old tag block, so it must
+        # always come out larger than the source. Anything smaller than the
+        # source is definitionally a truncated write.
+        src_size = os.path.getsize(src)
+        temp_size = os.path.getsize(temp_path)
+        if temp_size <= src_size:
+            raise RuntimeError(
+                f"tagged copy ({temp_size} bytes) is not larger than the source "
+                f"({src_size} bytes) -- this means the audio payload was "
+                "truncated during the write (e.g. ENOSPC or an I/O error), even "
+                "though the header still parses and reports a valid duration; "
+                "refusing to promote a short write over an irreplaceable original"
+            )
+
+        # Force the tagged copy's data to disk before the caller can promote
+        # it over the original with an atomic rename. POSIX gives no
+        # ordering guarantee between written data blocks and a later rename,
+        # so without this a crash or power loss right after the rename can
+        # leave the directory entry pointing at unwritten blocks with the
+        # original already gone.
+        with open(temp_path, "rb+") as fh:
+            fh.flush()
+            os.fsync(fh.fileno())
+
         return temp_path
     except Exception:
         try:
