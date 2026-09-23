@@ -17,10 +17,24 @@ allowlist guard must use a directory whose basename genuinely IS
 instead and would still pass after the allowlist check was deleted). Every
 guard test below asserts on ``result["reason"]`` to make sure it reached the
 guard its name claims, not just that some refusal happened.
+
+CTIME WARNING: the age guard now ages off the MORE RECENT of
+``st_mtime``/``st_ctime`` (see the fix for the bug this file's tests missed
+originally -- ``shutil.copy2`` carries the SOURCE's mtime onto a staged
+copy, so mtime alone is not trustworthy). ``os.utime`` can backdate mtime,
+but ctime cannot be backdated through any public API -- calling
+``os.utime`` on a path still bumps THAT path's real ctime to the moment of
+the call, regardless of what mtime/atime values are passed. Tests below
+that need a file to look genuinely old therefore use the ``fake_stat``
+fixture (which substitutes a controlled ``st_ctime`` at the exact
+``os.stat`` call ``sweep_staging`` makes) rather than relying on
+``os.utime`` alone for that. Tests that only need a genuinely FRESH file
+don't need it -- a file's real ctime is fresh at creation time regardless.
 """
 
 import os
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,6 +57,42 @@ def watch_dirs(tmp_path, monkeypatch):
     return audio, video
 
 
+@pytest.fixture
+def fake_stat(monkeypatch):
+    """Lets a test give any path a controlled ``st_ctime`` for the purposes
+    of ``sweep_staging``'s age guard (see the CTIME WARNING above for why
+    this exists instead of just backdating with ``os.utime``).
+
+    ``sweep_staging`` calls ``os.stat(path, follow_symlinks=False)`` as a
+    plain module-level call specifically so this is possible to intercept;
+    every field other than the ones a test explicitly overrides passes
+    through untouched from the real ``os.stat``.
+
+    Returns a ``set_ctime(path, hours_ago)`` function; call it for any path
+    that needs a fabricated age.
+    """
+    overrides = {}
+    real_stat = os.stat
+
+    def _stat(path, *args, **kwargs):
+        real = real_stat(path, *args, **kwargs)
+        key = os.path.normpath(os.fspath(path))
+        if key in overrides:
+            return SimpleNamespace(
+                st_mtime=real.st_mtime,
+                st_ctime=overrides[key],
+                st_size=real.st_size,
+            )
+        return real
+
+    monkeypatch.setattr(os, "stat", _stat)
+
+    def _set_ctime(path, hours_ago):
+        overrides[os.path.normpath(str(path))] = time.time() - hours_ago * 3600
+
+    return _set_ctime
+
+
 def _staging_dir(watch_dirs):
     audio, _video = watch_dirs
     staging = audio / source_tagger.TEMP_DIRNAME
@@ -50,11 +100,22 @@ def _staging_dir(watch_dirs):
     return staging
 
 
-def _touch(path, size=1024, age_hours=None):
+def _touch(path, size=1024, age_hours=None, fake_stat=None):
+    """Write ``path`` and, if ``age_hours`` is given, backdate its mtime.
+
+    If ``fake_stat`` (the fixture above) is also given, the SAME age is
+    applied to the path's effective ``st_ctime`` too -- simulating a
+    genuinely old file (both timestamps old), as opposed to the
+    copy2-staged-with-an-old-mtime scenario, which
+    ``test_copy_staged_from_an_old_mtime_source_is_left_alone_while_fresh``
+    below exercises directly through the real ``write_tagged_copy``.
+    """
     path.write_bytes(b"x" * size)
     if age_hours is not None:
         mtime = time.time() - age_hours * 3600
         os.utime(path, (mtime, mtime))
+        if fake_stat is not None:
+            fake_stat(path, age_hours)
     return path
 
 
@@ -62,9 +123,9 @@ def _touch(path, size=1024, age_hours=None):
 # Age guard -- the substance of this module
 # ---------------------------------------------------------------------------
 
-def test_file_older_than_threshold_is_removed_and_size_reported(watch_dirs):
+def test_file_older_than_threshold_is_removed_and_size_reported(watch_dirs, fake_stat):
     staging = _staging_dir(watch_dirs)
-    orphan = _touch(staging / "orphan.flac", size=4096, age_hours=8)
+    orphan = _touch(staging / "orphan.flac", size=4096, age_hours=8, fake_stat=fake_stat)
 
     result = source_tagger.sweep_staging(str(staging), older_than_hours=6.0)
 
@@ -94,9 +155,9 @@ def test_file_newer_than_threshold_is_left_alone(watch_dirs):
     assert any(entry["path"] == str(fresh) for entry in result["skipped"])
 
 
-def test_mixed_ages_only_removes_the_old_one(watch_dirs):
+def test_mixed_ages_only_removes_the_old_one(watch_dirs, fake_stat):
     staging = _staging_dir(watch_dirs)
-    old = _touch(staging / "old.flac", size=100, age_hours=10)
+    old = _touch(staging / "old.flac", size=100, age_hours=10, fake_stat=fake_stat)
     fresh = _touch(staging / "fresh.flac", size=100, age_hours=0.1)
 
     result = source_tagger.sweep_staging(str(staging), older_than_hours=6.0)
@@ -149,10 +210,10 @@ def test_staging_dir_outside_allowed_roots_is_refused(watch_dirs, tmp_path):
 # dry_run
 # ---------------------------------------------------------------------------
 
-def test_dry_run_removes_nothing_but_reports_the_same_set(watch_dirs):
+def test_dry_run_removes_nothing_but_reports_the_same_set(watch_dirs, fake_stat):
     staging = _staging_dir(watch_dirs)
-    old_a = _touch(staging / "a.flac", size=10, age_hours=10)
-    old_b = _touch(staging / "b.flac", size=20, age_hours=20)
+    old_a = _touch(staging / "a.flac", size=10, age_hours=10, fake_stat=fake_stat)
+    old_b = _touch(staging / "b.flac", size=20, age_hours=20, fake_stat=fake_stat)
     fresh = _touch(staging / "c.flac", size=30, age_hours=0.1)
 
     live = source_tagger.sweep_staging(str(staging), older_than_hours=6.0)
@@ -163,8 +224,8 @@ def test_dry_run_removes_nothing_but_reports_the_same_set(watch_dirs):
     assert (staging / "c.flac").exists()
 
     # Re-create the same fixture for the dry run.
-    old_a = _touch(staging / "a.flac", size=10, age_hours=10)
-    old_b = _touch(staging / "b.flac", size=20, age_hours=20)
+    old_a = _touch(staging / "a.flac", size=10, age_hours=10, fake_stat=fake_stat)
+    old_b = _touch(staging / "b.flac", size=20, age_hours=20, fake_stat=fake_stat)
     fresh = _touch(staging / "c.flac", size=30, age_hours=0.1)
 
     dry = source_tagger.sweep_staging(str(staging), older_than_hours=6.0, dry_run=True)
@@ -183,10 +244,12 @@ def test_dry_run_removes_nothing_but_reports_the_same_set(watch_dirs):
 # Never-fatal contract
 # ---------------------------------------------------------------------------
 
-def test_unremovable_file_does_not_abort_the_sweep(watch_dirs, monkeypatch):
+def test_unremovable_file_does_not_abort_the_sweep(watch_dirs, monkeypatch, fake_stat):
     staging = _staging_dir(watch_dirs)
-    stubborn = _touch(staging / "stubborn.flac", size=50, age_hours=10)
-    reclaimable = _touch(staging / "reclaimable.flac", size=60, age_hours=10)
+    stubborn = _touch(staging / "stubborn.flac", size=50, age_hours=10, fake_stat=fake_stat)
+    reclaimable = _touch(
+        staging / "reclaimable.flac", size=60, age_hours=10, fake_stat=fake_stat
+    )
 
     real_remove = os.remove
 
@@ -243,3 +306,103 @@ def test_nonexistent_staging_dir_is_a_noop_not_a_refusal(watch_dirs):
     assert result["refused"] is False
     assert result["removed"] == []
     assert result["removed_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Blocker 4 -- the test that would have caught the real bug: a staging copy
+# through the ACTUAL write_tagged_copy path, from a genuinely old-mtime
+# source, must not be swept while it's fresh.
+# ---------------------------------------------------------------------------
+
+def _make_real_flac(path, duration=1):
+    """A real, tiny, valid FLAC via ffmpeg -- same pattern as
+    test_source_tagger_idempotent.py's ``_make_flac``. Needed here (rather
+    than the synthetic ``b"x" * size`` fixtures the rest of this file uses)
+    because this test exercises ``write_tagged_copy`` for real, and that
+    function opens the copy with mutagen."""
+    import subprocess
+    subprocess.run(
+        ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+         "-t", str(duration), "-c:a", "flac", "-y", str(path)],
+        check=True, capture_output=True,
+    )
+
+
+def test_copy_staged_from_an_old_mtime_source_survives_a_concurrent_sweep(
+    watch_dirs, monkeypatch
+):
+    """THE test that would have caught the actual bug (see the module
+    docstring's CTIME WARNING and the fix in ``write_tagged_copy`` /
+    ``sweep_staging``). These are archival recordings months old:
+    ``shutil.copy2`` (inside ``write_tagged_copy``) carries the SOURCE
+    file's own old mtime onto the freshly staged copy, so before the fix a
+    copy of a 200-day-old source reported an age of ~4800 hours the instant
+    it was staged.
+
+    A synthetic fixture with a hand-backdated mtime (as every other test in
+    this file uses) can't reproduce this: ``mutagen``'s ``audio.save()``
+    -- which ``write_tagged_copy`` calls right after copying, to actually
+    write the tags -- is a real write, and a real write naturally bumps a
+    file's OWN mtime/ctime to "now" as an ordinary OS side effect. So by
+    the time ``write_tagged_copy`` returns control to a caller, the window
+    the bug lived in has already closed on its own -- calling
+    ``sweep_staging`` AFTER ``write_tagged_copy`` returns can never observe
+    it, bug or no bug. The actual danger, per the review, is a sweep
+    landing WHILE ``write_tagged_copy`` is still working -- i.e. in the gap
+    between ``shutil.copy2`` finishing and ``audio.save()`` running. This
+    test reproduces exactly that gap: ``mutagen.flac.FLAC`` is patched so
+    that the FIRST time ``write_tagged_copy`` opens the freshly staged copy
+    (immediately after copying, before any tag is set or saved), it also
+    runs a concurrent ``sweep_staging`` pass right there, mid-function --
+    the same race the review reproduced.
+    """
+    import mutagen.flac as mutagen_flac
+
+    audio, _video = watch_dirs
+    src = audio / "archival-recording.flac"
+    _make_real_flac(src)
+
+    # 200 days old, matching the review's own reproduction.
+    old_mtime = time.time() - 200 * 24 * 3600
+    os.utime(str(src), (old_mtime, old_mtime))
+    assert (time.time() - os.stat(src).st_mtime) / 3600 > 4700, (
+        "sanity: the source itself must actually be ~200 days old"
+    )
+
+    staging = audio / source_tagger.TEMP_DIRNAME
+    concurrent_sweep_result = {}
+    real_flac_cls = mutagen_flac.FLAC
+    call_count = {"n": 0}
+
+    def flac_with_concurrent_sweep(path, *args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # This is write_tagged_copy's FIRST ``FLAC(temp_path)`` call --
+            # right after ``shutil.copy2`` (and after the fix's own
+            # ``os.utime`` stamp, if present), before tags are set or
+            # ``audio.save()`` has run. Simulate a sweep landing exactly
+            # here, concurrently with the still-in-progress write.
+            concurrent_sweep_result["result"] = source_tagger.sweep_staging(
+                str(staging), older_than_hours=6.0
+            )
+        return real_flac_cls(path, *args, **kwargs)
+
+    # ``write_tagged_copy`` does ``from mutagen.flac import FLAC`` INSIDE
+    # the function body, re-resolving the name on every call -- patching
+    # the module attribute here is what that fresh import picks up.
+    monkeypatch.setattr(mutagen_flac, "FLAC", flac_with_concurrent_sweep)
+
+    temp_path = source_tagger.write_tagged_copy(
+        str(src), {"ARTIST": "Will See"}, None, None
+    )
+
+    assert "result" in concurrent_sweep_result, (
+        "sanity: the concurrent sweep hook must actually have fired"
+    )
+    assert os.path.exists(temp_path), (
+        "a copy staged moments ago from a 200-day-old source must survive "
+        "a sweep landing WHILE write_tagged_copy is still working, not be "
+        "swept as if the COPY itself were 200 days old"
+    )
+    assert concurrent_sweep_result["result"]["removed"] == []
+    assert concurrent_sweep_result["result"]["removed_count"] == 0

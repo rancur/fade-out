@@ -98,23 +98,36 @@ def build_tags(mix: Any) -> Dict[str, str]:
 
 
 def already_tagged(path: str, tags: Dict[str, str], cover_art_path: Optional[str]) -> bool:
-    """True if ``path`` already carries ``tags`` and its cover-art state
-    already matches ``cover_art_path``. A HEADER READ ONLY -- opening a FLAC
-    for reading never rewrites it, and this function never calls ``.save()``,
-    never copies, never touches the original in any way.
+    """True if ``path`` already carries ``tags`` and its embedded cover art
+    already matches the CONTENT of ``cover_art_path``, byte for byte. A
+    HEADER READ ONLY -- opening a FLAC for reading never rewrites it, and
+    this function never calls ``.save()``, never copies, never touches the
+    original in any way. Reading ``cover_art_path`` (to compare against) is
+    a small local PNG/JPEG, not the multi-gigabyte source, so this stays
+    cheap.
 
     Every key in ``tags`` must be present on the file with an identical
     value (a retitled mix has a different TITLE, so it reports False and
     gets re-tagged -- exactly the case this exists to still catch).
-    Embedded-picture presence must match whether ``cover_art_path`` points
-    at a real file: a mix tagged before cover art existed must not be
-    reported as already-tagged once art becomes available.
+
+    The cover art check compares actual CONTENT, not just presence: it was
+    previously presence-only (embedded picture exists vs. ``cover_art_path``
+    exists), which meant a mix whose artwork was regenerated -- same file
+    path, different bytes -- kept its STALE embedded art forever, since
+    "some picture is embedded" and "a cover art file exists" both stayed
+    true. The embedded picture's data is already in memory from the header
+    read above (FLAC PICTURE blocks are metadata, not audio payload, so
+    this is not an extra disk read of the source); a size check plus a
+    SHA-256 digest of both sides is compared instead of a full byte-for-byte
+    diff, which is equivalent in practice and cheaper for a large image.
 
     Any failure to open or parse the file (missing, corrupt, not a FLAC)
     is treated as "not already tagged" -- the safe default, since it falls
     through to the normal tag-and-verify path rather than silently skipping
     a file that might need repair.
     """
+    import hashlib
+
     from mutagen.flac import FLAC
 
     try:
@@ -130,6 +143,22 @@ def already_tagged(path: str, tags: Dict[str, str], cover_art_path: Optional[str
     has_art = bool(audio.pictures)
     if has_art != wants_art:
         return False
+
+    if wants_art and has_art:
+        try:
+            with open(cover_art_path, "rb") as fh:
+                on_disk = fh.read()
+        except OSError:
+            # Cover art existed a moment ago (``os.path.isfile`` above) but
+            # is now unreadable -- treat like any other failure to read the
+            # comparison source: not already tagged, fall through to a real
+            # (re-)tag rather than silently skipping.
+            return False
+        embedded = audio.pictures[0].data
+        if len(embedded) != len(on_disk):
+            return False
+        if hashlib.sha256(embedded).digest() != hashlib.sha256(on_disk).digest():
+            return False
 
     return True
 
@@ -167,8 +196,19 @@ def sweep_staging(
       it rather than inventing a second one. Neither check is negotiable --
       a caller passing a normal directory (or one outside the watch roots)
       gets a refusal back, never a wipe.
-    * Only entries strictly OLDER than ``older_than_hours`` (by mtime) are
-      touched. A fresh temp file may belong to a run currently in flight;
+    * Only entries strictly OLDER than ``older_than_hours`` (by the MORE
+      RECENT of ``st_mtime``/``st_ctime``, i.e. whichever timestamp says the
+      entry was touched most recently) are touched. ``st_mtime`` alone is
+      not trustworthy here: ``write_tagged_copy`` stages via
+      ``shutil.copy2``, whose ``copystat`` carries the SOURCE's mtime onto
+      the staged copy, so a copy of a months-old archival recording reports
+      an age of months the instant it is staged -- ``st_mtime`` alone would
+      let this guard delete a copy still being written. ``st_ctime`` is not
+      settable by ``copystat`` (or by any unprivileged caller) and always
+      reflects when the entry was actually created/last changed on this
+      filesystem, so taking the max of the two is the honest staging time
+      even if a future caller of ``write_tagged_copy`` forgets to also stamp
+      the mtime. A fresh temp file may belong to a run currently in flight;
       deleting one mid-write is the one outcome this must never produce.
     * The directory is scanned non-recursively (mirroring the watcher's own
       non-recursive ``os.listdir``, and how ``write_tagged_copy`` always
@@ -242,13 +282,25 @@ def sweep_staging(
                     {"path": path, "reason": "not a regular file"}
                 )
                 continue
-            st = entry.stat(follow_symlinks=False)
+            # ``os.stat`` rather than ``entry.stat()`` -- functionally
+            # identical for a confirmed regular, non-symlink file, but a
+            # plain module-level call rather than a method bound to an
+            # opaque ``os.DirEntry``, which is what lets tests substitute a
+            # controlled ``st_ctime`` (real ctime cannot be backdated by any
+            # public API, so that is the only way to unit test the ctime
+            # guard below at all).
+            st = os.stat(path, follow_symlinks=False)
         except OSError as exc:
             logger.warning("could not stat staging entry %s: %s", path, exc)
             result["skipped"].append({"path": path, "reason": str(exc)})
             continue
 
-        if st.st_mtime > cutoff:
+        # See the docstring above: take the MORE RECENT of mtime/ctime, not
+        # mtime alone, since ``copystat`` (via ``shutil.copy2``) carries the
+        # source's mtime onto a freshly staged copy of a months-old
+        # recording.
+        age_basis = max(st.st_mtime, st.st_ctime)
+        if age_basis > cutoff:
             result["skipped"].append({"path": path, "reason": "younger than threshold"})
             continue
 
@@ -332,6 +384,20 @@ def write_tagged_copy(
 
     try:
         shutil.copy2(src, temp_path)
+
+        # ``copy2``'s ``copystat`` carries the SOURCE's mtime onto the copy
+        # (that's the whole point of "2" over plain ``copy``), which for
+        # these archival recordings is months old. Left alone, a copy of a
+        # 200-day-old FLAC reports an age of ~4800 hours the instant it is
+        # staged -- ``sweep_staging``'s "never remove a file younger than
+        # the threshold" guard would not protect it at all; a 6-hour sweeper
+        # could delete this copy while this very function is still writing
+        # it. Stamp the copy with the current time right away so its age
+        # reflects when IT was staged, not when the original recording was
+        # made. Belt and braces with ``sweep_staging`` also aging off
+        # ``st_ctime`` (which ``copystat`` cannot set) rather than trusting
+        # this alone.
+        os.utime(temp_path, None)
 
         audio = FLAC(temp_path)
         for key, value in tags.items():
