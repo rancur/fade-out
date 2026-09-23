@@ -4,8 +4,6 @@ These are the two pieces of file_watcher that source_tagger must reuse exactly.
 If either changes shape, tagging silently stops protecting against re-ingest,
 so the contract is pinned here rather than left implicit.
 """
-import os
-
 from app.services import file_watcher
 
 

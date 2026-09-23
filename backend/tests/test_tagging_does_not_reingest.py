@@ -6,8 +6,6 @@ asserted against the watcher's own dedupe state, not a mock of it.
 import os
 import subprocess
 
-import pytest
-
 from app.services import file_watcher, source_tagger
 
 
