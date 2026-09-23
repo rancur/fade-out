@@ -174,3 +174,29 @@ def write_tagged_copy(
         except OSError:
             logger.warning("could not clean up temp file %s", temp_path, exc_info=True)
         raise
+
+
+def register_and_promote(
+    temp_path: str,
+    final_path: str,
+    file_type: str = "audio",
+    seen_db: Any = None,
+) -> None:
+    """Register the tagged file's hash, then move it into place.
+
+    **The order is the safety property.** Tagging changes the dedupe hash, so
+    between a tagged file appearing in a watch folder and its hash being known,
+    the watcher would treat it as a new recording and start a pipeline run that
+    re-uploads an already-published mix. Registering first closes that window
+    entirely; the file is never visible while unknown.
+
+    The previous hash's row is deliberately left in place -- a restored backup
+    of the untagged original must still dedupe.
+    """
+    from app.services import file_watcher
+
+    db = seen_db if seen_db is not None else file_watcher.open_seen_files_db()
+    new_hash = file_watcher.compute_file_hash(temp_path)
+    db.mark_done(new_hash, final_path, file_type)
+    os.rename(temp_path, final_path)
+    logger.info("promoted tagged file %s (hash %s registered first)", final_path, new_hash)
