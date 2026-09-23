@@ -20,6 +20,26 @@ def _make_flac(path):
     )
 
 
+def _make_flac_with_audio_data(path, duration=10):
+    """A FLAC with a non-trivial amount of encoded audio data (a sine wave,
+    not silence).
+
+    Silence compresses so well that ``_make_flac``'s 1-second fixture's
+    entire audio payload is dwarfed by the 64 KB padding block added on
+    every tagged write -- a tagged copy of that fixture is always larger
+    than the untagged original no matter how much of its (tiny) audio is
+    cut, which would mask a truncated write rather than let a test catch
+    it. A sine wave over several seconds produces audio data large enough
+    that truncating it actually shrinks the file below the source.
+    """
+    import subprocess
+    subprocess.run(
+        ["ffmpeg", "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
+         "-c:a", "flac", "-y", str(path)],
+        check=True, capture_output=True,
+    )
+
+
 def test_temp_dir_is_a_dot_dir_beside_the_source():
     d = source_tagger.temp_dir_for("/watch/audio/x.flac")
     assert d == "/watch/audio/.fadeout-tagging"
@@ -71,6 +91,70 @@ def test_duration_mismatch_fails_and_cleans_up(tmp_path):
     leftovers = list((tmp_path / source_tagger.TEMP_DIRNAME).glob("*")) \
         if (tmp_path / source_tagger.TEMP_DIRNAME).exists() else []
     assert leftovers == [], "a failed write must not leave a temp file behind"
+
+
+def test_truncated_staged_copy_is_rejected(tmp_path, monkeypatch):
+    """A short write (ENOSPC, an I/O error, a disk that fills mid-copy) must
+    be rejected before it can be promoted over the original.
+
+    The STREAMINFO duration a parse gives back is a header read, not a
+    measurement: shutil.copy2 carries it over from the original verbatim, so
+    a truncated payload still parses as valid FLAC and still reports the
+    full original duration. Verified by hand against a real FLAC: deleting
+    half the file's bytes still reports the full duration, passes
+    ``if not actual``, passes the ``abs(actual - expected) > 1.0`` check, and
+    would be promoted over the original. Only a raw size comparison against
+    the source catches it. This is the single most important test on this
+    branch -- it must fail if the size check in write_tagged_copy is
+    removed (verified by hand: with that check commented out, this test
+    fails because write_tagged_copy returns the truncated path instead of
+    raising).
+    """
+    src = tmp_path / "orig.flac"
+    _make_flac_with_audio_data(src)
+    src_size = src.stat().st_size
+
+    from mutagen.flac import FLAC as RealFLAC
+
+    original_save = RealFLAC.save
+
+    def truncating_save(self, *args, **kwargs):
+        # Write tags/padding normally, then simulate a short write by
+        # chopping well into the audio frame region -- found by walking the
+        # metadata block chain to its end, exactly like a real FLAC decoder
+        # would, so the truncation never touches a metadata block. That
+        # means the re-read below still parses cleanly and still reports
+        # the full original duration from STREAMINFO: the whole premise of
+        # this test is that neither the parse check nor the duration check
+        # can see this failure, only the size check can.
+        original_save(self, *args, **kwargs)
+        with open(self.filename, "rb") as fh:
+            assert fh.read(4) == b"fLaC"
+            audio_start = 4
+            while True:
+                block_header = fh.read(4)
+                is_last = bool(block_header[0] & 0x80)
+                block_len = int.from_bytes(block_header[1:4], "big")
+                fh.seek(block_len, 1)
+                audio_start = fh.tell()
+                if is_last:
+                    break
+        total_size = os.path.getsize(self.filename)
+        # Keep only the first 10% of the audio frame data.
+        cutoff = audio_start + (total_size - audio_start) // 10
+        with open(self.filename, "r+b") as fh:
+            fh.truncate(cutoff)
+
+    monkeypatch.setattr(RealFLAC, "save", truncating_save)
+
+    with pytest.raises(RuntimeError, match="not larger than the source"):
+        source_tagger.write_tagged_copy(
+            str(src), {"ARTIST": "Will See"}, None, None
+        )
+
+    leftovers = list((tmp_path / source_tagger.TEMP_DIRNAME).glob("*")) \
+        if (tmp_path / source_tagger.TEMP_DIRNAME).exists() else []
+    assert leftovers == [], "a truncated write must not leave a temp file behind"
 
 
 def test_zero_duration_read_fails_with_expected_duration(tmp_path, monkeypatch):
