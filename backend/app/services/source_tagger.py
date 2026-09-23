@@ -116,9 +116,10 @@ def write_tagged_copy(
     The original is never opened for writing. On any failure the temp file is
     removed and the caller is left exactly as it started.
 
-    If ``expected_duration`` is None, verification is skipped; production always
-    passes a real duration to catch corruption. Tests may pass None to accept
-    any duration.
+    The file is always re-read after writing to prove it still parses as valid
+    FLAC, which is the one check that does not depend on the caller passing
+    anything. If ``expected_duration`` is provided, the duration is also
+    compared; if None, only the parse-check is performed.
     """
     from mutagen.flac import FLAC, Picture
 
@@ -147,10 +148,13 @@ def write_tagged_copy(
 
         audio.save(padding=lambda _info: FLAC_PADDING_BYTES)
 
-        # Verify by re-reading. A truncated or corrupt write that still parses
-        # would otherwise be promoted over a good recording.
+        # Always re-read: this proves the file we just wrote still parses as
+        # FLAC. It is the one check that does not depend on the caller passing
+        # anything, and a corrupt-but-parseable write is exactly what this
+        # module exists to stop from being promoted.
+        verify = FLAC(temp_path)
+
         if expected_duration is not None:
-            verify = FLAC(temp_path)
             actual = verify.info.length
             if not actual:
                 raise RuntimeError(
