@@ -29,6 +29,7 @@ a full disk, or a corrupt write. In-place tagging gives neither guarantee.
 import logging
 import os
 import shutil
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -96,6 +97,72 @@ def build_tags(mix: Any) -> Dict[str, str]:
     return tags
 
 
+def already_tagged(path: str, tags: Dict[str, str], cover_art_path: Optional[str]) -> bool:
+    """True if ``path`` already carries ``tags`` and its embedded cover art
+    already matches the CONTENT of ``cover_art_path``, byte for byte. A
+    HEADER READ ONLY -- opening a FLAC for reading never rewrites it, and
+    this function never calls ``.save()``, never copies, never touches the
+    original in any way. Reading ``cover_art_path`` (to compare against) is
+    a small local PNG/JPEG, not the multi-gigabyte source, so this stays
+    cheap.
+
+    Every key in ``tags`` must be present on the file with an identical
+    value (a retitled mix has a different TITLE, so it reports False and
+    gets re-tagged -- exactly the case this exists to still catch).
+
+    The cover art check compares actual CONTENT, not just presence: it was
+    previously presence-only (embedded picture exists vs. ``cover_art_path``
+    exists), which meant a mix whose artwork was regenerated -- same file
+    path, different bytes -- kept its STALE embedded art forever, since
+    "some picture is embedded" and "a cover art file exists" both stayed
+    true. The embedded picture's data is already in memory from the header
+    read above (FLAC PICTURE blocks are metadata, not audio payload, so
+    this is not an extra disk read of the source); a size check plus a
+    SHA-256 digest of both sides is compared instead of a full byte-for-byte
+    diff, which is equivalent in practice and cheaper for a large image.
+
+    Any failure to open or parse the file (missing, corrupt, not a FLAC)
+    is treated as "not already tagged" -- the safe default, since it falls
+    through to the normal tag-and-verify path rather than silently skipping
+    a file that might need repair.
+    """
+    import hashlib
+
+    from mutagen.flac import FLAC
+
+    try:
+        audio = FLAC(path)
+    except Exception:
+        return False
+
+    for key, value in tags.items():
+        if audio.get(key) != [value]:
+            return False
+
+    wants_art = bool(cover_art_path and os.path.isfile(cover_art_path))
+    has_art = bool(audio.pictures)
+    if has_art != wants_art:
+        return False
+
+    if wants_art and has_art:
+        try:
+            with open(cover_art_path, "rb") as fh:
+                on_disk = fh.read()
+        except OSError:
+            # Cover art existed a moment ago (``os.path.isfile`` above) but
+            # is now unreadable -- treat like any other failure to read the
+            # comparison source: not already tagged, fall through to a real
+            # (re-)tag rather than silently skipping.
+            return False
+        embedded = audio.pictures[0].data
+        if len(embedded) != len(on_disk):
+            return False
+        if hashlib.sha256(embedded).digest() != hashlib.sha256(on_disk).digest():
+            return False
+
+    return True
+
+
 def temp_dir_for(path: str) -> str:
     """The staging directory for a source file's tagged copy.
 
@@ -104,6 +171,157 @@ def temp_dir_for(path: str) -> str:
     invisible to the watcher, which scans with a non-recursive ``os.listdir``.
     """
     return os.path.join(os.path.dirname(path), TEMP_DIRNAME)
+
+
+def sweep_staging(
+    root: str, older_than_hours: float = 6.0, dry_run: bool = False
+) -> Dict[str, Any]:
+    """Reclaim orphaned copies left in a ``TEMP_DIRNAME`` staging directory.
+
+    A run that dies between ``write_tagged_copy`` staging a multi-gigabyte
+    copy and ``register_and_promote`` moving it into place leaves that copy
+    behind. Nothing else reclaims it: the directory is invisible to the
+    watcher by design (see the module docstring), so across ~80 files of
+    ~498 GB a few failed runs can quietly consume tens of gigabytes, and the
+    resulting shortage then surfaces only as a routine "skipped" from
+    ``_has_free_space`` -- silent degradation in both directions.
+
+    THIS FUNCTION DELETES FILES, so the guards are the substance of it, not
+    the deletion:
+
+    * ``root`` must be a real, existing ``TEMP_DIRNAME`` directory (checked
+      by basename, not by content) inside one of
+      ``source_renamer.allowed_roots()``. That allowlist already exists
+      because an unguarded path-deletion primitive is dangerous; this reuses
+      it rather than inventing a second one. Neither check is negotiable --
+      a caller passing a normal directory (or one outside the watch roots)
+      gets a refusal back, never a wipe.
+    * Only entries strictly OLDER than ``older_than_hours`` (by the MORE
+      RECENT of ``st_mtime``/``st_ctime``, i.e. whichever timestamp says the
+      entry was touched most recently) are touched. ``st_mtime`` alone is
+      not trustworthy here: ``write_tagged_copy`` stages via
+      ``shutil.copy2``, whose ``copystat`` carries the SOURCE's mtime onto
+      the staged copy, so a copy of a months-old archival recording reports
+      an age of months the instant it is staged -- ``st_mtime`` alone would
+      let this guard delete a copy still being written. ``st_ctime`` is not
+      settable by ``copystat`` (or by any unprivileged caller) and always
+      reflects when the entry was actually created/last changed on this
+      filesystem, so taking the max of the two is the honest staging time
+      even if a future caller of ``write_tagged_copy`` forgets to also stamp
+      the mtime. A fresh temp file may belong to a run currently in flight;
+      deleting one mid-write is the one outcome this must never produce.
+    * The directory is scanned non-recursively (mirroring the watcher's own
+      non-recursive ``os.listdir``, and how ``write_tagged_copy`` always
+      places temp files directly inside ``root``, never in a subdirectory)
+      and symlinks are never followed or removed -- an entry that is a
+      symlink is left alone and reported as skipped, since a plain file
+      written by ``shutil.copy2`` is the only thing this module itself would
+      ever have staged there.
+    * A failure to stat or remove one entry (permission error, file vanished
+      under us, ...) is logged and skipped; it never aborts the sweep.
+
+    Never raises. Returns a dict of:
+
+    * ``refused`` / ``reason``: set when ``root`` fails a guard; when
+      ``refused`` is True nothing was touched, including on a real
+      basename-matching directory that happened to be outside the allowed
+      roots.
+    * ``removed``: list of ``{"path", "bytes"}`` for every entry removed (or,
+      under ``dry_run``, every entry that WOULD have been removed -- the
+      same set, nothing actually deleted).
+    * ``removed_count`` / ``reclaimed_bytes``: totals over ``removed``.
+    * ``skipped``: list of ``{"path", "reason"}`` for every entry left alone
+      (too young, a symlink, or an error acting on it).
+    """
+    result: Dict[str, Any] = {
+        "root": root,
+        "dry_run": dry_run,
+        "refused": False,
+        "reason": None,
+        "removed": [],
+        "removed_count": 0,
+        "reclaimed_bytes": 0,
+        "skipped": [],
+    }
+
+    if os.path.basename(os.path.normpath(root)) != TEMP_DIRNAME:
+        result["refused"] = True
+        result["reason"] = (
+            f"refusing to sweep {root!r}: basename is not {TEMP_DIRNAME!r}"
+        )
+        return result
+
+    if not is_within_allowed_roots(root):
+        result["refused"] = True
+        result["reason"] = f"refusing to sweep {root!r}: outside the allowed roots"
+        return result
+
+    if os.path.islink(root) or not os.path.isdir(root):
+        # Never created, already cleaned up, or -- out of caution -- a
+        # symlink where a real staging directory should be. Either way there
+        # is nothing safe to sweep; this is not a refusal.
+        return result
+
+    cutoff = time.time() - (older_than_hours * 3600.0)
+
+    try:
+        entries = list(os.scandir(root))
+    except OSError as exc:
+        logger.warning("could not list staging directory %s: %s", root, exc)
+        result["skipped"].append({"path": root, "reason": str(exc)})
+        return result
+
+    for entry in entries:
+        path = entry.path
+        try:
+            if entry.is_symlink():
+                result["skipped"].append({"path": path, "reason": "symlink"})
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                result["skipped"].append(
+                    {"path": path, "reason": "not a regular file"}
+                )
+                continue
+            # ``os.stat`` rather than ``entry.stat()`` -- functionally
+            # identical for a confirmed regular, non-symlink file, but a
+            # plain module-level call rather than a method bound to an
+            # opaque ``os.DirEntry``, which is what lets tests substitute a
+            # controlled ``st_ctime`` (real ctime cannot be backdated by any
+            # public API, so that is the only way to unit test the ctime
+            # guard below at all).
+            st = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            logger.warning("could not stat staging entry %s: %s", path, exc)
+            result["skipped"].append({"path": path, "reason": str(exc)})
+            continue
+
+        # See the docstring above: take the MORE RECENT of mtime/ctime, not
+        # mtime alone, since ``copystat`` (via ``shutil.copy2``) carries the
+        # source's mtime onto a freshly staged copy of a months-old
+        # recording.
+        age_basis = max(st.st_mtime, st.st_ctime)
+        if age_basis > cutoff:
+            result["skipped"].append({"path": path, "reason": "younger than threshold"})
+            continue
+
+        if dry_run:
+            result["removed"].append({"path": path, "bytes": st.st_size})
+            continue
+
+        try:
+            os.remove(path)
+        except OSError as exc:
+            logger.warning(
+                "could not remove orphaned staging file %s: %s", path, exc
+            )
+            result["skipped"].append({"path": path, "reason": str(exc)})
+            continue
+
+        result["removed"].append({"path": path, "bytes": st.st_size})
+
+    result["removed_count"] = len(result["removed"])
+    result["reclaimed_bytes"] = sum(item["bytes"] for item in result["removed"])
+    return result
 
 
 def _audio_payload_offset(path: str) -> int:
@@ -166,6 +384,20 @@ def write_tagged_copy(
 
     try:
         shutil.copy2(src, temp_path)
+
+        # ``copy2``'s ``copystat`` carries the SOURCE's mtime onto the copy
+        # (that's the whole point of "2" over plain ``copy``), which for
+        # these archival recordings is months old. Left alone, a copy of a
+        # 200-day-old FLAC reports an age of ~4800 hours the instant it is
+        # staged -- ``sweep_staging``'s "never remove a file younger than
+        # the threshold" guard would not protect it at all; a 6-hour sweeper
+        # could delete this copy while this very function is still writing
+        # it. Stamp the copy with the current time right away so its age
+        # reflects when IT was staged, not when the original recording was
+        # made. Belt and braces with ``sweep_staging`` also aging off
+        # ``st_ctime`` (which ``copystat`` cannot set) rather than trusting
+        # this alone.
+        os.utime(temp_path, None)
 
         audio = FLAC(temp_path)
         for key, value in tags.items():
@@ -411,15 +643,23 @@ async def tag_sources_for_mix(
             }
 
         tags = build_tags(mix)
+        cover_art_path = getattr(mix, "cover_art_path", None)
         exists = os.path.isfile(src)
+        # Evaluated whenever the source exists -- including during a dry
+        # run, for the same reason ``enabled`` is evaluated unconditionally
+        # above: a dry run that skipped this check would report "would tag"
+        # for a file a real run would then skip, overstating the work in
+        # front of a 498 GB operation.
+        skip_already_tagged = already_tagged(src, tags, cover_art_path) if exists else False
         has_space = _has_free_space(src) if exists else False
         actions.append({
             "path": src,
             "tags": tags,
-            "cover_art": getattr(mix, "cover_art_path", None),
+            "cover_art": cover_art_path,
             "source_exists": exists,
             "sufficient_space": has_space,
             "enabled": enabled,
+            "already_tagged": skip_already_tagged,
         })
 
         if dry_run:
@@ -429,6 +669,9 @@ async def tag_sources_for_mix(
             if not exists:
                 return {"status": "dry_run", "actions": actions,
                         "reason": f"source missing: {src} -- would be skipped"}
+            if skip_already_tagged:
+                return {"status": "dry_run", "actions": actions,
+                        "reason": "already tagged -- would be skipped"}
             if not has_space:
                 return {"status": "dry_run", "actions": actions,
                         "reason": f"insufficient free space for {src} -- would be skipped"}
@@ -438,12 +681,29 @@ async def tag_sources_for_mix(
             return {"status": "skipped", "actions": actions,
                     "reason": f"{src} does not exist"}
 
+        if skip_already_tagged:
+            # ``"terminal": True`` marks this outcome, at its own source, as
+            # safe for a caller's resume cursor to advance past -- this
+            # function is the one place that actually knows a "skipped" is
+            # the benign already-tagged case rather than a missing source,
+            # a source outside the allowed roots, or insufficient free
+            # space (all of which also come back "skipped"). Callers that
+            # judge terminal-success by matching the "already tagged"
+            # reason string (e.g. ``app.routers.catalog``) can fall back to
+            # that when this key is absent, but should prefer this key --
+            # see that module's own docstring for why the string match
+            # alone is brittle.
+            return {
+                "status": "skipped", "actions": actions, "reason": "already tagged",
+                "terminal": True,
+            }
+
         if not has_space:
             return {"status": "skipped", "actions": actions,
                     "reason": f"insufficient free space to rewrite {src} safely"}
 
         temp = write_tagged_copy(
-            src, tags, getattr(mix, "cover_art_path", None),
+            src, tags, cover_art_path,
             getattr(mix, "duration_seconds", None),
         )
         register_and_promote(temp, src, "audio")

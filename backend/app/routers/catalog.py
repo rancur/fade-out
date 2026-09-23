@@ -9,7 +9,8 @@ its own session; progress lands in the activity log and the sync summary in
 import asyncio
 import json
 import logging
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -38,6 +39,10 @@ _playlists_task: Optional[asyncio.Task] = None
 _retag_task: Optional[asyncio.Task] = None
 
 _RETAG_SUMMARY_STATUSES = ("ok", "skipped", "disabled", "failed", "dry_run", "unknown")
+
+# Key under AppSettings.settings_json where the resume cursor is persisted,
+# following the same precedent as catalog_sync's LAST_SYNC_KEY.
+RETAG_PROGRESS_KEY = "retag_progress"
 
 
 def _empty_retag_summary() -> Dict[str, int]:
@@ -834,32 +839,449 @@ def _rename_outcome_status(outcome: Dict[str, Any]) -> str:
     return "skipped"
 
 
-async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
+def _rename_outcome_reason(outcome: Dict[str, Any]) -> Optional[str]:
+    """Best-effort reason string for the renamer's outcome, mirroring
+    ``_rename_outcome_status``'s own derivation so the two travel together
+    into the activity log.
+
+    ``rename_sources_for_mix``'s top-level ``"reason"`` key is NOT an
+    outcome reason -- it is the CALLER's reason for the run (e.g.
+    ``"retag_backfill"``, passed straight through), identical on every
+    single mix regardless of what happened to it. The reason that actually
+    varies per outcome lives inside ``errors``/``skipped`` entries instead,
+    which is exactly what ``_rename_outcome_status`` already looks at.
+    """
+    errors = outcome.get("errors") or []
+    if errors and isinstance(errors[0], dict):
+        return errors[0].get("reason")
+    skipped = outcome.get("skipped") or []
+    if skipped and isinstance(skipped[-1], dict):
+        return skipped[-1].get("reason")
+    return None
+
+
+# Tag outcomes that are safe to advance the retag resume cursor past --
+# retrying any of these on a future ``resume=true`` would do no useful work.
+# NOTE: "disabled" is deliberately NOT in this tuple for real runs -- see
+# the docstring below.
+_TERMINAL_TAG_STATUSES = ("ok",)
+
+
+def _mix_outcome_is_terminal_success(
+    rename: Dict[str, Any], tag: Dict[str, Any], dry_run: bool
+) -> bool:
+    """Whether this mix's outcome -- BOTH the rename leg and the tag leg --
+    is safe to advance the persisted resume cursor past.
+
+    A dry run never writes anything, so this always returns True for one --
+    there is no "unrecoverable, must be retried" outcome to protect, only a
+    preview, and (see Blocker 1) a dry run's cursor can never be resolved
+    by a REAL run's ``resume=true`` regardless. This gate exists for real
+    runs, where the cursor is what a future ``resume=true`` trusts to mean
+    "already handled" for files that were actually (or deliberately not)
+    touched.
+
+    **Rename leg.** Rename runs before tag for every mix and is part of the
+    job, not a side effect of it -- a mix whose rename failed (``errors``
+    non-empty) but whose tag happened to succeed has NOT been fully handled,
+    and advancing the cursor past it would mean the failed rename is never
+    retried. So the rename outcome is checked via ``_rename_outcome_status``
+    (which derives a real status from the renamer's actual return shape --
+    it has no top-level ``status`` key): a status of ``"failed"`` blocks the
+    advance outright, regardless of what the tag leg did.
+
+    **Tag leg**, for a real run, terminal-success is: the tag was actually
+    written (``"ok"``), or the file already carried every target tag and
+    matching cover art. That last case is reported as ``"skipped"`` --
+    preferably with ``tag_sources_for_mix``'s own ``"terminal": True``
+    marker set at the one place that return dict is built, falling back to
+    matching its ``"already tagged"`` reason string when that key is absent
+    (e.g. an older ``source_tagger`` build). The fallback is brittle
+    prose-matching -- a future wording change to that string, without the
+    key, would silently turn every already-tagged mix into a
+    permanently-unadvanced cursor -- but the structural marker is the fix
+    for that, kept only as a fallback for compatibility.
+
+    ``"disabled"`` (the tag setting is off) is deliberately NOT terminal for
+    a real run, even though nothing was attempted and nothing failed. This
+    was Blocker 1: an operator runs a real backfill with ``tag_source_files``
+    off, every mix comes back ``"disabled"``, and the OLD logic advanced the
+    cursor to the end of the backlog anyway -- recorded under ``dry_run:
+    False``, so the mode guard on a later ``resume=true`` does not catch it.
+    The operator then enables the flag and re-runs with ``resume=true``,
+    which resolves to an offset past every candidate: ``{"started": true,
+    "candidates": 0}``, zero files touched. "Disabled" only means "genuinely
+    nothing to do" at the INSTANT it is returned -- the moment the setting
+    flips on, there IS something to do, and a cursor already advanced past
+    that mix means a future ``resume=true`` never revisits it. "Nothing was
+    attempted" is not "success", and the cursor must not treat it as one.
+
+    Also deliberately NOT terminal, so the cursor does not advance past
+    these and a future ``resume=true`` retries them: ``"failed"`` (a write
+    error -- retrying it is the entire point of resume), and every OTHER
+    ``"skipped"`` reason. ``tag_sources_for_mix`` returns the identical
+    ``"skipped"`` status for a missing source file, a source outside the
+    allowed roots, AND insufficient free space, alongside the benign
+    already-tagged case -- all three of the alarming ones can resolve
+    themselves before the next run (the volume gains headroom, a remount
+    fixes the path, ...), so skipping past them permanently would mean
+    they are never retried even once whatever caused them clears up.
+    """
+    if dry_run:
+        return True
+    if _rename_outcome_status(rename) == "failed":
+        return False
+    status = tag.get("status")
+    if status in _TERMINAL_TAG_STATUSES:
+        return True
+    return status == "skipped" and tag.get(
+        "terminal", tag.get("reason") == "already tagged"
+    )
+
+
+def _retag_candidates_stmt(offset: int, limit: Optional[int]):
+    """Build the retag candidate-selection query.
+
+    Shared verbatim by the pre-flight count in ``POST /retag`` and the actual
+    selection in ``_run_retag`` so the two can never drift apart -- same
+    WHERE, same ORDER BY, same OFFSET/LIMIT. The ordering is a deterministic
+    total order: ``Mix.created_at`` alone is not guaranteed unique (mixes
+    inserted in the same tick, e.g. via the back-catalog sync, tie), so
+    ``Mix.id`` breaks ties. Without a total order, ``offset``-based paging
+    across two calls (or a resume midway through) is not guaranteed to
+    select disjoint rows.
+
+    Also selects ``Mix.audio_file_path`` (second column, callers that only
+    want ids keep using ``row[0]``) so ``_run_retag`` can derive this run's
+    staging-sweep targets from where its actual candidates live, rather than
+    assuming every source sits directly under a flat watch root -- see
+    ``_sweep_retag_staging``. The pre-flight count in ``POST /retag`` just
+    counts rows, so the extra column does not affect it.
+    """
+    stmt = (
+        select(Mix.id, Mix.audio_file_path)
+        .where(Mix.pipeline_status == "completed")
+        .order_by(Mix.created_at, Mix.id)
+        .offset(offset)
+    )
+    if limit:
+        stmt = stmt.limit(limit)
+    return stmt
+
+
+async def _resume_offset(session: AsyncSession, dry_run: bool) -> tuple[int, bool]:
+    """Translate the persisted ``retag_progress`` cursor into an offset.
+
+    Returns ``(offset, cursor_ignored_for_mode_mismatch)``.
+
+    With no saved cursor -- the very first run, or a prior run whose last
+    mix has since been deleted from the candidate set -- resumption starts
+    from the beginning. This must never raise: ``resume=true`` against a
+    clean slate is exactly as safe as a bare run.
+
+    **A cursor written by a dry run must never govern a real run, and vice
+    versa.** A dry run never touches a single file -- ``_persist_retag_progress``
+    still writes a cursor after every dry-run mix so a dry run can itself be
+    resumed/paged, but if a REAL run's ``resume=true`` then consumed that
+    same cursor, it would believe every mix up to it was already tagged and
+    skip straight past the entire backlog, doing nothing while reporting
+    ``{"started": true}`` -- the exact silent-no-op this project shipped to
+    prevent. So: if the persisted cursor's own ``dry_run`` flag does not
+    match the mode of THIS call, it is treated exactly like no cursor at all
+    (start from the beginning) rather than resolved into an offset. The
+    caller surfaces this in the HTTP response so an operator relying on
+    ``resume=true`` can see their cursor was ignored rather than silently
+    getting offset 0.
+    """
+    result = await session.execute(select(AppSettings).where(AppSettings.id == 1))
+    row = result.scalar_one_or_none()
+    progress = ((row.settings_json or {}).get(RETAG_PROGRESS_KEY)) if row else None
+    if not progress:
+        return 0, False
+
+    stored_dry_run = progress.get("dry_run")
+    if stored_dry_run is not None and bool(stored_dry_run) != bool(dry_run):
+        return 0, True
+
+    last_mix_id = progress.get("last_mix_id")
+    if not last_mix_id:
+        return 0, False
+
+    ordered = await session.execute(
+        select(Mix.id)
+        .where(Mix.pipeline_status == "completed")
+        .order_by(Mix.created_at, Mix.id)
+    )
+    ordered_ids = [row[0] for row in ordered.all()]
+    try:
+        return ordered_ids.index(last_mix_id) + 1, False
+    except ValueError:
+        return 0, False
+
+
+async def _persist_retag_progress(
+    mix_id: str, processed: int, total: int, dry_run: bool
+) -> None:
+    """Write the resume cursor after a single mix, committing immediately.
+
+    Called after EVERY mix (not just at the end of the run) so a ``kill -9``
+    mid-run still leaves a usable checkpoint -- persisting only on
+    completion would defeat the entire purpose of a resumable backfill.
+    Best-effort and wrapped like every other persistence call in this
+    module: a failure to save the cursor must not take down a run that is
+    otherwise successfully touching irreplaceable files.
+    """
+    from app.database import async_session_factory
+
+    try:
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(AppSettings).where(AppSettings.id == 1)
+            )
+            row = result.scalar_one_or_none()
+            if not row:
+                row = AppSettings(id=1)
+                session.add(row)
+            merged = dict(row.settings_json or {})
+            merged[RETAG_PROGRESS_KEY] = {
+                "last_mix_id": mix_id,
+                "processed": processed,
+                "total": total,
+                "dry_run": dry_run,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            row.settings_json = merged
+            await session.commit()
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Failed to persist retag progress cursor")
+
+
+async def _emit_retag_activity(
+    level: str, event: str, message: str, **kwargs: Any
+) -> None:
+    """Best-effort activity-log emit for the retag backfill.
+
+    Durable per-mix outcomes for a run that rewrites ~498 GB of irreplaceable
+    FLAC masters must not disappear when the process restarts -- that's the
+    entire point of Task 3. But losing this log line is a far better outcome
+    than losing the run itself, so this is wrapped exactly like every other
+    best-effort activity emit in this codebase (see ``handlers._emit_activity``,
+    ``auth._emit_auth``): a broken activity log must never abort the backfill.
+    ``activity_log.log`` already never raises by its own contract, but this
+    wrapper does not rely on that -- it catches independently, so a future
+    change to ``activity_log`` (or a test double that raises) can't take the
+    backfill down with it.
+    """
+    try:
+        from app.services import activity_log
+
+        await activity_log.log(level, event, message, **kwargs)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("retag activity emit failed for %s", event, exc_info=True)
+
+
+async def _sweep_retag_staging(
+    dry_run: bool, candidate_audio_paths: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Reclaim orphaned ``.fadeout-tagging`` staging copies before a run
+    starts touching any real files.
+
+    ``dry_run`` is plumbed straight through to ``source_tagger.sweep_staging``.
+    This mattered: it used to be dropped on the floor here -- the call
+    passed only ``staging_root`` POSITIONALLY, so ``sweep_staging``'s own
+    ``dry_run`` parameter silently defaulted to ``False`` regardless of what
+    the retag run's caller asked for. The README promises a bare, unparamet-
+    erised POST is "report-only ... without touching anything"; before this
+    fix that bare POST (``dry_run=True``) still deleted every orphaned
+    staging file it found, for real, before a single candidate mix was even
+    selected.
+
+    Sweep targets are the UNION of two sources, de-duplicated:
+
+    * each of ``source_renamer.allowed_roots()`` directly (``write_tagged_copy``
+      stages directly alongside the source file, so this catches every mix
+      whose source sits right under a flat watch root -- the layout
+      ``source_tagger``'s module docstring describes);
+    * ``source_tagger.temp_dir_for(path)`` for every path in
+      ``candidate_audio_paths`` -- ``temp_dir_for`` stages in
+      ``dirname(src)/.fadeout-tagging``, and ``is_within_allowed_roots``
+      accepts any subdirectory of a watch root, not just the root itself.
+      A mix at ``<watch_audio>/2023/foo.flac`` stages under
+      ``<watch_audio>/2023/.fadeout-tagging``, which sweeping only the flat
+      roots above would never visit. Passing THIS run's actual candidates
+      (rather than, say, every mix ever) keeps this cheap and keeps sweep
+      targets tied to files this run is actually about to touch.
+
+    ``source_tagger.sweep_staging`` does real filesystem I/O (scandir/stat/
+    remove over however many orphans have accumulated) per target directory,
+    so each call runs off the event loop via ``asyncio.to_thread`` rather
+    than blocking it. Every target -- including one derived from a candidate
+    path -- still goes through ``sweep_staging``'s own basename/allowlist
+    guards, so a bogus or unexpected path is refused, never swept blindly.
+
+    Best-effort like everything else in this module: a sweep failure must
+    never stop the backfill it is meant to make safer to run unattended.
+    ``sweep_staging`` itself never raises, but this wrapper does not rely on
+    that holding forever -- it catches independently, mirroring
+    ``_emit_retag_activity``.
+    """
+    from app.services import source_renamer, source_tagger
+
+    staging_roots = {
+        os.path.join(watch_root, source_tagger.TEMP_DIRNAME)
+        for watch_root in source_renamer.allowed_roots()
+    }
+    for src in candidate_audio_paths or []:
+        if src:
+            staging_roots.add(source_tagger.temp_dir_for(src))
+
+    totals: Dict[str, Any] = {"removed_count": 0, "reclaimed_bytes": 0, "roots": []}
+    try:
+        for staging_root in sorted(staging_roots):
+            outcome = await asyncio.to_thread(
+                source_tagger.sweep_staging, staging_root, dry_run=dry_run
+            )
+            totals["roots"].append(outcome)
+            totals["removed_count"] += outcome.get("removed_count", 0)
+            totals["reclaimed_bytes"] += outcome.get("reclaimed_bytes", 0)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Sweeping retag staging directories failed")
+    return totals
+
+
+async def _run_retag(
+    dry_run: bool,
+    limit: Optional[int],
+    offset: int = 0,
+    resume: bool = False,
+    resume_cursor_ignored: bool = False,
+) -> None:
     """Rename then tag source files for each completed-pipeline mix.
 
     ``source_renamer.rename_sources_for_mix`` / ``source_tagger.tag_sources_for_mix``
     are both best-effort by contract (never raise), so one mix's failure never
     aborts the run. Rename is called before tag for each mix, matching the
     order the pipeline itself uses at completion. Progress is published to the
-    module-level ``_retag_state`` dict polled by ``GET /retag/status``.
+    module-level ``_retag_state`` dict polled by ``GET /retag/status``
+    (``running`` is set True before the staging sweep even starts, not after,
+    so a poll during a slow sweep sees the new run in progress rather than
+    the previous run's stale numbers), and a resume cursor is persisted to
+    ``AppSettings.settings_json`` after each mix whose outcome -- BOTH the
+    rename leg and the tag leg -- is terminal-success (see
+    ``_persist_retag_progress`` and ``_mix_outcome_is_terminal_success``) --
+    a failed rename, a failed tag write, or a tag skip for a condition that
+    can resolve itself (missing source, outside the allowed roots,
+    insufficient free space) does NOT advance the cursor, so a later
+    ``resume=true`` retries it instead of skipping it forever. Once ONE mix
+    in a run is not terminal-success, the cursor stops advancing for the
+    REST of that run too, even past later mixes that succeed -- the cursor
+    is an OFFSET into the ordered candidate list, not a per-mix ledger, so
+    letting a later success push it forward would still silently skip the
+    earlier stuck mix on the next resume, just less directly. The run
+    itself is unaffected by any of this -- the loop always continues
+    processing every remaining candidate in the SAME pass regardless of
+    whether the cursor is advancing.
+
+    ``resume_cursor_ignored`` is purely informational here -- the caller
+    (``POST /retag``) has already resolved it into the ``offset`` this run
+    actually uses; it is threaded through only so the durable
+    ``retag_run_started`` event can record whether an operator's
+    ``resume=true`` was honoured or silently ignored (a mode-mismatched
+    cursor -- see Blocker 1 / the mode guard below). Without it, an operator
+    reading the durable log after the process is gone has no way to tell a
+    refused resume from a fresh start.
+
+    Durable outcomes also go to the activity log (``app.services.activity_log``),
+    which is what survives a process restart when ``_retag_state`` does not:
+    one ``retag_run_started`` event with the run parameters, whether a
+    resume cursor was ignored, and candidate total, exactly one
+    ``retag_mix_processed`` event per mix carrying its ``mix_id``, both the
+    rename and tag status AND their reasons (at ``error`` level when either
+    failed, ``info`` otherwise), and one ``retag_run_completed`` event with
+    the final summary (``warn`` when the summary contains any failures OR
+    any tag skip whose reason was not "already tagged" -- the latter is
+    what actually distinguishes "every file was already tagged" from "every
+    file was skipped for want of disk" when both show up identically as
+    ``{skipped: N}``). If the run itself
+    crashes -- an exception escaping everything above, which is NOT the
+    normal best-effort failure path, since rename/tag/persist/emit all
+    already swallow their own errors -- a ``retag_run_failed`` event is
+    emitted before re-raising, so a crashed run is distinguishable in the
+    durable log from one that is simply still running. Every activity emit
+    goes through ``_emit_retag_activity``, which is best-effort -- a logging
+    failure can never abort this run.
+
+    Before any of that, orphaned ``.fadeout-tagging`` staging copies from a
+    previous run that died mid-flight are reclaimed (see
+    ``_sweep_retag_staging`` / ``source_tagger.sweep_staging``) -- otherwise
+    a repeatedly-interrupted backfill just keeps accumulating multi-gigabyte
+    orphans that nothing else will ever reclaim. The sweep itself honours
+    ``dry_run`` too: a bare, report-only POST must not delete anything for
+    real.
     """
     from app.database import async_session_factory
-    from app.models import Mix
     from app.services import source_renamer, source_tagger
 
-    try:
-        async with async_session_factory() as session:
-            stmt = select(Mix.id).where(Mix.pipeline_status == "completed")
-            if limit:
-                stmt = stmt.limit(limit)
-            mix_ids = [row[0] for row in (await session.execute(stmt)).all()]
+    _retag_state["running"] = True
+    _retag_state["processed"] = 0
+    _retag_state["total"] = 0
+    _retag_state["results"] = []
+    summary = _empty_retag_summary()
+    _retag_state["summary"] = summary
 
-        _retag_state["running"] = True
-        _retag_state["processed"] = 0
+    try:
+        # Candidates are selected BEFORE the sweep (not after, as before)
+        # because the sweep now derives its targets from where these
+        # candidates' sources actually live -- see
+        # ``_sweep_retag_staging``. This does not weaken "sweep before
+        # touching any real files": the sweep still runs, and still
+        # completes, before the mix-processing loop below touches anything.
+        async with async_session_factory() as session:
+            stmt = _retag_candidates_stmt(offset, limit)
+            candidate_rows = (await session.execute(stmt)).all()
+        mix_ids = [row[0] for row in candidate_rows]
+        candidate_audio_paths = [row[1] for row in candidate_rows if row[1]]
+
         _retag_state["total"] = len(mix_ids)
-        _retag_state["results"] = []
-        summary = _empty_retag_summary()
-        _retag_state["summary"] = summary
+
+        sweep = await _sweep_retag_staging(dry_run, candidate_audio_paths)
+        await _emit_retag_activity(
+            "info",
+            "retag_staging_swept",
+            f"Reclaimed {sweep['removed_count']} orphaned staging file(s) "
+            f"({sweep['reclaimed_bytes']} bytes) before starting the retag run"
+            f"{' (dry run -- nothing actually removed)' if dry_run else ''}.",
+            context={**sweep, "dry_run": dry_run},
+        )
+
+        await _emit_retag_activity(
+            "info",
+            "retag_run_started",
+            f"Retag backfill started: {len(mix_ids)} candidate mix(es) "
+            f"(dry_run={dry_run}, limit={limit}, offset={offset}, resume={resume}, "
+            f"resume_cursor_ignored={resume_cursor_ignored}).",
+            context={
+                "dry_run": dry_run,
+                "limit": limit,
+                "offset": offset,
+                "resume": resume,
+                "resume_cursor_ignored": resume_cursor_ignored,
+                "candidates": len(mix_ids),
+            },
+        )
+
+        any_alarming_skip = False
+        # Once a mix's outcome is NOT terminal-success, the persisted
+        # cursor must stop advancing for the REST of this run too -- not
+        # just skip persisting for that one mix. The cursor is an OFFSET
+        # into the ordered candidate list (see ``_resume_offset``), not a
+        # per-mix-id ledger: if a later mix in this same run were allowed
+        # to push the cursor past the stuck one's position, a future
+        # ``resume=true`` would still silently skip the stuck mix, exactly
+        # as before this fix, just via a different mechanism. The run
+        # itself still processes every remaining candidate in THIS pass
+        # either way -- only the persisted cursor freezes.
+        cursor_advance_blocked = False
 
         for mix_id in mix_ids:
             rename = await source_renamer.rename_sources_for_mix(
@@ -872,10 +1294,72 @@ async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
                 {"mix_id": mix_id, "rename": rename, "tag": tag}
             )
             rename_status = _rename_outcome_status(rename)
+            rename_reason = _rename_outcome_reason(rename)
             tag_status = tag.get("status")
+            tag_reason = tag.get("reason")
             for status in (rename_status, tag_status):
                 summary[status if status in summary else "unknown"] += 1
+
+            if tag_status == "skipped" and tag_reason != "already tagged":
+                any_alarming_skip = True
+
+            mix_level = "error" if "failed" in (rename_status, tag_status) else "info"
+            await _emit_retag_activity(
+                mix_level,
+                "retag_mix_processed",
+                f"Retag mix {mix_id}: rename={rename_status}, tag={tag_status}.",
+                mix_id=mix_id,
+                context={
+                    "rename_status": rename_status,
+                    "rename_reason": rename_reason,
+                    "tag_status": tag_status,
+                    "tag_reason": tag_reason,
+                },
+            )
+
             _retag_state["processed"] += 1
+
+            if not cursor_advance_blocked and _mix_outcome_is_terminal_success(
+                rename, tag, dry_run
+            ):
+                await _persist_retag_progress(
+                    mix_id, _retag_state["processed"], _retag_state["total"], dry_run
+                )
+            else:
+                # Either this mix itself wasn't terminal-success, or an
+                # earlier one in this run already wasn't -- either way the
+                # cursor must not advance any further this run. The loop
+                # still continues to the next mix immediately below; not
+                # advancing the cursor never stalls the run itself.
+                cursor_advance_blocked = True
+
+        await _emit_retag_activity(
+            "warn" if summary.get("failed") or any_alarming_skip else "info",
+            "retag_run_completed",
+            f"Retag backfill completed: {_retag_state['processed']}/"
+            f"{_retag_state['total']} mixes processed.",
+            context={
+                "summary": dict(summary),
+                "processed": _retag_state["processed"],
+                "total": _retag_state["total"],
+                "dry_run": dry_run,
+                "any_alarming_skip": any_alarming_skip,
+            },
+        )
+    except Exception:
+        logger.exception("retag backfill run crashed")
+        await _emit_retag_activity(
+            "error",
+            "retag_run_failed",
+            f"Retag backfill crashed after {_retag_state['processed']}/"
+            f"{_retag_state['total']} mixes processed.",
+            context={
+                "processed": _retag_state["processed"],
+                "total": _retag_state["total"],
+                "dry_run": dry_run,
+            },
+        )
+        raise
     finally:
         _retag_state["running"] = False
 
@@ -884,6 +1368,8 @@ async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
 async def catalog_retag(
     dry_run: bool = Query(default=True),
     limit: Optional[int] = Query(default=None),
+    offset: int = Query(default=0),
+    resume: bool = Query(default=False),
 ):
     """Rename and tag the source files of already-published (completed) mixes.
 
@@ -894,32 +1380,68 @@ async def catalog_retag(
     ``pipeline_status == "completed"`` are candidates; rename runs before tag
     for each one. Single-flight: a run already in progress returns 409
     instead of starting a second concurrent pass.
+
+    ``limit``/``offset`` genuinely paginate now (ordered by ``created_at``,
+    ``id``): a batch-two call with ``offset=limit`` picks up exactly where
+    batch one left off, never re-selecting the same rows. ``resume=true``
+    ignores ``offset`` and instead continues after the mix the last run
+    persisted as its cursor (``AppSettings.settings_json["retag_progress"]``);
+    with no saved cursor it starts from the beginning rather than erroring.
+
+    A dry run's cursor can never resume a real run, and a real run's cursor
+    can never resume a dry run: the persisted cursor records the ``dry_run``
+    it was written under, and ``resume=true`` against a cursor from the
+    other mode is treated as no cursor at all (starts from the beginning)
+    rather than resolved into an offset -- otherwise a real run resuming
+    past a dry run's cursor would believe files the dry run only PREVIEWED
+    were already tagged and silently do nothing. The response's
+    ``resume_cursor_ignored`` is true whenever this happened.
     """
     global _retag_task
     from app.database import async_session_factory
-    from app.models import Mix
 
     async with async_session_factory() as session:
-        # Mirrors the id-selection in ``_run_retag`` exactly (including the
-        # same ``limit``), so this pre-flight number is the actual count of
-        # mixes the run is about to touch -- a plain COUNT(*) with no limit
-        # applied would over-report whenever ``limit`` is passed.
-        candidate_stmt = select(Mix.id).where(Mix.pipeline_status == "completed")
-        if limit:
-            candidate_stmt = candidate_stmt.limit(limit)
+        # Resolve the resume cursor (if any) into a concrete offset in the
+        # same session/await window as the pre-flight count below, well
+        # before the single-flight guard. Mirrors the id-selection in
+        # ``_run_retag`` exactly (same statement builder), so this
+        # pre-flight number is the actual count of mixes the run is about
+        # to touch -- a plain COUNT(*) ignoring limit/offset would
+        # over-report.
+        resume_cursor_ignored = False
+        if resume:
+            effective_offset, resume_cursor_ignored = await _resume_offset(
+                session, dry_run
+            )
+        else:
+            effective_offset = offset
+        candidate_stmt = _retag_candidates_stmt(effective_offset, limit)
         candidates = len((await session.execute(candidate_stmt)).all())
 
     # No await between this check and the assignment below: asyncio is
     # single-threaded, so an uninterrupted block is atomic. A yield here
     # would let two concurrent POSTs both pass the guard and start two
-    # overlapping passes over the same multi-gigabyte files.
+    # overlapping passes over the same multi-gigabyte files. The resume
+    # cursor lookup above happens strictly BEFORE this window, not inside
+    # it, so it cannot reintroduce that race.
     if _retag_task and not _retag_task.done():
         raise HTTPException(
             status_code=409, detail="A retag run is already in progress."
         )
 
-    _retag_task = _spawn("retag", _run_retag(dry_run, limit))
-    return {"started": True, "dry_run": dry_run, "candidates": int(candidates)}
+    _retag_task = _spawn(
+        "retag",
+        _run_retag(
+            dry_run, limit, effective_offset, resume, resume_cursor_ignored
+        ),
+    )
+    return {
+        "started": True,
+        "dry_run": dry_run,
+        "candidates": int(candidates),
+        "offset": effective_offset,
+        "resume_cursor_ignored": resume_cursor_ignored,
+    }
 
 
 @router.get("/retag/status")
