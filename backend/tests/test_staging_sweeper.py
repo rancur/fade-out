@@ -328,33 +328,30 @@ def _make_real_flac(path, duration=1):
     )
 
 
-def test_copy_staged_from_an_old_mtime_source_survives_a_concurrent_sweep(
-    watch_dirs, monkeypatch
-):
-    """THE test that would have caught the actual bug (see the module
-    docstring's CTIME WARNING and the fix in ``write_tagged_copy`` /
-    ``sweep_staging``). These are archival recordings months old:
-    ``shutil.copy2`` (inside ``write_tagged_copy``) carries the SOURCE
-    file's own old mtime onto the freshly staged copy, so before the fix a
-    copy of a 200-day-old source reported an age of ~4800 hours the instant
-    it was staged.
+# These two tests split what was originally ONE test
+# (``test_copy_staged_from_an_old_mtime_source_survives_a_concurrent_sweep``)
+# covering the combined fix: with BOTH halves present, or with only the
+# ctime half present (the copy's real ctime is naturally fresh moments
+# after ``shutil.copy2``, regardless of the ``os.utime`` stamp), the
+# combined test passed identically -- so a mutation reverting only the
+# ``os.utime`` stamp in ``write_tagged_copy`` left it green. Each test below
+# defeats the OTHER half so only the one it names can save the file.
 
-    A synthetic fixture with a hand-backdated mtime (as every other test in
-    this file uses) can't reproduce this: ``mutagen``'s ``audio.save()``
-    -- which ``write_tagged_copy`` calls right after copying, to actually
-    write the tags -- is a real write, and a real write naturally bumps a
-    file's OWN mtime/ctime to "now" as an ordinary OS side effect. So by
-    the time ``write_tagged_copy`` returns control to a caller, the window
-    the bug lived in has already closed on its own -- calling
-    ``sweep_staging`` AFTER ``write_tagged_copy`` returns can never observe
-    it, bug or no bug. The actual danger, per the review, is a sweep
-    landing WHILE ``write_tagged_copy`` is still working -- i.e. in the gap
-    between ``shutil.copy2`` finishing and ``audio.save()`` running. This
-    test reproduces exactly that gap: ``mutagen.flac.FLAC`` is patched so
-    that the FIRST time ``write_tagged_copy`` opens the freshly staged copy
-    (immediately after copying, before any tag is set or saved), it also
-    runs a concurrent ``sweep_staging`` pass right there, mid-function --
-    the same race the review reproduced.
+def test_write_tagged_copy_mtime_stamp_survives_a_stale_ctime_view(
+    watch_dirs, monkeypatch, fake_stat
+):
+    """Isolates ``write_tagged_copy``'s own ``os.utime(temp_path, None)``
+    stamp from ``sweep_staging``'s ctime-aware aging (see the module
+    docstring's CTIME WARNING).
+
+    ``fake_stat`` pins the sweep's view of the staged copy's ``st_ctime`` to
+    the same ~200-day-old value as the SOURCE (standing in for a sweep/
+    filesystem timing combination where ctime doesn't yet read as fresh),
+    while leaving ``st_mtime`` untouched -- real, whatever
+    ``write_tagged_copy`` actually set it to. With ctime forced old,
+    ``max(mtime, ctime)`` can only come out fresh via the ``os.utime``
+    stamp. If that stamp were missing, the copy's mtime would still carry
+    the source's ~200-day-old value (via ``copystat``) and this must fail.
     """
     import mutagen.flac as mutagen_flac
 
@@ -378,10 +375,11 @@ def test_copy_staged_from_an_old_mtime_source_survives_a_concurrent_sweep(
         call_count["n"] += 1
         if call_count["n"] == 1:
             # This is write_tagged_copy's FIRST ``FLAC(temp_path)`` call --
-            # right after ``shutil.copy2`` (and after the fix's own
-            # ``os.utime`` stamp, if present), before tags are set or
-            # ``audio.save()`` has run. Simulate a sweep landing exactly
-            # here, concurrently with the still-in-progress write.
+            # right after ``shutil.copy2`` and the ``os.utime`` stamp (if
+            # present), before tags are set or ``audio.save()`` has run.
+            # Pin THIS path's ctime old, then simulate a sweep landing here,
+            # concurrently with the still-in-progress write.
+            fake_stat(path, 200 * 24)
             concurrent_sweep_result["result"] = source_tagger.sweep_staging(
                 str(staging), older_than_hours=6.0
             )
@@ -400,9 +398,91 @@ def test_copy_staged_from_an_old_mtime_source_survives_a_concurrent_sweep(
         "sanity: the concurrent sweep hook must actually have fired"
     )
     assert os.path.exists(temp_path), (
-        "a copy staged moments ago from a 200-day-old source must survive "
-        "a sweep landing WHILE write_tagged_copy is still working, not be "
-        "swept as if the COPY itself were 200 days old"
+        "the os.utime mtime stamp alone must save a copy whose ctime the "
+        "sweep sees as old"
+    )
+    assert concurrent_sweep_result["result"]["removed"] == []
+    assert concurrent_sweep_result["result"]["removed_count"] == 0
+
+
+def test_sweep_ctime_aware_aging_survives_when_mtime_alone_reads_as_old(
+    watch_dirs, monkeypatch
+):
+    """Isolates ``sweep_staging``'s ctime-aware ``max(mtime, ctime)`` aging
+    from ``write_tagged_copy``'s ``os.utime`` stamp -- the other half of the
+    same combined fix.
+
+    ``write_tagged_copy``'s own ``os.utime(temp_path, None)`` call is
+    neutralised here (a no-op), so the staged copy's mtime is left exactly
+    as ``shutil.copy2`` set it -- the SOURCE's ~200-day-old mtime, carried
+    by ``copystat``. Its REAL ``st_ctime`` is untouched and genuinely
+    fresh, since the file was in fact just created moments ago -- nothing
+    here fakes it. Only ``sweep_staging`` taking the ctime into account at
+    all can save it under these conditions; aging off mtime alone would
+    sweep it.
+    """
+    import mutagen.flac as mutagen_flac
+
+    audio, _video = watch_dirs
+    src = audio / "archival-recording.flac"
+    _make_real_flac(src)
+
+    old_mtime = time.time() - 200 * 24 * 3600
+    os.utime(str(src), (old_mtime, old_mtime))
+
+    # Neutralise ONLY write_tagged_copy's own ``os.utime(temp_path, None)``
+    # call ("stamp to current time" -- a plain ``None`` times argument, no
+    # ``ns``). ``shutil.copy2``'s ``copystat`` must still take effect
+    # untouched -- it calls ``os.utime(dst, ns=(atime_ns, mtime_ns), ...)``
+    # with the SOURCE's explicit old timestamps, which is the very
+    # mechanism this test relies on to leave the copy's mtime reading old.
+    # A blanket no-op would neutralise that call too and defeat the setup.
+    real_utime = os.utime
+
+    def _utime_neutralize_now_stamp(path, *args, **kwargs):
+        times = args[0] if args else kwargs.get("times")
+        if times is None and kwargs.get("ns") is None:
+            return None
+        return real_utime(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "utime", _utime_neutralize_now_stamp)
+
+    staging = audio / source_tagger.TEMP_DIRNAME
+    concurrent_sweep_result = {}
+    real_flac_cls = mutagen_flac.FLAC
+    call_count = {"n": 0}
+
+    def flac_with_concurrent_sweep(path, *args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Captured BEFORE audio.save() runs (that real write would
+            # bump mtime to "now" on its own, closing the window this test
+            # means to exercise) -- proves the utime neutralisation above
+            # actually left the copy's mtime reading as old at the moment
+            # the sweep runs, not just after the fact.
+            concurrent_sweep_result["mtime_at_sweep_time"] = os.stat(path).st_mtime
+            concurrent_sweep_result["result"] = source_tagger.sweep_staging(
+                str(staging), older_than_hours=6.0
+            )
+        return real_flac_cls(path, *args, **kwargs)
+
+    monkeypatch.setattr(mutagen_flac, "FLAC", flac_with_concurrent_sweep)
+
+    temp_path = source_tagger.write_tagged_copy(
+        str(src), {"ARTIST": "Will See"}, None, None
+    )
+
+    assert "result" in concurrent_sweep_result, (
+        "sanity: the concurrent sweep hook must actually have fired"
+    )
+    assert (
+        time.time() - concurrent_sweep_result["mtime_at_sweep_time"]
+    ) / 3600 > 100, (
+        "sanity: with the utime stamp neutralised, the copy's mtime must "
+        "still read as old at the moment the sweep ran"
+    )
+    assert os.path.exists(temp_path), (
+        "ctime-aware aging alone must save a copy whose mtime reads as old"
     )
     assert concurrent_sweep_result["result"]["removed"] == []
     assert concurrent_sweep_result["result"]["removed_count"] == 0

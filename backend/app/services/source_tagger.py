@@ -682,7 +682,21 @@ async def tag_sources_for_mix(
                     "reason": f"{src} does not exist"}
 
         if skip_already_tagged:
-            return {"status": "skipped", "actions": actions, "reason": "already tagged"}
+            # ``"terminal": True`` marks this outcome, at its own source, as
+            # safe for a caller's resume cursor to advance past -- this
+            # function is the one place that actually knows a "skipped" is
+            # the benign already-tagged case rather than a missing source,
+            # a source outside the allowed roots, or insufficient free
+            # space (all of which also come back "skipped"). Callers that
+            # judge terminal-success by matching the "already tagged"
+            # reason string (e.g. ``app.routers.catalog``) can fall back to
+            # that when this key is absent, but should prefer this key --
+            # see that module's own docstring for why the string match
+            # alone is brittle.
+            return {
+                "status": "skipped", "actions": actions, "reason": "already tagged",
+                "terminal": True,
+            }
 
         if not has_space:
             return {"status": "skipped", "actions": actions,

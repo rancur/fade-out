@@ -356,6 +356,19 @@ class TestResume:
             "cursor must never make a real run silently do nothing"
         )
 
+        # Gate 3: the refusal must also be durable, not just in the HTTP
+        # response -- an operator reading the activity log after the
+        # process is gone must be able to tell a refused resume from a
+        # fresh start. Two runs happened (the bare dry run, then the real
+        # resume) -- ``query`` returns newest-first, so the real run's
+        # start event is items[0].
+        from app.services import activity_log
+
+        items, total = await activity_log.query(event="retag_run_started")
+        assert total == 2
+        assert items[0]["context"]["dry_run"] is False
+        assert items[0]["context"]["resume_cursor_ignored"] is True
+
     async def test_resume_true_with_no_saved_cursor_starts_at_beginning(
         self, client, monkeypatch
     ):
@@ -532,3 +545,138 @@ class TestCursorSkipsNonTerminalOutcomes:
         body = second.json()
         assert body["offset"] == 1
         assert body["candidates"] == 2
+
+    async def test_disabled_tag_on_a_real_run_does_not_advance_cursor(
+        self, client, monkeypatch
+    ):
+        """Gate 1 / Blocker 1 restated: a real run whose tag leg comes back
+        ``"disabled"`` (``tag_source_files`` is off) must NOT have its
+        cursor advanced past that mix. Before this fix, ``"disabled"`` was
+        treated as terminal-success for a real run -- an operator running
+        the real backfill with the flag off would see the cursor race to
+        the end of the backlog (recorded under ``dry_run=False``, so the
+        mode guard doesn't catch it), then enable the flag and
+        ``resume=true`` into ``{"candidates": 0}`` with zero files ever
+        touched.
+        """
+        import app.services.source_renamer as renamer_mod
+        import app.services.source_tagger as tagger_mod
+
+        for day, mix_id in enumerate(["mix-a", "mix-b", "mix-c"], start=1):
+            await _make_mix(id=mix_id, created_at=_dt(day))
+
+        seen = []
+
+        async def fake_rename(mix_id, *, reason, dry_run=False):
+            return {
+                "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                "renamed": [], "skipped": [], "errors": [],
+            }
+
+        async def fake_tag(mix_id, *, reason, dry_run=False):
+            seen.append(mix_id)
+            if mix_id == "mix-b":
+                return {
+                    "status": "disabled", "actions": [],
+                    "reason": "tag_source_files is off",
+                }
+            return {"status": "ok", "actions": [], "reason": reason}
+
+        monkeypatch.setattr(renamer_mod, "rename_sources_for_mix", fake_rename)
+        monkeypatch.setattr(tagger_mod, "tag_sources_for_mix", fake_tag)
+
+        first = await client.post("/api/catalog/retag", params={"dry_run": "false"})
+        assert first.status_code == 202
+        await asyncio.wait_for(catalog._retag_task, timeout=5)
+        # The run itself still covers every candidate in this same pass.
+        assert seen == ["mix-a", "mix-b", "mix-c"]
+
+        # mix-b came back disabled -- the persisted cursor must be stuck at
+        # mix-a, the last TERMINAL-success mix, not mix-c.
+        progress = await _get_progress()
+        assert progress["last_mix_id"] == "mix-a"
+
+        # The setting is now enabled -- resume must revisit mix-b, not
+        # believe it was already handled.
+        seen.clear()
+
+        async def fake_tag_enabled(mix_id, *, reason, dry_run=False):
+            seen.append(mix_id)
+            return {"status": "ok", "actions": [], "reason": reason}
+
+        monkeypatch.setattr(tagger_mod, "tag_sources_for_mix", fake_tag_enabled)
+
+        second = await client.post(
+            "/api/catalog/retag", params={"dry_run": "false", "resume": "true"}
+        )
+        assert second.status_code == 202
+        body = second.json()
+        assert body["offset"] == 1
+        assert body["candidates"] == 2
+
+        await asyncio.wait_for(catalog._retag_task, timeout=5)
+        assert seen == ["mix-b", "mix-c"], (
+            "the previously-disabled mix must be retried once the setting "
+            "is enabled, not skipped forever"
+        )
+
+    async def test_failed_rename_does_not_advance_cursor_even_when_tag_succeeds(
+        self, client, monkeypatch
+    ):
+        """Gate 2: the rename leg was absent from the OLD cursor decision --
+        it inspected only the tag outcome. A mix whose rename comes back
+        with ``errors`` (e.g. ``permission_denied``) but whose tag succeeds
+        must NOT advance the cursor, or a later ``resume=true`` never
+        retries the failed rename."""
+        import app.services.source_renamer as renamer_mod
+        import app.services.source_tagger as tagger_mod
+
+        for day, mix_id in enumerate(["mix-a", "mix-b", "mix-c"], start=1):
+            await _make_mix(id=mix_id, created_at=_dt(day))
+
+        seen = []
+
+        async def fake_rename(mix_id, *, reason, dry_run=False):
+            seen.append(mix_id)
+            if mix_id == "mix-b":
+                return {
+                    "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                    "renamed": [], "skipped": [],
+                    "errors": [{"path": "/x/b.flac", "reason": "permission_denied"}],
+                }
+            return {
+                "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                "renamed": [{"from": "old.flac", "to": "new.flac"}],
+                "skipped": [], "errors": [],
+            }
+
+        async def fake_tag(mix_id, *, reason, dry_run=False):
+            # Tag succeeds for EVERY mix, including mix-b -- the rename
+            # failure is the only thing wrong with it.
+            return {"status": "ok", "actions": [], "reason": reason}
+
+        monkeypatch.setattr(renamer_mod, "rename_sources_for_mix", fake_rename)
+        monkeypatch.setattr(tagger_mod, "tag_sources_for_mix", fake_tag)
+
+        first = await client.post("/api/catalog/retag", params={"dry_run": "false"})
+        assert first.status_code == 202
+        await asyncio.wait_for(catalog._retag_task, timeout=5)
+        assert seen == ["mix-a", "mix-b", "mix-c"]
+
+        progress = await _get_progress()
+        assert progress["last_mix_id"] == "mix-a"
+
+        seen.clear()
+        second = await client.post(
+            "/api/catalog/retag", params={"dry_run": "false", "resume": "true"}
+        )
+        assert second.status_code == 202
+        body = second.json()
+        assert body["offset"] == 1
+        assert body["candidates"] == 2
+
+        await asyncio.wait_for(catalog._retag_task, timeout=5)
+        assert seen == ["mix-b", "mix-c"], (
+            "mix-b's failed rename must be retried on resume even though "
+            "its tag leg already succeeded"
+        )

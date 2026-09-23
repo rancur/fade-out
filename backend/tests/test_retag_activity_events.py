@@ -142,6 +142,47 @@ class TestRunStartedEvent:
         assert ctx["candidates"] == 2
         assert items[0]["level"] == "info"
 
+    async def test_start_event_records_a_refused_resume_cursor(
+        self, prepared_db, monkeypatch
+    ):
+        """Gate 3: the HTTP response surfaces a mode-mismatched resume
+        cursor as ``resume_cursor_ignored``, but that only exists for the
+        life of the request/response cycle. An operator reading the
+        DURABLE log after the process is gone must be able to tell a
+        refused resume from a fresh start -- the ``retag_run_started``
+        event's context must carry it too, not just
+        ``dry_run/limit/offset/resume/candidates``."""
+        _wire_fakes(monkeypatch)
+        await _make_mix(id="mix-a", created_at=_dt(1))
+
+        await catalog._run_retag(
+            dry_run=False, limit=None, offset=0, resume=True,
+            resume_cursor_ignored=True,
+        )
+
+        items, total = await activity_log.query(event="retag_run_started")
+        assert total == 1
+        assert items[0]["context"]["resume_cursor_ignored"] is True
+
+    async def test_start_event_records_a_non_refused_resume_as_false(
+        self, prepared_db, monkeypatch
+    ):
+        """The other side of the same field: a resume that WAS honoured
+        must record ``resume_cursor_ignored: False``, not just omit the
+        key -- an absent key and an explicit False look identical to a
+        naive reader unless the field is always present."""
+        _wire_fakes(monkeypatch)
+        await _make_mix(id="mix-a", created_at=_dt(1))
+
+        await catalog._run_retag(
+            dry_run=False, limit=None, offset=0, resume=True,
+            resume_cursor_ignored=False,
+        )
+
+        items, total = await activity_log.query(event="retag_run_started")
+        assert total == 1
+        assert items[0]["context"]["resume_cursor_ignored"] is False
+
 
 class TestPerMixEvent:
     async def test_each_processed_mix_emits_exactly_one_event_with_both_statuses(
@@ -170,6 +211,48 @@ class TestPerMixEvent:
             assert "tag_status" in ctx
             assert ctx["rename_status"] == "ok"
             assert ctx["tag_status"] == "ok"
+
+    async def test_event_context_carries_both_reason_fields(
+        self, prepared_db, monkeypatch
+    ):
+        """Blocker 3: the status alone doesn't say WHY -- two mixes both
+        showing ``tag_status: "skipped"`` could be one already-tagged (fine)
+        and one out of disk space (alarming), indistinguishable without the
+        reason string. ``retag_mix_processed`` must carry
+        ``rename_reason``/``tag_reason`` alongside the statuses, not just
+        the statuses on their own."""
+        await _make_mix(id="mix-a", created_at=_dt(1))
+
+        def _rename_with_reason(mix_id, *, dry_run=False):
+            return {
+                "mix_id": mix_id, "reason": "retag_backfill", "dry_run": dry_run,
+                "renamed": [], "skipped": [{"path": "/x/a.flac", "reason": "no_title"}],
+                "errors": [],
+            }
+
+        def _tag_out_of_space(dry_run=False):
+            return {
+                "status": "skipped", "actions": [],
+                "reason": "insufficient free space to rewrite /x/a.flac safely",
+            }
+
+        _wire_fakes(
+            monkeypatch,
+            rename_by_mix={"mix-a": _rename_with_reason},
+            tag_by_mix={"mix-a": _tag_out_of_space},
+        )
+
+        await catalog._run_retag(dry_run=False, limit=None)
+
+        items, total = await activity_log.query(event="retag_mix_processed")
+        assert total == 1
+        ctx = items[0]["context"]
+        assert ctx["rename_status"] == "skipped"
+        assert ctx["rename_reason"] == "no_title"
+        assert ctx["tag_status"] == "skipped"
+        assert ctx["tag_reason"] == (
+            "insufficient free space to rewrite /x/a.flac safely"
+        )
 
 
 class TestLevelByOutcome:
@@ -219,6 +302,36 @@ class TestCompletionEvent:
         assert item["context"]["total"] == 2
         # At least one leg failed (the rename on mix-rename-failed) -> not a
         # silent "info" completion for a run that actually lost work.
+        assert item["level"] == "warn"
+
+    async def test_alarming_skip_with_no_failures_still_warns(
+        self, prepared_db, monkeypatch
+    ):
+        """Blocker 3, the other half: NOTHING failed here -- every rename
+        and every tag call returns cleanly -- but one tag was skipped for
+        insufficient free space, not because it was already tagged. That
+        must still warn: ``{skipped: N}`` alone can't tell "every file was
+        already tagged" (fine) from "every file was skipped for want of
+        disk" (alarming) apart, which is the entire reason
+        ``any_alarming_skip`` exists. A completion event that only checked
+        ``summary.get("failed")`` would silently report "info" here."""
+        await _make_mix(id="mix-a", created_at=_dt(1))
+
+        def _tag_out_of_space(dry_run=False):
+            return {
+                "status": "skipped", "actions": [],
+                "reason": "insufficient free space to rewrite /x/a.flac safely",
+            }
+
+        _wire_fakes(monkeypatch, tag_by_mix={"mix-a": _tag_out_of_space})
+
+        await catalog._run_retag(dry_run=False, limit=None)
+
+        items, total = await activity_log.query(event="retag_run_completed")
+        assert total == 1
+        item = items[0]
+        assert item["context"]["summary"].get("failed", 0) == 0
+        assert item["context"]["any_alarming_skip"] is True
         assert item["level"] == "warn"
 
 

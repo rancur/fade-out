@@ -11,8 +11,11 @@ wire, would defeat the entire point of the control.
 
 import asyncio
 import inspect
+import os
 import sys
+import time
 import types
+from types import SimpleNamespace
 
 # Sandbox-only workaround: this environment doesn't have the `shazamio`
 # dependency installed (a real dependency of app/services/audio_analyzer.py
@@ -462,3 +465,121 @@ class TestRetagSummary:
         assert state["summary"]["skipped"] == 1
         assert state["summary"]["unknown"] == 1
         assert sum(state["summary"].values()) == 2 * state["processed"]
+
+
+class TestSweepPassesDryRunThrough:
+    """Blocker 5 -- the delete-primitive bug. ``_sweep_retag_staging`` used
+    to call ``source_tagger.sweep_staging(staging_root)`` POSITIONALLY, which
+    silently dropped ``dry_run`` to that function's own default of
+    ``False`` regardless of what the retag caller asked for -- so a bare,
+    "report-only" POST deleted real orphaned staging files. These tests
+    exercise the real ``catalog._sweep_retag_staging`` ->
+    ``source_tagger.sweep_staging`` call boundary (not a mock of either
+    side), since the bug lived exactly at that boundary, and use a REAL
+    file on disk so a regression actually deletes something a test can see.
+    """
+
+    async def test_dry_run_sweep_reports_but_does_not_delete(self, tmp_path, monkeypatch):
+        import app.services.source_tagger as tagger_mod
+        from app.config import settings
+
+        audio = tmp_path / "audio"
+        video = tmp_path / "video"
+        audio.mkdir()
+        video.mkdir()
+        monkeypatch.setattr(settings, "WATCH_AUDIO_PATH", str(audio))
+        monkeypatch.setattr(settings, "WATCH_VIDEO_PATH", str(video))
+
+        staging = audio / tagger_mod.TEMP_DIRNAME
+        staging.mkdir()
+        orphan = staging / "orphan.flac"
+        orphan.write_bytes(b"x" * 1024)
+
+        # The default age threshold is 6 hours; sweep_staging ages off the
+        # MORE RECENT of st_mtime/st_ctime, and real ctime cannot be
+        # backdated through any public API. Patch os.stat to report a
+        # controlled, genuinely-old ctime for this one path -- same
+        # technique as test_staging_sweeper.py's ``fake_stat`` fixture.
+        real_stat = os.stat
+        old_ts = time.time() - 7 * 3600
+        target = os.path.normpath(str(orphan))
+
+        def _stat(path, *args, **kwargs):
+            real = real_stat(path, *args, **kwargs)
+            if os.path.normpath(os.fspath(path)) == target:
+                return SimpleNamespace(
+                    st_mtime=old_ts, st_ctime=old_ts, st_size=real.st_size,
+                )
+            return real
+
+        monkeypatch.setattr(os, "stat", _stat)
+
+        result = await catalog._sweep_retag_staging(dry_run=True)
+        assert orphan.exists(), "a dry-run sweep must not delete anything, for real"
+        assert result["removed_count"] == 1  # reports what WOULD be removed
+
+        result = await catalog._sweep_retag_staging(dry_run=False)
+        assert not orphan.exists(), "sanity: the age guard genuinely caught it"
+        assert result["removed_count"] == 1
+
+
+class TestSweepTargetsIncludeNestedCandidateDirs:
+    """Finding 7 -- sweep targets must be the UNION of the flat watch roots
+    AND ``dirname(candidate_source)/.fadeout-tagging`` for every candidate
+    this run selected, not the flat roots alone. A source living in a
+    subdirectory of a watch root (e.g. ``<watch_audio>/2023/foo.flac``)
+    stages its orphaned copy under ``<watch_audio>/2023/.fadeout-tagging``,
+    which sweeping only the flat root's own ``.fadeout-tagging`` would never
+    visit."""
+
+    async def test_orphan_under_a_nested_candidate_dir_is_swept(self, tmp_path, monkeypatch):
+        import app.services.source_tagger as tagger_mod
+        from app.config import settings
+
+        audio = tmp_path / "audio"
+        video = tmp_path / "video"
+        audio.mkdir()
+        video.mkdir()
+        monkeypatch.setattr(settings, "WATCH_AUDIO_PATH", str(audio))
+        monkeypatch.setattr(settings, "WATCH_VIDEO_PATH", str(video))
+
+        nested = audio / "2023"
+        nested.mkdir()
+        nested_staging = nested / tagger_mod.TEMP_DIRNAME
+        nested_staging.mkdir()
+        orphan = nested_staging / "orphan.flac"
+        orphan.write_bytes(b"x" * 1024)
+
+        real_stat = os.stat
+        old_ts = time.time() - 7 * 3600
+        target = os.path.normpath(str(orphan))
+
+        def _stat(path, *args, **kwargs):
+            real = real_stat(path, *args, **kwargs)
+            if os.path.normpath(os.fspath(path)) == target:
+                return SimpleNamespace(
+                    st_mtime=old_ts, st_ctime=old_ts, st_size=real.st_size,
+                )
+            return real
+
+        monkeypatch.setattr(os, "stat", _stat)
+
+        # No candidate paths -- the flat-roots-only sweep must NOT reach
+        # this nested orphan.
+        result = await catalog._sweep_retag_staging(dry_run=False, candidate_audio_paths=[])
+        assert orphan.exists(), (
+            "sanity: an orphan nested under a candidate's own directory "
+            "must not be reachable from the flat watch roots alone"
+        )
+        assert result["removed_count"] == 0
+
+        # Now pass the actual candidate source living in that nested
+        # directory -- its own staging dir must be added as a sweep target.
+        candidate_source = str(nested / "foo.flac")
+        result = await catalog._sweep_retag_staging(
+            dry_run=False, candidate_audio_paths=[candidate_source]
+        )
+        assert not orphan.exists(), (
+            "the nested candidate's own .fadeout-tagging dir must be swept"
+        )
+        assert result["removed_count"] == 1

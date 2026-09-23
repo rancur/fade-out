@@ -95,6 +95,34 @@ def test_missing_cover_art_reports_false_once_art_is_available(tmp_path):
     assert source_tagger.already_tagged(str(final), tags, str(cover)) is False
 
 
+def test_regenerated_cover_art_same_path_different_content_reports_false(tmp_path):
+    """Finding 6: the cover art check must compare CONTENT, not just
+    presence. A mix's artwork can be regenerated at the SAME
+    ``cover_art_path`` with different bytes (e.g. a redesigned thumbnail) --
+    a presence-only check ("some picture is embedded" and "a cover art file
+    exists" are both true) would report already-tagged forever and leave
+    the STALE embedded art in place. Both images here are the same length,
+    so this specifically exercises the SHA-256 digest comparison, not the
+    cheaper size check that precedes it."""
+    src = tmp_path / "orig.flac"
+    _make_flac(src)
+    tags = {"ARTIST": "Will See", "ALBUM": "Will See Mixes", "TITLE": "Test Mix"}
+
+    cover = tmp_path / "cover.png"
+    _make_cover(cover)
+
+    tagged = source_tagger.write_tagged_copy(str(src), tags, str(cover), None)
+    final = tmp_path / "final.flac"
+    os.replace(tagged, final)
+
+    assert source_tagger.already_tagged(str(final), tags, str(cover)) is True
+
+    # Artwork regenerated at the SAME path -- same length, different bytes.
+    cover.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\xff" * 100)
+
+    assert source_tagger.already_tagged(str(final), tags, str(cover)) is False
+
+
 def test_already_tagged_does_not_modify_the_file(tmp_path):
     """A header read only: size and mtime must be byte-for-byte unchanged
     after the check."""
