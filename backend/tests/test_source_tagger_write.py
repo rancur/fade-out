@@ -157,3 +157,33 @@ def test_padding_uses_constant(tmp_path):
     out = source_tagger.write_tagged_copy(str(src), {"ARTIST": "Will See"}, None, None)
     padding = sum(b.length for b in FLAC(out).metadata_blocks if b.code == 1)
     assert padding >= source_tagger.FLAC_PADDING_BYTES
+
+
+def test_corrupt_write_fails_and_cleans_up_even_with_none_duration(tmp_path, monkeypatch):
+    """A corrupt write that does not parse as FLAC must fail and cleanup, even when expected_duration=None."""
+    src = tmp_path / "orig.flac"
+    _make_flac(src)
+
+    # Monkeypatch FLAC so that the post-write re-read (the verify step) raises.
+    from mutagen.flac import FLAC as RealFLAC
+
+    original_init = RealFLAC.__init__
+    call_count = [0]
+
+    def patched_init(self, *args, **kwargs):
+        call_count[0] += 1
+        # First call (editing the copy) succeeds; second call (verify re-read) fails.
+        if call_count[0] == 2:
+            raise ValueError("simulated corrupt FLAC: re-read failed")
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(RealFLAC, "__init__", patched_init)
+
+    with pytest.raises(ValueError, match="simulated corrupt FLAC"):
+        source_tagger.write_tagged_copy(
+            str(src), {"ARTIST": "Will See"}, None, expected_duration=None
+        )
+
+    leftovers = list((tmp_path / source_tagger.TEMP_DIRNAME).glob("*")) \
+        if (tmp_path / source_tagger.TEMP_DIRNAME).exists() else []
+    assert leftovers == [], "a corrupt write must not leave a temp file behind"
