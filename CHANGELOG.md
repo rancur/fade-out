@@ -10,6 +10,26 @@ run unattended — never unsafe to the files themselves, but a run that
 looks successful while having done little or nothing is worse for an
 operation nobody is watching. This release closes those gaps.
 
+- The resume cursor now only advances when **both** legs of a mix reached a
+  terminal outcome — the rename as well as the tag. A rename that failed on
+  `permission_denied`, a read-only mount or a cross-device link previously
+  advanced the cursor and was never retried, which is precisely the class of
+  transient, fixable condition resume exists for.
+- **`disabled` is no longer treated as terminal success on a real run.** It
+  used to be, on the reasoning that a switched-off setting means "nothing to
+  do" — true at the time, false the moment the setting is switched on. A real
+  run with `tag_source_files` off would advance the cursor across the whole
+  backlog and record it as a real run, so enabling the flag and resuming
+  afterwards tagged nothing and reported success. Dry runs are unaffected.
+- `retag_run_started` now records `resume_cursor_ignored`, so the durable log
+  alone shows when a cursor was refused for belonging to the opposite mode —
+  previously that appeared only in the HTTP response, which is gone by the
+  time anyone reads the log.
+- `tag_sources_for_mix` now marks its already-tagged outcome with a structural
+  `"terminal": True` at the one site that knows the answer, replacing a match
+  on the human-readable reason string. The string match remains as a fallback
+  for older builds.
+
 - **A dry run's cursor can no longer poison a real run.** The persisted
   resume cursor records the `dry_run` it was written under; `resume=true`
   against a cursor from the other mode is now treated as no cursor at all
