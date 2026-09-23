@@ -33,6 +33,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from app.services import source_renamer
+from app.services.source_renamer import is_within_allowed_roots
 from app.services.tracklist_utils import format_timestamp
 
 logger = logging.getLogger("fadeout.source_tagger")
@@ -292,8 +293,6 @@ def register_and_promote(
         if opened_here:
             db.close()
 
-
-from app.services.source_renamer import is_within_allowed_roots
 
 MIN_FREE_SPACE_MULTIPLE = 2
 

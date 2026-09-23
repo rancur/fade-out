@@ -112,7 +112,6 @@ def test_truncated_staged_copy_is_rejected(tmp_path, monkeypatch):
     """
     src = tmp_path / "orig.flac"
     _make_flac_with_audio_data(src)
-    src_size = src.stat().st_size
 
     from mutagen.flac import FLAC as RealFLAC
 
