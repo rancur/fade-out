@@ -269,30 +269,92 @@ class TestResume:
         """A run stopped early (``limit=2``) leaves a cursor at the second
         mix. A follow-up call with ``resume=true`` (no limit/offset) must
         continue with the mixes AFTER that cursor, not restart from zero and
-        not repeat mix-a/mix-b."""
+        not repeat mix-a/mix-b.
+
+        Both calls are explicit REAL runs (``dry_run=False``) -- see
+        Blocker 1: a dry run's cursor can never resume a real run (and vice
+        versa), so the setup call here must actually be the same mode as the
+        resuming call, or the resume below would hit that mode-mismatch
+        guard instead of exercising cursor continuation at all. The original
+        version of this test passed only ``limit=2`` to the first call,
+        which defaults to ``dry_run=True`` -- so what it actually proved was
+        that a DRY run advances a REAL run's cursor, not what its name
+        claims.
+        """
         seen = []
         _noop_fakes(monkeypatch, seen=seen)
 
         for day, mix_id in enumerate(["mix-a", "mix-b", "mix-c", "mix-d"], start=1):
             await _make_mix(id=mix_id, created_at=_dt(day))
 
-        first = await client.post("/api/catalog/retag", params={"limit": 2})
+        first = await client.post(
+            "/api/catalog/retag", params={"dry_run": "false", "limit": 2}
+        )
         assert first.status_code == 202
         await asyncio.wait_for(catalog._retag_task, timeout=5)
         assert seen == ["mix-a", "mix-b"]
 
         progress = await _get_progress()
         assert progress["last_mix_id"] == "mix-b"
+        assert progress["dry_run"] is False
 
         seen.clear()
-        second = await client.post("/api/catalog/retag", params={"resume": "true"})
+        second = await client.post(
+            "/api/catalog/retag", params={"dry_run": "false", "resume": "true"}
+        )
         assert second.status_code == 202
         body = second.json()
         assert body["offset"] == 2
         assert body["candidates"] == 2
+        assert body["resume_cursor_ignored"] is False
 
         await asyncio.wait_for(catalog._retag_task, timeout=5)
         assert seen == ["mix-c", "mix-d"]
+
+    async def test_resume_true_ignores_a_cursor_from_the_opposite_mode(
+        self, client, monkeypatch
+    ):
+        """Blocker 1: the README's own documented flow is a bare (dry-run)
+        POST over the whole backlog, followed by a real run. A REAL run's
+        ``resume=true`` must NOT resolve a cursor a DRY run wrote -- a dry
+        run never touches a single file, so resuming past its cursor would
+        make the real run believe everything up to it was already done and
+        touch nothing at all, while still reporting ``{"started": true}``.
+        """
+        seen = []
+        _noop_fakes(monkeypatch, seen=seen)
+
+        for day, mix_id in enumerate(["mix-a", "mix-b", "mix-c"], start=1):
+            await _make_mix(id=mix_id, created_at=_dt(day))
+
+        # Bare POST -- dry_run defaults to True -- over the whole backlog.
+        dry = await client.post("/api/catalog/retag")
+        assert dry.status_code == 202
+        assert dry.json()["dry_run"] is True
+        await asyncio.wait_for(catalog._retag_task, timeout=5)
+        assert seen == ["mix-a", "mix-b", "mix-c"]
+
+        progress = await _get_progress()
+        assert progress["last_mix_id"] == "mix-c"
+        assert progress["dry_run"] is True
+
+        # Now the real run, resuming. If the dry run's cursor governed it,
+        # this would compute offset=3 (past every mix) and touch nothing.
+        seen.clear()
+        real = await client.post(
+            "/api/catalog/retag", params={"dry_run": "false", "resume": "true"}
+        )
+        assert real.status_code == 202
+        body = real.json()
+        assert body["resume_cursor_ignored"] is True
+        assert body["offset"] == 0
+        assert body["candidates"] == 3
+
+        await asyncio.wait_for(catalog._retag_task, timeout=5)
+        assert seen == ["mix-a", "mix-b", "mix-c"], (
+            "the real run must actually touch every mix -- a dry run's "
+            "cursor must never make a real run silently do nothing"
+        )
 
     async def test_resume_true_with_no_saved_cursor_starts_at_beginning(
         self, client, monkeypatch
@@ -352,3 +414,121 @@ class TestResume:
 
         await asyncio.wait_for(catalog._retag_task, timeout=5)
         assert seen == ["mix-p", "mix-q"]
+
+
+class TestCursorSkipsNonTerminalOutcomes:
+    async def test_failed_tag_does_not_advance_cursor_and_is_retried_on_resume(
+        self, client, monkeypatch
+    ):
+        """Blocker 2: a mix whose tag write comes back ``{"status": "failed"}``
+        must NOT have the resume cursor advanced past it -- otherwise a
+        later ``resume=true`` skips it forever instead of retrying the
+        failed write. The run itself must still continue past it to the
+        next mix in the same pass (not advancing the cursor must never
+        stall the run)."""
+        import app.services.source_renamer as renamer_mod
+        import app.services.source_tagger as tagger_mod
+
+        for day, mix_id in enumerate(["mix-a", "mix-b", "mix-c"], start=1):
+            await _make_mix(id=mix_id, created_at=_dt(day))
+
+        seen = []
+
+        async def fake_rename(mix_id, *, reason, dry_run=False):
+            return {
+                "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                "renamed": [], "skipped": [], "errors": [],
+            }
+
+        async def fake_tag(mix_id, *, reason, dry_run=False):
+            seen.append(mix_id)
+            if mix_id == "mix-b":
+                return {"status": "failed", "actions": [], "reason": "disk full"}
+            return {"status": "ok", "actions": [], "reason": reason}
+
+        monkeypatch.setattr(renamer_mod, "rename_sources_for_mix", fake_rename)
+        monkeypatch.setattr(tagger_mod, "tag_sources_for_mix", fake_tag)
+
+        first = await client.post("/api/catalog/retag", params={"dry_run": "false"})
+        assert first.status_code == 202
+        await asyncio.wait_for(catalog._retag_task, timeout=5)
+        # The run itself must not stall on the failure -- all three are seen.
+        assert seen == ["mix-a", "mix-b", "mix-c"]
+
+        # mix-b failed -- the persisted cursor must be stuck at mix-a, the
+        # last TERMINAL-success mix, not mix-c.
+        progress = await _get_progress()
+        assert progress["last_mix_id"] == "mix-a"
+
+        seen.clear()
+        second = await client.post(
+            "/api/catalog/retag", params={"dry_run": "false", "resume": "true"}
+        )
+        assert second.status_code == 202
+        body = second.json()
+        assert body["offset"] == 1
+        assert body["candidates"] == 2
+
+        await asyncio.wait_for(catalog._retag_task, timeout=5)
+        # mix-b (the previously-failed one) is retried, not skipped forever.
+        assert seen == ["mix-b", "mix-c"]
+
+    async def test_skip_for_insufficient_space_freezes_the_cursor_at_the_prior_mix(
+        self, client, monkeypatch
+    ):
+        """Same guarantee as above, for the other reproduced case: a mix
+        skipped for a condition that can resolve itself (here, insufficient
+        free space) must also not advance the cursor -- ``skipped`` is NOT
+        automatically terminal-success, only ``skipped`` with reason
+        ``"already tagged"`` is.
+
+        Three mixes: mix-a genuinely succeeds (cursor should reach it),
+        mix-b is skipped for space (the cursor must freeze here), mix-c
+        then also succeeds -- but the cursor must NOT advance to mix-c
+        either. The cursor is an OFFSET into the ordered candidate list, so
+        if mix-c's success pushed it forward, a future resume would resolve
+        past mix-b's position and silently skip it anyway, even though
+        nothing was ever technically "persisted for mix-b" -- this is the
+        subtler version of the same bug the mutation check below exists to
+        catch.
+        """
+        import app.services.source_renamer as renamer_mod
+        import app.services.source_tagger as tagger_mod
+
+        for day, mix_id in enumerate(["mix-a", "mix-b", "mix-c"], start=1):
+            await _make_mix(id=mix_id, created_at=_dt(day))
+
+        async def fake_rename(mix_id, *, reason, dry_run=False):
+            return {
+                "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                "renamed": [], "skipped": [], "errors": [],
+            }
+
+        async def fake_tag(mix_id, *, reason, dry_run=False):
+            if mix_id == "mix-b":
+                return {
+                    "status": "skipped", "actions": [],
+                    "reason": "insufficient free space to rewrite /x/b.flac safely",
+                }
+            return {"status": "ok", "actions": [], "reason": reason}
+
+        monkeypatch.setattr(renamer_mod, "rename_sources_for_mix", fake_rename)
+        monkeypatch.setattr(tagger_mod, "tag_sources_for_mix", fake_tag)
+
+        resp = await client.post("/api/catalog/retag", params={"dry_run": "false"})
+        assert resp.status_code == 202
+        await asyncio.wait_for(catalog._retag_task, timeout=5)
+
+        progress = await _get_progress()
+        assert progress["last_mix_id"] == "mix-a"
+
+        # And a subsequent resume must actually revisit mix-b (and, as a
+        # cheap side effect of the offset-based cursor, mix-c too) rather
+        # than resolving straight past both of them.
+        second = await client.post(
+            "/api/catalog/retag", params={"dry_run": "false", "resume": "true"}
+        )
+        assert second.status_code == 202
+        body = second.json()
+        assert body["offset"] == 1
+        assert body["candidates"] == 2
