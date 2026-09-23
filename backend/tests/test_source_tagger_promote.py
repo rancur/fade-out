@@ -121,6 +121,58 @@ def test_rename_failure_removes_temp_file_and_reraises(tmp_path, monkeypatch):
     assert not list(temp.parent.iterdir()), "staging dir should be empty"
 
 
+def test_compute_file_hash_failure_removes_temp_file_and_reraises(tmp_path, monkeypatch):
+    """A raising compute_file_hash (e.g. an I/O error reading the temp file
+    off a flaky NAS mount) must not orphan a multi-gigabyte temp file --
+    nothing else ever sweeps .fadeout-tagging/."""
+    temp = tmp_path / ".fadeout-tagging" / "x.flac"
+    temp.parent.mkdir()
+    temp.write_bytes(b"tagged-content")
+    final = tmp_path / "x.flac"
+    db = _RecordingSeenDB()
+
+    def failing_hash(path):
+        raise OSError("simulated I/O error reading temp file")
+
+    monkeypatch.setattr(file_watcher, "compute_file_hash", failing_hash)
+
+    try:
+        source_tagger.register_and_promote(str(temp), str(final), "audio", seen_db=db)
+        assert False, "should have raised OSError"
+    except OSError as e:
+        assert "simulated I/O error" in str(e)
+
+    assert not temp.exists(), "temp file should be removed when compute_file_hash raises"
+    assert not list(temp.parent.iterdir()), "staging dir should be empty"
+    assert not final.exists(), "the original must never be touched"
+
+
+def test_mark_done_failure_removes_temp_file_and_reraises(tmp_path, monkeypatch):
+    """A raising mark_done (sqlite3.OperationalError: database is locked is a
+    live failure mode while the running watcher holds its own connection to
+    the same seen_files.db) must not orphan the temp file either."""
+    temp = tmp_path / ".fadeout-tagging" / "x.flac"
+    temp.parent.mkdir()
+    temp.write_bytes(b"tagged-content")
+    final = tmp_path / "x.flac"
+    db = _RecordingSeenDB()
+
+    def failing_mark_done(h, p, t):
+        raise RuntimeError("database is locked")
+
+    db.mark_done = failing_mark_done
+
+    try:
+        source_tagger.register_and_promote(str(temp), str(final), "audio", seen_db=db)
+        assert False, "should have raised RuntimeError"
+    except RuntimeError as e:
+        assert "database is locked" in str(e)
+
+    assert not temp.exists(), "temp file should be removed when mark_done raises"
+    assert not list(temp.parent.iterdir()), "staging dir should be empty"
+    assert not final.exists(), "the original must never be touched"
+
+
 def test_rename_failure_leaves_mark_done_row(tmp_path, monkeypatch):
     """A failed os.rename does NOT roll back the mark_done row."""
     temp = tmp_path / ".fadeout-tagging" / "x.flac"

@@ -212,6 +212,31 @@ def write_tagged_copy(
         raise
 
 
+def _fsync_dir(path: str) -> None:
+    """Fsync the directory containing ``path`` so a promote survives a crash.
+
+    A successful ``os.rename`` only guarantees the new directory entry is
+    visible; POSIX gives no ordering guarantee between that and the entry
+    actually reaching disk, so without this a crash or power loss right
+    after the rename can lose the rename on some filesystems even though the
+    renamed file's own data was already fsynced. Not every platform supports
+    fsyncing a directory, so a refusal here degrades to a logged warning
+    rather than failing an otherwise-successful promote.
+    """
+    directory = os.path.dirname(path) or "."
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        logger.warning(
+            "could not fsync directory %s after promoting %s (platform may not "
+            "support directory fsync)", directory, path, exc_info=True,
+        )
+
+
 def register_and_promote(
     temp_path: str,
     final_path: str,
@@ -228,27 +253,38 @@ def register_and_promote(
 
     The previous hash's row is deliberately left in place -- a restored backup
     of the untagged original must still dedupe.
+
+    Any failure in this function -- a raising ``compute_file_hash`` (an I/O
+    error reading the multi-gigabyte temp file), a raising ``mark_done``
+    (``sqlite3.OperationalError: database is locked`` is a live failure mode
+    while the running watcher holds its own connection to the same
+    ``seen_files.db``), or a raising ``os.rename`` -- removes the temp file
+    before re-raising. The staging dir is hidden from the watcher, so an
+    orphan left behind here is invisible debris that nothing else will ever
+    reclaim.
     """
     from app.services import file_watcher
 
     db = seen_db if seen_db is not None else file_watcher.open_seen_files_db()
     opened_here = seen_db is None
     try:
-        new_hash = file_watcher.compute_file_hash(temp_path)
-        db.mark_done(new_hash, final_path, file_type)
         try:
+            new_hash = file_watcher.compute_file_hash(temp_path)
+            db.mark_done(new_hash, final_path, file_type)
             os.rename(temp_path, final_path)
         except Exception:
-            # The staging dir is hidden from the watcher, so an orphan here is
-            # invisible debris that nothing else will ever reclaim. The
-            # mark_done row above is deliberately NOT rolled back: it is keyed
-            # on a hash no file now has, so it is inert.
+            # The mark_done row above (if it already landed) is deliberately
+            # NOT rolled back: it is keyed on a hash no file now has, so it
+            # is inert, and a restored backup of the untagged original still
+            # dedupes on its own (different) hash.
             try:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
             except OSError:
                 logger.warning("could not clean up temp file %s", temp_path, exc_info=True)
             raise
+
+        _fsync_dir(final_path)
         logger.info(
             "promoted tagged file %s (hash %s registered first)", final_path, new_hash
         )
