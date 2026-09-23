@@ -96,6 +96,43 @@ def build_tags(mix: Any) -> Dict[str, str]:
     return tags
 
 
+def already_tagged(path: str, tags: Dict[str, str], cover_art_path: Optional[str]) -> bool:
+    """True if ``path`` already carries ``tags`` and its cover-art state
+    already matches ``cover_art_path``. A HEADER READ ONLY -- opening a FLAC
+    for reading never rewrites it, and this function never calls ``.save()``,
+    never copies, never touches the original in any way.
+
+    Every key in ``tags`` must be present on the file with an identical
+    value (a retitled mix has a different TITLE, so it reports False and
+    gets re-tagged -- exactly the case this exists to still catch).
+    Embedded-picture presence must match whether ``cover_art_path`` points
+    at a real file: a mix tagged before cover art existed must not be
+    reported as already-tagged once art becomes available.
+
+    Any failure to open or parse the file (missing, corrupt, not a FLAC)
+    is treated as "not already tagged" -- the safe default, since it falls
+    through to the normal tag-and-verify path rather than silently skipping
+    a file that might need repair.
+    """
+    from mutagen.flac import FLAC
+
+    try:
+        audio = FLAC(path)
+    except Exception:
+        return False
+
+    for key, value in tags.items():
+        if audio.get(key) != [value]:
+            return False
+
+    wants_art = bool(cover_art_path and os.path.isfile(cover_art_path))
+    has_art = bool(audio.pictures)
+    if has_art != wants_art:
+        return False
+
+    return True
+
+
 def temp_dir_for(path: str) -> str:
     """The staging directory for a source file's tagged copy.
 
@@ -411,15 +448,23 @@ async def tag_sources_for_mix(
             }
 
         tags = build_tags(mix)
+        cover_art_path = getattr(mix, "cover_art_path", None)
         exists = os.path.isfile(src)
+        # Evaluated whenever the source exists -- including during a dry
+        # run, for the same reason ``enabled`` is evaluated unconditionally
+        # above: a dry run that skipped this check would report "would tag"
+        # for a file a real run would then skip, overstating the work in
+        # front of a 498 GB operation.
+        skip_already_tagged = already_tagged(src, tags, cover_art_path) if exists else False
         has_space = _has_free_space(src) if exists else False
         actions.append({
             "path": src,
             "tags": tags,
-            "cover_art": getattr(mix, "cover_art_path", None),
+            "cover_art": cover_art_path,
             "source_exists": exists,
             "sufficient_space": has_space,
             "enabled": enabled,
+            "already_tagged": skip_already_tagged,
         })
 
         if dry_run:
@@ -429,6 +474,9 @@ async def tag_sources_for_mix(
             if not exists:
                 return {"status": "dry_run", "actions": actions,
                         "reason": f"source missing: {src} -- would be skipped"}
+            if skip_already_tagged:
+                return {"status": "dry_run", "actions": actions,
+                        "reason": "already tagged -- would be skipped"}
             if not has_space:
                 return {"status": "dry_run", "actions": actions,
                         "reason": f"insufficient free space for {src} -- would be skipped"}
@@ -438,12 +486,15 @@ async def tag_sources_for_mix(
             return {"status": "skipped", "actions": actions,
                     "reason": f"{src} does not exist"}
 
+        if skip_already_tagged:
+            return {"status": "skipped", "actions": actions, "reason": "already tagged"}
+
         if not has_space:
             return {"status": "skipped", "actions": actions,
                     "reason": f"insufficient free space to rewrite {src} safely"}
 
         temp = write_tagged_copy(
-            src, tags, getattr(mix, "cover_art_path", None),
+            src, tags, cover_art_path,
             getattr(mix, "duration_seconds", None),
         )
         register_and_promote(temp, src, "audio")
