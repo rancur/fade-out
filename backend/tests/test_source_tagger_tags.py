@@ -13,8 +13,8 @@ def _mix(**kw):
         video_file_path=None,
         genres=["Trance", "Progressive"],
         tracklist=[
-            {"title": "One", "artist": "A", "timestamp": "00:00"},
-            {"title": "Two", "artist": "B", "timestamp": "05:30"},
+            {"title": "One", "artist": "A", "timestamp_seconds": 0.0, "timestamp_formatted": "0:00"},
+            {"title": "Two", "artist": "B", "timestamp_seconds": 330.0, "timestamp_formatted": "5:30"},
         ],
         cover_art_path="/output/cover-art/m1.jpg",
         soundcloud_url="https://soundcloud.com/thewillsee/lunar-desert-groove-trance-mix",
@@ -47,8 +47,8 @@ def test_genres_are_joined():
 
 def test_tracklist_becomes_a_readable_description():
     desc = build_tags(_mix())["DESCRIPTION"]
-    assert "00:00 A - One" in desc
-    assert "05:30 B - Two" in desc
+    assert "0:00 A - One" in desc
+    assert "5:30 B - Two" in desc
 
 
 def test_url_prefers_soundcloud_then_youtube():
@@ -62,3 +62,32 @@ def test_missing_optional_fields_are_omitted_not_blank():
     assert "DESCRIPTION" not in tags
     assert "URL" not in tags
     assert tags["ARTIST"] == "Will See"
+
+
+def test_empty_genres_are_omitted_not_blank():
+    """Genres list with only empty strings must not emit a GENRE tag."""
+    tags = build_tags(_mix(genres=["", None]))
+    assert "GENRE" not in tags
+
+
+def test_tracklist_fallback_to_timestamp_seconds():
+    """Entry with only timestamp_seconds (no timestamp_formatted) still renders timestamp."""
+    tags = build_tags(_mix(
+        tracklist=[
+            {"title": "Three", "artist": "C", "timestamp_seconds": 125.5},
+        ]
+    ))
+    desc = tags["DESCRIPTION"]
+    # format_timestamp(125.5) -> int(125) = 125 -> 2:05
+    assert "2:05 C - Three" in desc
+
+
+def test_tracklist_no_timestamp_renders_without_leading_space():
+    """Entry with no timestamp data renders artist and title without leading space."""
+    tags = build_tags(_mix(
+        tracklist=[
+            {"title": "Four", "artist": "D"},
+        ]
+    ))
+    desc = tags["DESCRIPTION"]
+    assert desc == "D - Four"
