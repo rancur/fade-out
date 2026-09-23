@@ -165,6 +165,27 @@ def _compute_file_hash(path: str) -> str:
     return md5.hexdigest()
 
 
+def compute_file_hash(path: str) -> str:
+    """Public alias of the dedupe hash.
+
+    ``source_tagger`` must compute the byte-identical value, because writing
+    FLAC tags changes the file head and therefore this hash; the tagger
+    re-registers the new hash so the watcher does not treat a tagged file as a
+    new recording and re-ingest an already-published mix. Keep this and
+    ``_compute_file_hash`` the same function, not merely similar.
+    """
+    return _compute_file_hash(path)
+
+
+def open_seen_files_db(db_path: str = "data/seen_files.db") -> "_SeenFilesDB":
+    """Open the dedupe database the watcher uses.
+
+    Exposed so the tagger can register a tagged file's new hash against the
+    same table the watcher reads.
+    """
+    return _SeenFilesDB(db_path)
+
+
 class _StabilityTracker:
     """Tracks file sizes and detects when a file has stopped growing.
 

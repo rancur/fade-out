@@ -1201,6 +1201,23 @@ class PipelineOrchestrator:
             await session.commit()
 
     async def _mark_complete(self, mix_id: str) -> None:
+        # Write the completed status FIRST, before rename/tag. source_tagger
+        # hard-gates on mix.pipeline_status == "completed" (only published
+        # mixes are tagged); writing it after the rename/tag block meant that
+        # gate always tripped and the tagger silently no-op'd on every real
+        # run. Renaming and tagging are best-effort cosmetic follow-ups to a
+        # run whose real work (verified uploads) is already done, so if the
+        # process dies between this write and the rename/tag calls below, the
+        # database is telling the truth -- the publish genuinely succeeded.
+        async with async_session_factory() as session:
+            mix = await session.get(Mix, mix_id)
+            if mix:
+                mix.pipeline_status = "completed"
+                mix.pipeline_step = "complete"
+                mix.pipeline_error = None
+                mix.pipeline_completed_at = datetime.now(timezone.utc)
+                await session.commit()
+
         # Rename the sources to match the generated title now that every upload
         # has been verified -- the video has passed its completeness gate and no
         # uploader is holding the file open. Off by default; see source_renamer.
@@ -1215,14 +1232,19 @@ class PipelineOrchestrator:
         except Exception:  # pragma: no cover - defensive
             logger.exception("Source rename failed for mix %s", mix_id)
 
-        async with async_session_factory() as session:
-            mix = await session.get(Mix, mix_id)
-            if mix:
-                mix.pipeline_status = "completed"
-                mix.pipeline_step = "complete"
-                mix.pipeline_error = None
-                mix.pipeline_completed_at = datetime.now(timezone.utc)
-                await session.commit()
+        # After renaming, so the tags land on the final path. Best-effort by
+        # the same contract as renaming: this returns a status dict and never
+        # raises, so this try/except is defense in depth only -- it must not
+        # be able to un-complete a run either. Kept in its own try/except
+        # (separate from the renamer's, above) so a tagging failure is never
+        # misattributed as a rename failure in the logs.
+        try:
+            from app.services import source_tagger
+
+            await source_tagger.tag_sources_for_mix(mix_id, reason="pipeline_complete")
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Source tagging failed for mix %s", mix_id)
+
         # Close out the pre-created "complete" row too, so a finished mix has
         # no step left sitting at "pending".
         await self._record_step(mix_id, "complete", StepStatus.COMPLETED)
