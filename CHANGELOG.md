@@ -1,5 +1,80 @@
 # Changelog
 
+## v2.6.1 — 2026-09-23
+
+### Retag backfill: safe to run unattended
+
+v2.6.0 made the retag backfill resumable, paginated and auditable, but a
+whole-branch review found it could still be **silently incomplete** when
+run unattended — never unsafe to the files themselves, but a run that
+looks successful while having done little or nothing is worse for an
+operation nobody is watching. This release closes those gaps.
+
+- **A dry run's cursor can no longer poison a real run.** The persisted
+  resume cursor records the `dry_run` it was written under; `resume=true`
+  against a cursor from the other mode is now treated as no cursor at all
+  (starts from the beginning) instead of being resolved into an offset.
+  Previously, the README's own documented flow — a bare (dry-run) POST over
+  the whole backlog, then a real run — left the real run resuming past a
+  cursor the dry run wrote, so it touched nothing and reported
+  `{"started": true}` with no file ever tagged. The POST response now
+  includes `resume_cursor_ignored` so this is visible when it happens.
+- **The resume cursor now only advances past terminal-success outcomes.**
+  A failed tag write, or a skip for a condition that can resolve itself
+  (missing source, outside the allowed roots, insufficient free space), no
+  longer advances the cursor — the mix is retried on the next
+  `resume=true` instead of being skipped forever. The run still moves on to
+  the next mix immediately either way; not advancing the cursor never
+  stalls it.
+- **The durable audit trail now carries `reason`, not just `status`.**
+  `retag_mix_processed` events include both the rename and tag reason
+  alongside their status, and `retag_run_completed` is now logged at `warn`
+  when any tag skip's reason was not "already tagged" (previously only
+  failures triggered `warn`) — this is what actually distinguishes "every
+  file was already tagged" from "every file was skipped for want of disk",
+  which otherwise both show up identically as `{skipped: N}`. A run that
+  crashes outright now emits a `retag_run_failed` event before the
+  exception propagates, so a crashed run is distinguishable in the durable
+  log from one still in progress.
+- **The orphan-reclaiming sweep can no longer delete an in-flight staging
+  copy.** `write_tagged_copy` stages via `shutil.copy2`, whose `copystat`
+  carries the SOURCE file's mtime onto the staged copy — for these
+  months-old archival recordings, a freshly staged copy reported an age of
+  thousands of hours immediately, so a 6-hour sweeper could delete a copy
+  while it was still being written. `write_tagged_copy` now stamps the
+  staged copy with the current time right after copying, and
+  `sweep_staging` now ages off the more recent of `st_mtime`/`st_ctime`
+  (ctime cannot be backdated by `copystat`) rather than `st_mtime` alone —
+  belt and braces on a delete primitive.
+- **A bare, report-only POST can no longer perform real deletions.** The
+  staging sweep's own `dry_run` was being dropped — passed positionally
+  where the parameter went unused — so it always deleted for real
+  regardless of what the retag call's `dry_run` was. It is now plumbed
+  through properly, and the would-remove set is included in the
+  `retag_staging_swept` activity event under a dry run just as it would be
+  under a real one.
+- **The already-tagged skip now compares cover art by content, not just
+  presence.** A mix whose artwork was regenerated at the same
+  `cover_art_path` — same file, different bytes — previously kept its stale
+  embedded art forever, since "some picture is embedded" and "a cover art
+  file exists" both stayed true. `already_tagged()` now compares the
+  embedded picture's size and a SHA-256 digest against the file on disk.
+- **The orphan sweep now visits nested source directories, not just flat
+  watch roots.** A mix stored in a subdirectory of a watch root (e.g.
+  `<watch_audio>/2023/foo.flac`) stages its own `.fadeout-tagging/` copy
+  alongside itself, not at the watch root — which a sweep of only the flat
+  roots never visited. The sweep's targets are now the union of the flat
+  watch-root directories and `dirname(<candidate's source>)/.fadeout-tagging/`
+  for every mix the run actually selected as a candidate.
+- `GET /retag/status` no longer reports the previous run's numbers while a
+  new run's staging sweep is still in progress — the `running` flag is now
+  set before the sweep starts, not after.
+- Corrected documentation: the bare-POST "without touching anything" claim
+  now genuinely holds for the staging sweep too (previously only for the
+  per-mix dry-run report), the "never removes a file younger than the
+  threshold" claim now genuinely holds under the copy2-mtime scenario
+  above, and the cover-art "matches" claim now means content, not presence.
+
 ## v2.6.0 — 2026-09-23
 
 ### Retag backfill: idempotent, resumable, auditable
