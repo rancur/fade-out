@@ -27,6 +27,8 @@ a full disk, or a corrupt write. In-place tagging gives neither guarantee.
 """
 
 import logging
+import os
+import shutil
 from typing import Any, Dict, List, Optional
 
 from app.services import source_renamer
@@ -90,3 +92,68 @@ def build_tags(mix: Any) -> Dict[str, str]:
         tags["URL"] = url
 
     return tags
+
+
+def temp_dir_for(path: str) -> str:
+    """The staging directory for a source file's tagged copy.
+
+    A dot-subdirectory of the file's own folder: same filesystem, so the final
+    promote is an atomic rename rather than a second multi-gigabyte copy, and
+    invisible to the watcher, which scans with a non-recursive ``os.listdir``.
+    """
+    return os.path.join(os.path.dirname(path), TEMP_DIRNAME)
+
+
+def write_tagged_copy(
+    src: str,
+    tags: Dict[str, str],
+    cover_art_path: Optional[str],
+    expected_duration: Optional[float],
+) -> str:
+    """Copy ``src``, write ``tags`` into the copy, verify it, return its path.
+
+    The original is never opened for writing. On any failure the temp file is
+    removed and the caller is left exactly as it started.
+    """
+    from mutagen.flac import FLAC, Picture
+
+    staging = temp_dir_for(src)
+    os.makedirs(staging, exist_ok=True)
+    temp_path = os.path.join(staging, os.path.basename(src))
+
+    try:
+        shutil.copy2(src, temp_path)
+
+        audio = FLAC(temp_path)
+        for key, value in tags.items():
+            audio[key] = value
+
+        if cover_art_path and os.path.isfile(cover_art_path):
+            picture = Picture()
+            picture.type = 3  # front cover
+            picture.mime = "image/jpeg"
+            picture.desc = "Cover"
+            with open(cover_art_path, "rb") as fh:
+                picture.data = fh.read()
+            audio.clear_pictures()
+            audio.add_picture(picture)
+
+        audio.save(padding=lambda _info: FLAC_PADDING_BYTES)
+
+        # Verify by re-reading. A truncated or corrupt write that still parses
+        # would otherwise be promoted over a good recording.
+        verify = FLAC(temp_path)
+        if expected_duration and verify.info.length:
+            if abs(verify.info.length - float(expected_duration)) > 1.0:
+                raise RuntimeError(
+                    f"tagged copy duration {verify.info.length:.1f}s does not match "
+                    f"the expected {float(expected_duration):.1f}s"
+                )
+        return temp_path
+    except Exception:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            logger.warning("could not clean up temp file %s", temp_path, exc_info=True)
+        raise
