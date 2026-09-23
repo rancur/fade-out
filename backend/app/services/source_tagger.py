@@ -30,6 +30,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from app.services import source_renamer
+from app.services.tracklist_utils import format_timestamp
 
 logger = logging.getLogger("fadeout.source_tagger")
 
@@ -44,13 +45,19 @@ def _format_tracklist(tracklist: Optional[List[Dict[str, Any]]]) -> str:
     for entry in tracklist or []:
         if not isinstance(entry, dict):
             continue
-        ts = (entry.get("timestamp") or "").strip()
         artist = (entry.get("artist") or "").strip()
         title = (entry.get("title") or "").strip()
         if not title:
             continue
+        # Prefer pre-formatted timestamp; fall back to formatting from seconds
+        ts = (entry.get("timestamp_formatted") or "").strip()
+        if not ts:
+            seconds = entry.get("timestamp_seconds")
+            if seconds is not None:
+                ts = format_timestamp(float(seconds or 0))
         label = f"{artist} - {title}" if artist else title
-        lines.append(f"{ts} {label}".strip())
+        line = f"{ts} {label}".strip() if ts else label
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -70,9 +77,9 @@ def build_tags(mix: Any) -> Dict[str, str]:
     if date_token:
         tags["DATE"] = date_token
 
-    genres = getattr(mix, "genres", None)
-    if genres:
-        tags["GENRE"] = "; ".join(str(g) for g in genres if g)
+    genre_value = "; ".join(str(g) for g in (getattr(mix, "genres", None) or []) if g)
+    if genre_value:
+        tags["GENRE"] = genre_value
 
     description = _format_tracklist(getattr(mix, "tracklist", None))
     if description:
