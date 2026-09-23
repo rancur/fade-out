@@ -665,7 +665,9 @@ from app.services import source_tagger
 
 @pytest.mark.asyncio
 async def test_disabled_setting_is_a_clean_no_op(monkeypatch):
-    monkeypatch.setattr(source_tagger, "_tagging_enabled", lambda: False)
+    async def _off():
+        return False
+    monkeypatch.setattr(source_tagger, "_tagging_enabled", _off)
     result = await source_tagger.tag_sources_for_mix("m1", reason="test")
     assert result["status"] == "disabled"
     assert result["actions"] == []
@@ -673,7 +675,9 @@ async def test_disabled_setting_is_a_clean_no_op(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_refuses_a_mix_that_is_not_completed(monkeypatch):
-    monkeypatch.setattr(source_tagger, "_tagging_enabled", lambda: True)
+    async def _on():
+        return True
+    monkeypatch.setattr(source_tagger, "_tagging_enabled", _on)
     monkeypatch.setattr(
         source_tagger, "_load_mix",
         _fake_loader(pipeline_status="running", audio_file_path="/watch/audio/a.flac"),
@@ -685,7 +689,9 @@ async def test_refuses_a_mix_that_is_not_completed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_refuses_a_path_outside_the_allowed_roots(monkeypatch):
-    monkeypatch.setattr(source_tagger, "_tagging_enabled", lambda: True)
+    async def _on():
+        return True
+    monkeypatch.setattr(source_tagger, "_tagging_enabled", _on)
     monkeypatch.setattr(
         source_tagger, "_load_mix",
         _fake_loader(pipeline_status="completed", audio_file_path="/etc/passwd"),
@@ -697,7 +703,9 @@ async def test_refuses_a_path_outside_the_allowed_roots(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_never_raises_when_the_write_explodes(monkeypatch):
-    monkeypatch.setattr(source_tagger, "_tagging_enabled", lambda: True)
+    async def _on():
+        return True
+    monkeypatch.setattr(source_tagger, "_tagging_enabled", _on)
     monkeypatch.setattr(
         source_tagger, "_load_mix",
         _fake_loader(pipeline_status="completed", audio_file_path="/watch/audio/a.flac"),
@@ -716,7 +724,9 @@ async def test_never_raises_when_the_write_explodes(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dry_run_touches_nothing(monkeypatch):
-    monkeypatch.setattr(source_tagger, "_tagging_enabled", lambda: True)
+    async def _on():
+        return True
+    monkeypatch.setattr(source_tagger, "_tagging_enabled", _on)
     monkeypatch.setattr(
         source_tagger, "_load_mix",
         _fake_loader(pipeline_status="completed", audio_file_path="/watch/audio/a.flac"),
@@ -789,10 +799,11 @@ from app.services.source_renamer import is_within_allowed_roots
 MIN_FREE_SPACE_MULTIPLE = 2
 
 
-def _tagging_enabled() -> bool:
-    from app.services.app_config import get_setting
+async def _tagging_enabled() -> bool:
+    """Mirror how source_renamer reads its own flag: app_config.resolve is async."""
+    from app.services import app_config
 
-    return bool(get_setting("tag_source_files"))
+    return bool(await app_config.resolve("tag_source_files"))
 
 
 async def _load_mix(mix_id: str) -> Any:
@@ -825,7 +836,7 @@ async def tag_sources_for_mix(
     """Tag this mix's source audio. Best-effort: never raises, never fails a run."""
     actions: List[Dict[str, Any]] = []
 
-    if not dry_run and not _tagging_enabled():
+    if not dry_run and not await _tagging_enabled():
         return {"status": "disabled", "actions": [], "reason": "tag_source_files is off"}
 
     try:
