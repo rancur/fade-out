@@ -645,18 +645,87 @@ class SoundCloudUploader:
             ],
         )
 
+    # Markup-based login detection is inherently brittle: these class names and
+    # aria labels are SoundCloud's private DOM and change without notice. They
+    # are kept as a fast path, but a miss no longer decides the question on its
+    # own -- see the session probe in _ensure_logged_in.
+    LOGGED_IN_SELECTORS = (
+        '[aria-label="Your profile"]',
+        ".header__userNavButton",
+        "[class*=userNav]",
+        'a[href*="/you/"]',
+        "[class*=profileMenu]",
+    )
+
+    async def _page_diagnostics(self, page: Page, label: str) -> str:
+        """Capture why a browser step failed, instead of only that it did.
+
+        A bare `wait_for_selector: Timeout 10000ms exceeded` says nothing about
+        whether the page was a login form, a consent wall, an error, or blank.
+        On 2026-09-18 that exact message was the only evidence available and it
+        sent the investigation down two wrong paths. Always record the URL and
+        what was actually on screen.
+        """
+        details = []
+        try:
+            details.append(f"url={page.url}")
+        except Exception:
+            pass
+        try:
+            text = await page.evaluate("(document.body.innerText || '').slice(0, 300)")
+            details.append(f"visible_text={text!r}")
+        except Exception:
+            pass
+        try:
+            shot = f"/data/soundcloud-{label}-error.png"
+            await page.screenshot(path=shot)
+            details.append(f"screenshot={shot}")
+        except Exception:
+            pass
+        return " | ".join(details) or "no diagnostics could be captured"
+
     async def _ensure_logged_in(self) -> None:
         """Check if logged in via browser, attempt login if not."""
         page = await self._browser.new_page()
         try:
             await page.goto(SOUNDCLOUD_WEB_BASE, wait_until="domcontentloaded", timeout=30_000)
             await page.wait_for_timeout(2000)
-            logged_in = await page.query_selector('[aria-label="Your profile"]') is not None
+
+            logged_in = False
+            for selector in self.LOGGED_IN_SELECTORS:
+                if await page.query_selector(selector) is not None:
+                    logged_in = True
+                    logger.info("SoundCloud browser session detected via %s", selector)
+                    break
+
             if not logged_in:
-                logged_in = await page.query_selector('.header__userNavButton') is not None
+                # Ask the site, not the DOM. If every selector has been renamed
+                # out from under us this is what stops a live session being
+                # mistaken for a logged-out one and triggering a pointless
+                # login attempt that then trips anti-bot.
+                try:
+                    status = await page.evaluate(
+                        "fetch('/me', {credentials:'include'})"
+                        "  .then(r => r.status).catch(() => 0)"
+                    )
+                    if status and int(status) < 400:
+                        logged_in = True
+                        logger.info(
+                            "SoundCloud browser session confirmed by session probe "
+                            "(HTTP %s) after every selector missed -- the selectors "
+                            "are probably stale.", status,
+                        )
+                except Exception:
+                    logger.debug("SoundCloud session probe failed", exc_info=True)
+
             if logged_in:
                 logger.info("Already logged in to SoundCloud (browser)")
                 return
+
+            logger.info(
+                "No SoundCloud browser session (%s); attempting login",
+                await self._page_diagnostics(page, "session-check"),
+            )
             await self._browser_login(page)
         finally:
             await page.close()
@@ -674,9 +743,20 @@ class SoundCloudUploader:
             await email_btn.click()
             await page.wait_for_timeout(1000)
 
-        email_input = await page.wait_for_selector(
-            'input[type="email"], input[name="email"], input[id="email"]', timeout=10_000,
-        )
+        try:
+            email_input = await page.wait_for_selector(
+                'input[type="email"], input[name="email"], input[id="email"]', timeout=10_000,
+            )
+        except Exception as exc:
+            # The bare timeout is not actionable. Say what was on screen: a
+            # blank page means the authorize/login SPA refused to render (see
+            # the redirect_uri note in routers/auth.py), a visible challenge
+            # means anti-bot, and a form with different markup means the
+            # selectors need updating. These need different responses.
+            raise RuntimeError(
+                f"SoundCloud login form never appeared ({exc.__class__.__name__}). "
+                f"{await self._page_diagnostics(page, 'login')}"
+            ) from exc
         await email_input.fill(self._email)
         await page.wait_for_timeout(500)
 
