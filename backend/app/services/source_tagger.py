@@ -335,7 +335,15 @@ async def tag_sources_for_mix(
     actions: List[Dict[str, Any]] = []
 
     try:
-        if not dry_run and not await _tagging_enabled():
+        # Evaluated unconditionally -- including during a dry run. Both
+        # tag_source_files and rename_source_files default to OFF, so a dry
+        # run that never looked at the flag could report "would tag all N
+        # mixes", green-light a real run, and have every mix come back
+        # "disabled" with nothing done: a full pre-flight report and a real
+        # run that silently does nothing look identical unless the dry run
+        # checks the same flag the real run gates on.
+        enabled = await _tagging_enabled()
+        if not dry_run and not enabled:
             return {"status": "disabled", "actions": [], "reason": "tag_source_files is off"}
 
         mix = await _load_mix(mix_id)
@@ -369,9 +377,13 @@ async def tag_sources_for_mix(
             "cover_art": getattr(mix, "cover_art_path", None),
             "source_exists": exists,
             "sufficient_space": has_space,
+            "enabled": enabled,
         })
 
         if dry_run:
+            if not enabled:
+                return {"status": "dry_run", "actions": actions,
+                        "reason": "tag_source_files is off -- a real run would do nothing"}
             if not exists:
                 return {"status": "dry_run", "actions": actions,
                         "reason": f"source missing: {src} -- would be skipped"}

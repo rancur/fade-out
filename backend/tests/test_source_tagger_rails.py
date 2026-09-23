@@ -93,6 +93,11 @@ async def test_dry_run_touches_nothing(monkeypatch):
         _fake_loader(pipeline_status="completed", audio_file_path="/watch/audio/a.flac"),
     )
     monkeypatch.setattr(source_tagger, "is_within_allowed_roots", lambda p: True)
+    # Without this, "/watch/audio/a.flac" doesn't exist on the test machine
+    # and this test silently exercises the missing-source branch instead of
+    # the one its name claims (duplicating test_dry_run_touches_nothing's
+    # sibling, test_dry_run_reports_a_missing_source_instead_of_a_false_green).
+    monkeypatch.setattr(source_tagger.os.path, "isfile", lambda p: True)
 
     def boom(*a, **k):
         raise AssertionError("dry run must not write")
@@ -101,6 +106,35 @@ async def test_dry_run_touches_nothing(monkeypatch):
     result = await source_tagger.tag_sources_for_mix("m1", reason="test", dry_run=True)
     assert result["status"] == "dry_run"
     assert result["actions"], "a dry run should still report what it would do"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_reports_disabled_setting_plainly(monkeypatch):
+    """Regression test for the false-green hole: a dry run must evaluate
+    tag_source_files too, not just the real run. Both tag_source_files and
+    rename_source_files default to OFF, so a dry run that never checked the
+    flag could report "would tag" and then have the real run silently do
+    nothing -- indistinguishable from success at the status endpoint."""
+    async def _off():
+        return False
+    monkeypatch.setattr(source_tagger, "_tagging_enabled", _off)
+    monkeypatch.setattr(
+        source_tagger, "_load_mix",
+        _fake_loader(pipeline_status="completed", audio_file_path="/watch/audio/a.flac"),
+    )
+    monkeypatch.setattr(source_tagger, "is_within_allowed_roots", lambda p: True)
+    monkeypatch.setattr(source_tagger.os.path, "isfile", lambda p: True)
+    monkeypatch.setattr(source_tagger, "_has_free_space", lambda p: True)
+
+    def boom(*a, **k):
+        raise AssertionError("dry run must not write")
+
+    monkeypatch.setattr(source_tagger, "write_tagged_copy", boom)
+    result = await source_tagger.tag_sources_for_mix("m1", reason="test", dry_run=True)
+    assert result["status"] == "dry_run"
+    assert result["actions"][0]["enabled"] is False
+    assert "off" in result["reason"]
+    assert "nothing" in result["reason"]
 
 
 @pytest.mark.asyncio

@@ -293,3 +293,56 @@ class TestOnlyCompletedMixesAreCandidates:
         assert body["total"] == 1
         assert [r["mix_id"] for r in body["results"]] == ["retag-completed"]
         assert seen_mix_ids == ["retag-completed"]
+
+
+class TestRetagSummary:
+    async def test_summary_counts_match_per_mix_results(self, prepared_db, monkeypatch):
+        """_run_retag must aggregate a summary of every rename AND tag
+        outcome so GET /api/catalog/retag/status cannot show a run that did
+        nothing (e.g. every mix coming back "disabled" because the setting
+        is off) as if it had succeeded -- processed == total alone can't
+        tell the two apart."""
+        import app.services.source_renamer as renamer_mod
+        import app.services.source_tagger as tagger_mod
+
+        await _make_mix(id="retag-ok", pipeline_status="completed")
+        await _make_mix(id="retag-disabled", pipeline_status="completed")
+        await _make_mix(id="retag-failed", pipeline_status="completed")
+
+        rename_outcomes = {
+            "retag-ok": {"status": "ok", "renamed": [], "skipped": []},
+            "retag-disabled": {"status": "disabled", "renamed": [], "skipped": []},
+            "retag-failed": {"status": "failed", "renamed": [], "skipped": []},
+        }
+        tag_outcomes = {
+            "retag-ok": {"status": "ok", "actions": [], "reason": "ok"},
+            "retag-disabled": {"status": "disabled", "actions": [], "reason": "off"},
+            "retag-failed": {"status": "skipped", "actions": [], "reason": "no space"},
+        }
+
+        async def fake_rename(mix_id, *, reason, dry_run=False):
+            return rename_outcomes[mix_id]
+
+        async def fake_tag(mix_id, *, reason, dry_run=False):
+            return tag_outcomes[mix_id]
+
+        monkeypatch.setattr(renamer_mod, "rename_sources_for_mix", fake_rename)
+        monkeypatch.setattr(tagger_mod, "tag_sources_for_mix", fake_tag)
+
+        await catalog._run_retag(dry_run=False, limit=None)
+
+        state = catalog._retag_state
+        assert state["total"] == 3
+        assert len(state["results"]) == 3
+
+        # The summary must be derivable from -- and match -- the per-mix
+        # results it was built alongside, not just plausible-looking counts.
+        expected = {"ok": 0, "skipped": 0, "disabled": 0, "failed": 0, "dry_run": 0}
+        for r in state["results"]:
+            expected[r["rename"]["status"]] += 1
+            expected[r["tag"]["status"]] += 1
+
+        assert state["summary"] == expected
+        assert state["summary"] == {
+            "ok": 2, "skipped": 1, "disabled": 2, "failed": 1, "dry_run": 0,
+        }
