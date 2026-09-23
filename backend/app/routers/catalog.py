@@ -35,6 +35,16 @@ _improve_task: Optional[asyncio.Task] = None
 _backfill_task: Optional[asyncio.Task] = None
 _regen_thumbs_task: Optional[asyncio.Task] = None
 _playlists_task: Optional[asyncio.Task] = None
+_retag_task: Optional[asyncio.Task] = None
+
+# Live progress for the retag backfill, polled by GET /retag/status. Reset at
+# the start of each run by ``_run_retag``.
+_retag_state: Dict[str, Any] = {
+    "running": False,
+    "processed": 0,
+    "total": 0,
+    "results": [],
+}
 
 
 def _spawn(name: str, coro) -> asyncio.Task:
@@ -767,3 +777,95 @@ async def trigger_improve(body: ImproveBody):
         raise HTTPException(status_code=422, detail="mix_ids must be a list or 'all_generic'")
     _improve_task = _spawn("improve", run_improve(mix_ids))
     return {"status": "started"}
+
+
+# --- Source file retag backfill ---
+#
+# Retroactively applies the same rename-then-tag treatment the pipeline now
+# runs automatically at completion to the back-catalog of already-published
+# mixes. The real run rewrites roughly 498 GB of irreplaceable multi-gigabyte
+# FLAC recordings in place, so ``dry_run`` defaults to True -- a bare POST
+# must be the safe, report-only form, never the destructive one.
+
+
+async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
+    """Rename then tag source files for each completed-pipeline mix.
+
+    ``source_renamer.rename_sources_for_mix`` / ``source_tagger.tag_sources_for_mix``
+    are both best-effort by contract (never raise), so one mix's failure never
+    aborts the run. Rename is called before tag for each mix, matching the
+    order the pipeline itself uses at completion. Progress is published to the
+    module-level ``_retag_state`` dict polled by ``GET /retag/status``.
+    """
+    from app.database import async_session_factory
+    from app.models import Mix
+    from app.services import source_renamer, source_tagger
+
+    try:
+        async with async_session_factory() as session:
+            stmt = select(Mix.id).where(Mix.pipeline_status == "completed")
+            if limit:
+                stmt = stmt.limit(limit)
+            mix_ids = [row[0] for row in (await session.execute(stmt)).all()]
+
+        _retag_state["running"] = True
+        _retag_state["processed"] = 0
+        _retag_state["total"] = len(mix_ids)
+        _retag_state["results"] = []
+
+        for mix_id in mix_ids:
+            rename = await source_renamer.rename_sources_for_mix(
+                mix_id, reason="retag_backfill", dry_run=dry_run
+            )
+            tag = await source_tagger.tag_sources_for_mix(
+                mix_id, reason="retag_backfill", dry_run=dry_run
+            )
+            _retag_state["results"].append(
+                {"mix_id": mix_id, "rename": rename, "tag": tag}
+            )
+            _retag_state["processed"] += 1
+    finally:
+        _retag_state["running"] = False
+
+
+@router.post("/retag", status_code=202)
+async def catalog_retag(
+    dry_run: bool = Query(default=True),
+    limit: Optional[int] = Query(default=None),
+):
+    """Rename and tag the source files of already-published (completed) mixes.
+
+    Defaults to ``dry_run=True``: a bare, un-parameterised POST is the safe,
+    report-only form. The real run rewrites multi-gigabyte FLACs across
+    roughly 498 GB of irreplaceable recordings, so the destructive form
+    (``dry_run=false``) is opt-in only, never the default. Only mixes with
+    ``pipeline_status == "completed"`` are candidates; rename runs before tag
+    for each one. Single-flight: a run already in progress returns 409
+    instead of starting a second concurrent pass.
+    """
+    global _retag_task
+    from app.database import async_session_factory
+    from app.models import Mix
+
+    if _retag_task and not _retag_task.done():
+        raise HTTPException(
+            status_code=409, detail="A retag run is already in progress."
+        )
+
+    async with async_session_factory() as session:
+        candidates = (
+            await session.execute(
+                select(sa_func.count())
+                .select_from(Mix)
+                .where(Mix.pipeline_status == "completed")
+            )
+        ).scalar_one()
+
+    _retag_task = _spawn("retag", _run_retag(dry_run, limit))
+    return {"started": True, "dry_run": dry_run, "candidates": int(candidates)}
+
+
+@router.get("/retag/status")
+async def catalog_retag_status():
+    """Whether a retag run is in progress + its live processed/total/results."""
+    return dict(_retag_state)
