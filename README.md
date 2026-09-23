@@ -314,24 +314,29 @@ logged, never fatal to the pipeline run — when free space on the volume is
 under 2x the file's size, since the out-of-place copy needs room to exist
 alongside the original while it is written.
 
-`.fadeout-tagging/` is operator-visible, not a temp directory the OS
-reclaims on its own. Every failure path removes its own staged file, but it
-is not swept on a schedule or on startup — a run that fails between writing
-the copy and any cleanup running (a killed process, an OS-level crash) can
-leave a multi-gigabyte orphan behind. Check it after any run that didn't
-finish cleanly.
+`.fadeout-tagging/` staging copies from a write that never finished (a killed
+process, an OS-level crash between writing the copy and promoting it) are no
+longer left for an operator to find by hand: every retag backfill run sweeps
+each watch root's `.fadeout-tagging/` directory before it starts, removing
+anything older than the sweep's age threshold. See "Orphaned staging
+cleanup" below for the guardrails and the default threshold. Tagging
+triggered by ordinary pipeline completion (a single mix finishing, not the
+backfill) does not run that sweep, so an orphan from a single-mix failure
+outside a backfill run still needs manual cleanup.
 
-**Re-tagging is not idempotent, but it is safe.** There's no "already
-tagged, skip it" check — a mix that already has all its tags written gets
-the exact same full out-of-place rewrite on every run that touches it, and
-that rewrite succeeds: once a file already carries the 64 KB padding block
-this module adds, mutagen writes new metadata *into* that padding, so a
-healthy re-tag's total file size doesn't change at all. The truncation guard
-accounts for this — it compares the audio payload (everything past the last
-metadata block), not total file size, so a byte-identical-size re-tag is not
-mistaken for a truncated write. Running the backfill twice over the same
-mixes redoes the full multi-gigabyte rewrite twice, not zero — that's wasted
-I/O and time on an irreplaceable file, not a failure.
+**Re-tagging skips files that already carry the target tags.** Before
+writing anything, `already_tagged()` reads the FLAC's existing Vorbis
+comments — a header read only, it never opens the file for writing or
+copies it — and compares every target tag's value plus whether embedded
+cover art matches what the mix now has. Only when everything already
+matches does the mix come back `{"status": "skipped", "reason": "already
+tagged"}` without touching the file at all; a retitled mix has a different
+`TITLE`, so it is still re-tagged, same as any other real change. A dry run
+over an already-tagged library reports `"already tagged -- would be
+skipped"` for the same mixes rather than overstating the work a real run
+would do. This is what makes the retag backfill (below) cheap to re-run
+after an interruption instead of redoing a full multi-gigabyte rewrite of
+every file it already touched.
 
 To backfill renames and tags across already-published mixes:
 
@@ -369,17 +374,51 @@ curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false"
 curl "$FADEOUT/api/catalog/retag/status"
 ```
 
-Pass `limit=<n>` to cap how many completed mixes a single run touches — e.g.
-`curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&limit=5"`. This caps
-a *single* run; it does not paginate. `_run_retag`'s selection query has no
-`ORDER BY` and applies no offset, so calling it again with the same `limit`
-is not guaranteed to reach a different batch of mixes rather than
-re-selecting the same ones. Don't rely on repeated limited calls to sweep the
-full backlog in "supervised batches" — use `limit` to bound the size of one
-run (e.g. a smoke test before committing to all ~80 mixes / ~498 GB), and run
-without it (or with a limit covering everything) once you're ready to cover
-the full completed-mix backlog in a single pass.
-The `candidates` count returned by the POST already reflects `limit`.
+**The backfill is resumable and genuinely paginated.** `limit` and `offset`
+select a deterministically ordered slice of completed mixes (`ORDER BY
+created_at, id`, applied identically to the pre-flight `candidates` count
+and to the run itself), so `offset=0&limit=20` followed by
+`offset=20&limit=20` touches two disjoint batches rather than risking the
+same rows twice. After every mix, a resume cursor is written to
+`AppSettings.settings_json["retag_progress"]`; passing `resume=true` (which
+ignores any `offset` you also pass) continues from that cursor instead of
+restarting from the beginning, and with no saved cursor it just starts at
+the beginning like a fresh run. Combined with the already-tagged skip
+above, an interrupted run can simply be re-issued — as a fresh call
+(previously-touched files are skipped cheaply) or with `resume=true` to
+pick up exactly where the cursor left off — rather than watched through
+hand-sized batches:
+
+```bash
+curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&limit=20"
+curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&resume=true&limit=20"
+```
+
+The `candidates` count returned by the POST reflects `limit`/`offset` (or
+the resolved resume cursor when `resume=true`) — it's the number of mixes
+this call is actually about to touch, not the size of the whole backlog.
+
+**Orphaned staging cleanup.** Before selecting any candidates, every retag
+run sweeps each watch root's `.fadeout-tagging/` directory
+(`source_tagger.sweep_staging`, `older_than_hours=6.0` by default) and
+removes anything older than that threshold; a file younger than the
+threshold is left alone because it may belong to a run currently in
+flight. The sweep only ever acts on a directory whose basename is exactly
+`.fadeout-tagging` and that lives inside an allowed watch root — anything
+else is refused outright rather than swept. What it reclaimed is logged as
+a `retag_staging_swept` activity event before the run's candidates are
+even selected.
+
+**Every backfill run is auditable after the fact**, independent of the
+in-memory `GET /retag/status` state a process restart wipes. Durable events
+go through the activity log: `retag_staging_swept` before the run starts,
+one `retag_run_started` with the run's parameters and candidate count, one
+`retag_mix_processed` per mix carrying both the rename and tag outcome
+(logged at `error` when either failed, `info` otherwise), and a closing
+`retag_run_completed` with the run's summary (logged at `warn` when the
+summary contains any failures, `info` otherwise). Activity-log emits are
+best-effort and layered on top — a logging failure can never abort or slow
+the backfill itself.
 
 `GET /retag/status` includes a `summary` — `{ok, skipped, disabled, failed,
 dry_run, unknown}` counts across every rename *and* tag outcome of the run.
