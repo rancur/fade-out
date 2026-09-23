@@ -401,6 +401,21 @@ SETTINGS_SCHEMA: Tuple[SettingDef, ...] = (
         type="bool", category="Advanced", env_attr="RENAME_SOURCE_FILES",
     ),
     SettingDef(
+        key="tag_source_files",
+        label="Write metadata into source files",
+        help="After a run completes, write artist/title/date/genre/tracklist "
+             "and the cover art into the source FLAC so the recording is "
+             "identifiable in Plex or any local player. The file is rewritten "
+             "out-of-place and swapped in atomically, and its new dedupe hash "
+             "is registered BEFORE the swap, so tagging can never cause the "
+             "watcher to re-ingest and re-upload an already-published mix. "
+             "The first write rewrites the whole file (these FLACs carry no "
+             "padding); 64 KB of padding is added so later edits do not. "
+             "Requires the audio watch folder mounted read-WRITE. OFF by "
+             "default.",
+        type="bool", category="Advanced", env_attr="TAG_SOURCE_FILES",
+    ),
+    SettingDef(
         key="backfill_auto_resume",
         label="Backfill auto-resume",
         help="Restart an interrupted catalog tracklist backfill shortly after "
