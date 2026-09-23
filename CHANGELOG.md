@@ -1,5 +1,47 @@
 # Changelog
 
+## v2.5.0 — 2026-09-22
+
+### Source file tagging
+- New opt-in **Write metadata into source files** setting (`tag_source_files`,
+  Settings → Advanced, OFF by default): when a run completes, the source FLAC
+  gets `ARTIST` ("Will See"), `TITLE`, `DATE`, `GENRE`, `ALBUM` ("Will See
+  Mixes"), `DESCRIPTION` (the tracklist), `URL` (SoundCloud or YouTube), and
+  the generated cover art embedded as a picture block — so the recording is
+  identifiable in Plex or any local player. `rename_source_files` is
+  unchanged and stays a separate setting; renaming was already shipped
+  before this work.
+- The file watcher dedupes on `md5(first 10 MB)`, and FLAC metadata blocks
+  live at the start of the file, so tagging changes a file's dedupe hash. The
+  write is therefore done out-of-place: the file is copied into a hidden
+  `.fadeout-tagging/` staging directory inside the watch folder, tagged
+  there, re-read to confirm it still parses as FLAC (and that its duration
+  matches, when one is known), and only THEN is its new hash registered with
+  the file watcher — before the tagged copy is moved into place with an
+  atomic rename. Registering before promoting is the safety property: the
+  file is never visible to the watcher while its hash is unknown, so a
+  tagged file can never be re-ingested and re-uploaded. Do not reorder this.
+- These FLACs carry no padding (audio frames measured to begin at byte 86),
+  so the first tag write on a file is always a full rewrite; 64 KB of
+  padding is added so later edits happen in place.
+- Refuses to rewrite a file when free space on its volume is under 2x the
+  file's size, rather than risking a truncated multi-gigabyte recording.
+- Tagging can never fail a pipeline run — every failure returns a status
+  rather than raising, matching `source_renamer`'s contract.
+
+### Retag backfill
+- `POST /api/catalog/retag` backfills renames and tags across already-
+  published (completed) mixes, running rename before tag for each one, same
+  as the pipeline does at completion. `dry_run` defaults to **true** — a bare
+  POST is the safe, report-only form; pass `dry_run=false` to actually
+  rewrite files. The dry run reports, per mix, whether the source file exists
+  and whether there is sufficient free space, so it is a genuine pre-flight
+  check rather than a guess.
+- `GET /api/catalog/retag/status` reports live progress (`running`,
+  `processed`, `total`, `results`). A second run started while one is
+  already in progress gets **409** instead of starting a concurrent pass over
+  the same files.
+
 ## v2.4.1 — 2026-08-22
 
 ### An interrupted mix is resumed, not quietly buried

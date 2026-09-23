@@ -255,6 +255,74 @@ curl -X POST "$FADEOUT/api/catalog/mixes/<mix_id>/rename-source?dry_run=true"
 `dry_run=true` reports the plan without touching anything, and works even while
 the setting is off.
 
+### Source File Tagging
+
+Turning on **Write metadata into source files** (Settings → Advanced,
+`tag_source_files`, OFF by default) writes library metadata directly into a
+completed mix's source FLAC, so the recording is identifiable in Plex or any
+local player — not just on SoundCloud/YouTube. It writes:
+
+| Tag | Value |
+|---|---|
+| `ARTIST` | `Will See` |
+| `TITLE` | the mix title |
+| `DATE` | the same `YYYY-MM-DD` token used for renaming (see above) |
+| `GENRE` | the mix's genres, `; `-separated |
+| `ALBUM` | `Will See Mixes` |
+| `DESCRIPTION` | the tracklist |
+| `URL` | the SoundCloud or YouTube URL |
+| cover picture block | the generated cover art |
+
+This is a separate setting from **Rename source files to match titles**
+(`rename_source_files`, above) and does not change it — renaming moves/renames
+the file, tagging rewrites its metadata, and either can be on, off, or both.
+
+**Why this can't just be a mutagen call in place.** The file watcher dedupes
+on `md5(first 10 MB)`, and FLAC metadata blocks live at the very start of the
+file, so writing tags changes a file's dedupe hash. If a freshly tagged file
+appeared in the watch folder before the watcher knew its new hash, it would be
+re-ingested as a new recording and the mix re-uploaded a second time. Tagging
+is therefore done out-of-place and promoted in a fixed order:
+
+1. copy the source into a hidden `.fadeout-tagging/` folder inside the watch
+   directory (same filesystem, and invisible to the watcher's non-recursive
+   directory listing),
+2. write the tags and cover art into the copy,
+3. re-read the copy to confirm it still parses as valid FLAC — and, when a
+   duration is known for the mix, that it still matches,
+4. register the copy's new hash with the file watcher,
+5. only then move it into place with an atomic rename.
+
+**Registering the hash before promoting the file is the safety property, not
+an implementation detail — do not reorder steps 4 and 5.** A tagged file
+registered too late is a tagged file the watcher can pick up as new.
+
+These FLACs carry no padding (audio frames measured to begin at byte 86), so
+the first tag write on a given file is always a full rewrite; 64 KB of padding
+is added on write so later edits can happen in place. The rewrite is skipped —
+logged, never fatal to the pipeline run — when free space on the volume is
+under 2x the file's size, since the out-of-place copy needs room to exist
+alongside the original while it is written.
+
+To backfill renames and tags across already-published mixes:
+
+```bash
+curl -X POST "$FADEOUT/api/catalog/retag"
+```
+
+`dry_run` **defaults to true**, so a bare POST is the safe, report-only form —
+per mix, it reports whether the source file exists and whether there is
+sufficient free space, without touching anything. Pass `dry_run=false` to
+actually rewrite files, and poll progress while it runs:
+
+```bash
+curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false"
+curl "$FADEOUT/api/catalog/retag/status"
+```
+
+A retag run started while one is already in progress gets `409` rather than
+starting a second concurrent pass over the same files.
+
 ### Output Directories
 
 | Path | Purpose |
