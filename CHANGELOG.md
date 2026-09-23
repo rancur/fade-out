@@ -1,5 +1,50 @@
 # Changelog
 
+## v2.6.0 — 2026-09-23
+
+### Retag backfill: idempotent, resumable, auditable
+
+v2.5.0 shipped the retag backfill over roughly 80 irreplaceable multi-
+gigabyte FLAC recordings (~498 GB) with known gaps: a re-run redid the full
+rewrite even on files already tagged, `limit` capped a single call but did
+not paginate (no `ORDER BY`, no offset, so a second capped call could
+re-select the same rows), nothing durable survived a process restart, and
+orphaned staging copies from an interrupted run were never reclaimed. This
+release closes all four.
+
+- **Re-tagging skips files that already carry the target tags.**
+  `source_tagger.already_tagged()` reads a FLAC's existing Vorbis comments
+  (a header read only — never a write, never a copy) and compares every
+  target tag value plus embedded cover art presence; only when everything
+  matches does the mix come back `{"status": "skipped", "reason": "already
+  tagged"}` untouched. A retitled mix has a different `TITLE`, so it is
+  still re-tagged. Dry runs report `"already tagged -- would be skipped"`
+  for the same mixes instead of overstating the work.
+- **`POST /api/catalog/retag` gained `offset` and `resume`.** Candidate
+  selection is now ordered deterministically (`Mix.created_at`, `Mix.id`),
+  identically in the pre-flight `candidates` count and in the run itself, so
+  `limit`+`offset` select genuinely disjoint batches. After every mix, a
+  cursor is persisted to `AppSettings.settings_json["retag_progress"]`;
+  `resume=true` continues from that cursor (ignoring any `offset` passed
+  alongside it) instead of restarting, and falls back to the beginning when
+  no cursor is saved.
+- **Durable per-mix outcomes in the activity log.** Each run emits one
+  `retag_run_started` (parameters + candidate count), one
+  `retag_mix_processed` per mix (both the rename and tag outcome, at
+  `error` level when either failed), and a closing `retag_run_completed`
+  with the summary, logged at `warn` when the summary contains any
+  failures. All emits are best-effort and can never abort a run.
+- **Orphaned staging copies are reclaimed automatically.** Every backfill
+  run now opens by sweeping each watch root's `.fadeout-tagging/` directory
+  (`source_tagger.sweep_staging`, `older_than_hours=6.0` by default) and
+  reports the result as a `retag_staging_swept` activity event. The sweep
+  refuses to touch anything whose basename isn't `.fadeout-tagging` or that
+  falls outside the allowed watch roots, and never removes a file younger
+  than the age threshold, since it may belong to a run still in flight.
+- Documentation updated to match: the README no longer tells operators to
+  run the backfill "under supervision" in hand-sized batches — that
+  instruction existed only because of the four gaps above.
+
 ## v2.5.0 — 2026-09-22
 
 ### Source file tagging
