@@ -37,13 +37,25 @@ _regen_thumbs_task: Optional[asyncio.Task] = None
 _playlists_task: Optional[asyncio.Task] = None
 _retag_task: Optional[asyncio.Task] = None
 
+_RETAG_SUMMARY_STATUSES = ("ok", "skipped", "disabled", "failed", "dry_run")
+
+
+def _empty_retag_summary() -> Dict[str, int]:
+    return {status: 0 for status in _RETAG_SUMMARY_STATUSES}
+
+
 # Live progress for the retag backfill, polled by GET /retag/status. Reset at
-# the start of each run by ``_run_retag``.
+# the start of each run by ``_run_retag``. ``summary`` tallies every rename
+# AND tag outcome across the run (two entries per mix), so a run in which
+# every mix came back "disabled" (the setting is off) cannot be mistaken for
+# one that actually did the work -- ``processed == total`` alone can't tell
+# the two apart.
 _retag_state: Dict[str, Any] = {
     "running": False,
     "processed": 0,
     "total": 0,
     "results": [],
+    "summary": _empty_retag_summary(),
 }
 
 
@@ -812,6 +824,8 @@ async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
         _retag_state["processed"] = 0
         _retag_state["total"] = len(mix_ids)
         _retag_state["results"] = []
+        summary = _empty_retag_summary()
+        _retag_state["summary"] = summary
 
         for mix_id in mix_ids:
             rename = await source_renamer.rename_sources_for_mix(
@@ -823,6 +837,10 @@ async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
             _retag_state["results"].append(
                 {"mix_id": mix_id, "rename": rename, "tag": tag}
             )
+            for outcome in (rename, tag):
+                status = outcome.get("status")
+                if status in summary:
+                    summary[status] += 1
             _retag_state["processed"] += 1
     finally:
         _retag_state["running"] = False
@@ -848,13 +866,14 @@ async def catalog_retag(
     from app.models import Mix
 
     async with async_session_factory() as session:
-        candidates = (
-            await session.execute(
-                select(sa_func.count())
-                .select_from(Mix)
-                .where(Mix.pipeline_status == "completed")
-            )
-        ).scalar_one()
+        # Mirrors the id-selection in ``_run_retag`` exactly (including the
+        # same ``limit``), so this pre-flight number is the actual count of
+        # mixes the run is about to touch -- a plain COUNT(*) with no limit
+        # applied would over-report whenever ``limit`` is passed.
+        candidate_stmt = select(Mix.id).where(Mix.pipeline_status == "completed")
+        if limit:
+            candidate_stmt = candidate_stmt.limit(limit)
+        candidates = len((await session.execute(candidate_stmt)).all())
 
     # No await between this check and the assignment below: asyncio is
     # single-threaded, so an uninterrupted block is atomic. A yield here
