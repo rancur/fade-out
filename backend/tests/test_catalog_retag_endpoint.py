@@ -25,7 +25,12 @@ import types
 if "shazamio" not in sys.modules:
     try:
         import shazamio  # noqa: F401
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as exc:
+        # Only stub if shazamio ITSELF is missing. If shazamio is installed
+        # but one of its own transitive deps is missing, that's a real
+        # environment problem -- don't swallow it under this stub.
+        if exc.name != "shazamio":
+            raise
         _fake_shazamio = types.ModuleType("shazamio")
 
         class _FakeShazam:  # pragma: no cover - never exercised by these tests
@@ -36,6 +41,29 @@ if "shazamio" not in sys.modules:
         sys.modules["shazamio"] = _fake_shazamio
 
 from app.routers import catalog
+
+
+async def _drain_pending_tasks(timeout: float = 5.0) -> None:
+    """Wait for every OTHER pending asyncio task to finish.
+
+    Used to settle background retag run(s) before asserting on their side
+    effects. Unlike awaiting a single known task handle, this also catches
+    an extra, un-referenced task -- which is exactly what a broken
+    single-flight guard produces when two concurrent requests both spawn a
+    run and the second assignment overwrites ``catalog._retag_task``,
+    orphaning the first task's reference (it keeps running regardless; this
+    still waits for it).
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    current = asyncio.current_task()
+    while True:
+        pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+        if not pending:
+            return
+        if loop.time() > deadline:
+            raise TimeoutError(f"tasks still pending after {timeout}s: {pending}")
+        await asyncio.sleep(0)
 
 
 async def _make_mix(**kwargs):
@@ -121,10 +149,14 @@ class TestDryRunPerformsNoWrites:
 
 
 class TestSingleFlight:
-    async def test_concurrent_run_returns_409(self, client, monkeypatch):
-        """A second run started while one is still in progress must be
-        rejected with 409, not queued or silently coalesced -- two concurrent
-        passes over the same FLACs is exactly the hazard this guards."""
+    async def test_second_run_while_one_is_running_returns_409(self, client, monkeypatch):
+        """Steady-state branch: a second run started well AFTER the first is
+        already known to be in progress must be rejected with 409, not
+        queued or silently coalesced. The two POSTs here are sequential
+        (the first fully resolves before the second is sent), so this only
+        exercises the "already running" check once ``_retag_task`` is set --
+        it can NOT catch a race in the check-then-set window itself. See
+        ``test_truly_concurrent_requests_only_one_wins`` for that."""
         import app.services.source_renamer as renamer_mod
 
         await _make_mix(id="retag-mix-slow")
@@ -158,6 +190,68 @@ class TestSingleFlight:
         # later test -- polling on the "running" flag is racy (it can read
         # the module default before the task has even started).
         await asyncio.wait_for(catalog._retag_task, timeout=5)
+
+    async def test_truly_concurrent_requests_only_one_wins(self, client, monkeypatch):
+        """Genuine race: fire two POSTs concurrently via ``asyncio.gather``
+        so they interleave on the shared event loop, exercising the actual
+        check-then-set window between the single-flight guard and the
+        ``_retag_task`` assignment (the bug this guards against: an ``await``
+        between the check and the assignment lets both requests pass the
+        guard before either sets the task). Exactly one request must win
+        (202) and the other must be rejected (409), and exactly one
+        background run may actually touch the seeded mix.
+
+        The renamer is held open on an ``asyncio.Event`` for the duration of
+        the gather. This matters: without it, the first (winning) run can
+        finish so fast (nothing here does real I/O) that it's genuinely
+        ``done()`` before the second request even reaches the guard -- which
+        would make a *second, legitimate* run start and produce two 202s for
+        a reason that has nothing to do with the check-then-set race. Holding
+        the run open keeps it definitively in-progress for the whole window,
+        so a second 202 can only mean the guard let two runs overlap.
+        """
+        import app.services.source_renamer as renamer_mod
+        import app.services.source_tagger as tagger_mod
+
+        await _make_mix(id="retag-mix-concurrent")
+
+        rename_calls = []
+        hold = asyncio.Event()
+
+        async def fake_rename(mix_id, *, reason, dry_run=False):
+            rename_calls.append(mix_id)
+            await hold.wait()
+            return {"status": "dry_run", "renamed": [], "skipped": []}
+
+        async def fake_tag(mix_id, *, reason, dry_run=False):
+            return {"status": "dry_run", "actions": [], "reason": reason}
+
+        monkeypatch.setattr(renamer_mod, "rename_sources_for_mix", fake_rename)
+        monkeypatch.setattr(tagger_mod, "tag_sources_for_mix", fake_tag)
+
+        try:
+            first, second = await asyncio.gather(
+                client.post("/api/catalog/retag"),
+                client.post("/api/catalog/retag"),
+            )
+
+            statuses = sorted([first.status_code, second.status_code])
+            assert statuses == [202, 409], (
+                f"expected exactly one 202 and one 409, got {statuses}"
+            )
+        finally:
+            hold.set()
+
+        # Settle any/all background run(s) -- including an orphaned extra
+        # one a broken guard would have spawned -- before checking side
+        # effects.
+        await _drain_pending_tasks()
+
+        assert rename_calls == ["retag-mix-concurrent"], (
+            "exactly one background run should have processed the mix; "
+            f"got {rename_calls} (more than one entry means the "
+            "single-flight guard let two concurrent runs through)"
+        )
 
 
 class TestOnlyCompletedMixesAreCandidates:
