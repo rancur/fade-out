@@ -862,12 +862,16 @@ def _rename_outcome_reason(outcome: Dict[str, Any]) -> Optional[str]:
 
 # Tag outcomes that are safe to advance the retag resume cursor past --
 # retrying any of these on a future ``resume=true`` would do no useful work.
-_TERMINAL_TAG_STATUSES = ("ok", "disabled")
+# NOTE: "disabled" is deliberately NOT in this tuple for real runs -- see
+# the docstring below.
+_TERMINAL_TAG_STATUSES = ("ok",)
 
 
-def _tag_outcome_is_terminal_success(tag: Dict[str, Any], dry_run: bool) -> bool:
-    """Whether ``tag_sources_for_mix``'s outcome is safe to advance the
-    persisted resume cursor past.
+def _mix_outcome_is_terminal_success(
+    rename: Dict[str, Any], tag: Dict[str, Any], dry_run: bool
+) -> bool:
+    """Whether this mix's outcome -- BOTH the rename leg and the tag leg --
+    is safe to advance the persisted resume cursor past.
 
     A dry run never writes anything, so this always returns True for one --
     there is no "unrecoverable, must be retried" outcome to protect, only a
@@ -877,36 +881,62 @@ def _tag_outcome_is_terminal_success(tag: Dict[str, Any], dry_run: bool) -> bool
     "already handled" for files that were actually (or deliberately not)
     touched.
 
-    For a real run, terminal-success is: the tag was actually written
-    (``"ok"``), the setting is off so there was genuinely nothing to do
-    (``"disabled"``), or the file already carried every target tag and
-    matching cover art (``"skipped"`` with reason ``"already tagged"``).
+    **Rename leg.** Rename runs before tag for every mix and is part of the
+    job, not a side effect of it -- a mix whose rename failed (``errors``
+    non-empty) but whose tag happened to succeed has NOT been fully handled,
+    and advancing the cursor past it would mean the failed rename is never
+    retried. So the rename outcome is checked via ``_rename_outcome_status``
+    (which derives a real status from the renamer's actual return shape --
+    it has no top-level ``status`` key): a status of ``"failed"`` blocks the
+    advance outright, regardless of what the tag leg did.
 
-    Deliberately NOT terminal, so the cursor does not advance past these and
-    a future ``resume=true`` retries them: ``"failed"`` (a write error --
-    retrying it is the entire point of resume), and every OTHER ``"skipped"``
-    reason. ``tag_sources_for_mix`` returns the identical ``"skipped"``
-    status for a missing source file, a source outside the allowed roots,
-    AND insufficient free space, alongside the benign already-tagged case --
-    all three of the alarming ones can resolve themselves before the next
-    run (the volume gains headroom, a remount fixes the path, ...), so
-    skipping past them permanently would mean they are never retried even
-    once whatever caused them clears up.
+    **Tag leg**, for a real run, terminal-success is: the tag was actually
+    written (``"ok"``), or the file already carried every target tag and
+    matching cover art. That last case is reported as ``"skipped"`` --
+    preferably with ``tag_sources_for_mix``'s own ``"terminal": True``
+    marker set at the one place that return dict is built, falling back to
+    matching its ``"already tagged"`` reason string when that key is absent
+    (e.g. an older ``source_tagger`` build). The fallback is brittle
+    prose-matching -- a future wording change to that string, without the
+    key, would silently turn every already-tagged mix into a
+    permanently-unadvanced cursor -- but the structural marker is the fix
+    for that, kept only as a fallback for compatibility.
 
-    Matching ``"already tagged"`` by its exact reason string is brittle
-    prose-matching -- ``tag_sources_for_mix`` has no structural field that
-    distinguishes a benign skip from an alarming one (Blocker 3 is the same
-    complaint), and a future wording change to that string would silently
-    turn every already-tagged mix into a permanently-unadvanced cursor. It
-    is nonetheless the only signal available without changing that
-    function's return shape.
+    ``"disabled"`` (the tag setting is off) is deliberately NOT terminal for
+    a real run, even though nothing was attempted and nothing failed. This
+    was Blocker 1: an operator runs a real backfill with ``tag_source_files``
+    off, every mix comes back ``"disabled"``, and the OLD logic advanced the
+    cursor to the end of the backlog anyway -- recorded under ``dry_run:
+    False``, so the mode guard on a later ``resume=true`` does not catch it.
+    The operator then enables the flag and re-runs with ``resume=true``,
+    which resolves to an offset past every candidate: ``{"started": true,
+    "candidates": 0}``, zero files touched. "Disabled" only means "genuinely
+    nothing to do" at the INSTANT it is returned -- the moment the setting
+    flips on, there IS something to do, and a cursor already advanced past
+    that mix means a future ``resume=true`` never revisits it. "Nothing was
+    attempted" is not "success", and the cursor must not treat it as one.
+
+    Also deliberately NOT terminal, so the cursor does not advance past
+    these and a future ``resume=true`` retries them: ``"failed"`` (a write
+    error -- retrying it is the entire point of resume), and every OTHER
+    ``"skipped"`` reason. ``tag_sources_for_mix`` returns the identical
+    ``"skipped"`` status for a missing source file, a source outside the
+    allowed roots, AND insufficient free space, alongside the benign
+    already-tagged case -- all three of the alarming ones can resolve
+    themselves before the next run (the volume gains headroom, a remount
+    fixes the path, ...), so skipping past them permanently would mean
+    they are never retried even once whatever caused them clears up.
     """
     if dry_run:
         return True
+    if _rename_outcome_status(rename) == "failed":
+        return False
     status = tag.get("status")
     if status in _TERMINAL_TAG_STATUSES:
         return True
-    return status == "skipped" and tag.get("reason") == "already tagged"
+    return status == "skipped" and tag.get(
+        "terminal", tag.get("reason") == "already tagged"
+    )
 
 
 def _retag_candidates_stmt(offset: int, limit: Optional[int]):
@@ -1120,7 +1150,11 @@ async def _sweep_retag_staging(
 
 
 async def _run_retag(
-    dry_run: bool, limit: Optional[int], offset: int = 0, resume: bool = False
+    dry_run: bool,
+    limit: Optional[int],
+    offset: int = 0,
+    resume: bool = False,
+    resume_cursor_ignored: bool = False,
 ) -> None:
     """Rename then tag source files for each completed-pipeline mix.
 
@@ -1132,11 +1166,12 @@ async def _run_retag(
     (``running`` is set True before the staging sweep even starts, not after,
     so a poll during a slow sweep sees the new run in progress rather than
     the previous run's stale numbers), and a resume cursor is persisted to
-    ``AppSettings.settings_json`` after each mix whose outcome is
-    terminal-success (see ``_persist_retag_progress`` and
-    ``_tag_outcome_is_terminal_success``) -- a failed write or a skip for a
-    condition that can resolve itself (missing source, outside the allowed
-    roots, insufficient free space) does NOT advance the cursor, so a later
+    ``AppSettings.settings_json`` after each mix whose outcome -- BOTH the
+    rename leg and the tag leg -- is terminal-success (see
+    ``_persist_retag_progress`` and ``_mix_outcome_is_terminal_success``) --
+    a failed rename, a failed tag write, or a tag skip for a condition that
+    can resolve itself (missing source, outside the allowed roots,
+    insufficient free space) does NOT advance the cursor, so a later
     ``resume=true`` retries it instead of skipping it forever. Once ONE mix
     in a run is not terminal-success, the cursor stops advancing for the
     REST of that run too, even past later mixes that succeed -- the cursor
@@ -1147,17 +1182,27 @@ async def _run_retag(
     processing every remaining candidate in the SAME pass regardless of
     whether the cursor is advancing.
 
+    ``resume_cursor_ignored`` is purely informational here -- the caller
+    (``POST /retag``) has already resolved it into the ``offset`` this run
+    actually uses; it is threaded through only so the durable
+    ``retag_run_started`` event can record whether an operator's
+    ``resume=true`` was honoured or silently ignored (a mode-mismatched
+    cursor -- see Blocker 1 / the mode guard below). Without it, an operator
+    reading the durable log after the process is gone has no way to tell a
+    refused resume from a fresh start.
+
     Durable outcomes also go to the activity log (``app.services.activity_log``),
     which is what survives a process restart when ``_retag_state`` does not:
-    one ``retag_run_started`` event with the run parameters and candidate
-    total, exactly one ``retag_mix_processed`` event per mix carrying its
-    ``mix_id``, both the rename and tag status AND their reasons (at
-    ``error`` level when either failed, ``info`` otherwise), and one
-    ``retag_run_completed`` event with the final summary (``warn`` when the
-    summary contains any failures OR any tag skip whose reason was not
-    "already tagged" -- the latter is what actually distinguishes "every
-    file was already tagged" from "every file was skipped for want of disk"
-    when both show up identically as ``{skipped: N}``). If the run itself
+    one ``retag_run_started`` event with the run parameters, whether a
+    resume cursor was ignored, and candidate total, exactly one
+    ``retag_mix_processed`` event per mix carrying its ``mix_id``, both the
+    rename and tag status AND their reasons (at ``error`` level when either
+    failed, ``info`` otherwise), and one ``retag_run_completed`` event with
+    the final summary (``warn`` when the summary contains any failures OR
+    any tag skip whose reason was not "already tagged" -- the latter is
+    what actually distinguishes "every file was already tagged" from "every
+    file was skipped for want of disk" when both show up identically as
+    ``{skipped: N}``). If the run itself
     crashes -- an exception escaping everything above, which is NOT the
     normal best-effort failure path, since rename/tag/persist/emit all
     already swallow their own errors -- a ``retag_run_failed`` event is
@@ -1213,12 +1258,14 @@ async def _run_retag(
             "info",
             "retag_run_started",
             f"Retag backfill started: {len(mix_ids)} candidate mix(es) "
-            f"(dry_run={dry_run}, limit={limit}, offset={offset}, resume={resume}).",
+            f"(dry_run={dry_run}, limit={limit}, offset={offset}, resume={resume}, "
+            f"resume_cursor_ignored={resume_cursor_ignored}).",
             context={
                 "dry_run": dry_run,
                 "limit": limit,
                 "offset": offset,
                 "resume": resume,
+                "resume_cursor_ignored": resume_cursor_ignored,
                 "candidates": len(mix_ids),
             },
         )
@@ -1272,8 +1319,8 @@ async def _run_retag(
 
             _retag_state["processed"] += 1
 
-            if not cursor_advance_blocked and _tag_outcome_is_terminal_success(
-                tag, dry_run
+            if not cursor_advance_blocked and _mix_outcome_is_terminal_success(
+                rename, tag, dry_run
             ):
                 await _persist_retag_progress(
                     mix_id, _retag_state["processed"], _retag_state["total"], dry_run
@@ -1383,7 +1430,10 @@ async def catalog_retag(
         )
 
     _retag_task = _spawn(
-        "retag", _run_retag(dry_run, limit, effective_offset, resume)
+        "retag",
+        _run_retag(
+            dry_run, limit, effective_offset, resume, resume_cursor_ignored
+        ),
     )
     return {
         "started": True,

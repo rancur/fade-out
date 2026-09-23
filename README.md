@@ -382,14 +382,26 @@ select a deterministically ordered slice of completed mixes (`ORDER BY
 created_at, id`, applied identically to the pre-flight `candidates` count
 and to the run itself), so `offset=0&limit=20` followed by
 `offset=20&limit=20` touches two disjoint batches rather than risking the
-same rows twice. After every mix whose tag outcome is terminal-success
-(written, disabled with the setting off, or already carrying the target
-tags/art), a resume cursor is written to
-`AppSettings.settings_json["retag_progress"]`; a failed write or a skip
+same rows twice. After every mix whose outcome — **both** the rename leg
+and the tag leg — is terminal-success, a resume cursor is written to
+`AppSettings.settings_json["retag_progress"]`. Terminal-success for the
+rename leg is anything other than a failed write; for the tag leg it's the
+tag actually being written, or the file already carrying every target tag
+and matching cover art. A failed rename, a failed tag write, or a tag skip
 that could resolve itself (a missing source, a source outside the allowed
 roots, or insufficient free space) does **not** advance the cursor, so the
 mix is retried on the next `resume=true` instead of being skipped forever —
 the run itself still moves on to the next mix immediately either way.
+
+**A tag outcome of `disabled` does *not* advance the cursor on a real run**
+— even though nothing failed and nothing was attempted. `disabled` means
+"genuinely nothing to do" only at the instant it's returned: the moment
+`tag_source_files` is turned on, there IS something to do, and a cursor
+already advanced past that mix would mean a later `resume=true` never
+revisits it. (A dry run's own reporting of `disabled` is unaffected by any
+of this — see below; a dry run's cursor is never terminal-success-gated in
+the first place, since a dry run never writes anything.)
+
 Passing `resume=true` (which ignores any `offset` you also pass) continues
 from that cursor instead of restarting from the beginning, and with no
 saved cursor it just starts at the beginning like a fresh run.
@@ -398,11 +410,28 @@ saved cursor it just starts at the beginning like a fresh run.
 persisted cursor records the `dry_run` it was written under; `resume=true`
 against a cursor from the other mode is treated as no cursor at all rather
 than resolved into an offset — the response's `resume_cursor_ignored` is
-`true` when this happens. Without this, a bare (dry-run) POST over the
-whole backlog followed by a real `dry_run=false&resume=true` run would
-resolve the dry run's cursor to "everything already done" and the real run
-would touch nothing, report `{"started": true}`, and leave every file
-untagged.
+`true` when this happens, and the same flag is recorded on the durable
+`retag_run_started` activity event, so a refused resume is still visible
+after the process that ran it is gone. Without this guard, a bare
+(dry-run) POST over the whole backlog followed by a real
+`dry_run=false&resume=true` run would resolve the dry run's cursor to
+"everything already done" and the real run would touch nothing, report
+`{"started": true}`, and leave every file untagged.
+
+**Do not pair `resume=true` with `limit`.** A permanently-failing mix
+freezes the cursor at its position (by design — see above), and a `limit`
+caps how far each resumed pass can reach past it: with `limit=10` and a
+stuck mix at offset 3, every resumed pass re-processes offsets 3–12 and
+never reaches 13, forever. Without `limit` the same stuck mix is benign —
+the loop still walks every remaining candidate to the end in a single
+pass; only the persisted cursor itself sticks at the stuck mix's position.
+
+**Do not mix `offset` runs with `resume` runs.** They advance two different
+notions of "where we are": a run started at `offset=50` whose very first
+mix succeeds persists THAT mix as the cursor, and a later `resume=true`
+continues from there — silently skipping mixes 0–49, which this `offset=50`
+run never touched at all. Pick one scheme (hand-sized `offset` batches, or
+`resume=true`) for a given pass over the backlog and stick to it.
 
 Combined with the already-tagged skip
 above, an interrupted run can simply be re-issued — as a fresh call
@@ -412,7 +441,7 @@ hand-sized batches:
 
 ```bash
 curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&limit=20"
-curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&resume=true&limit=20"
+curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&resume=true"
 ```
 
 The `candidates` count returned by the POST reflects `limit`/`offset` (or
