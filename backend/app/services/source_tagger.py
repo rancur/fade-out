@@ -219,3 +219,99 @@ def register_and_promote(
     finally:
         if opened_here:
             db.close()
+
+
+from app.services.source_renamer import is_within_allowed_roots
+
+MIN_FREE_SPACE_MULTIPLE = 2
+
+
+async def _tagging_enabled() -> bool:
+    """Mirror how source_renamer reads its own flag: app_config.resolve is async."""
+    from app.services import app_config
+
+    return bool(await app_config.resolve("tag_source_files"))
+
+
+async def _load_mix(mix_id: str) -> Any:
+    from sqlalchemy import select
+
+    from app.database import async_session_factory
+    from app.models import Mix
+
+    async with async_session_factory() as session:
+        return (await session.execute(select(Mix).where(Mix.id == mix_id))).scalar_one_or_none()
+
+
+def _has_free_space(path: str) -> bool:
+    """Refuse to rewrite a file we cannot fit a second copy of.
+
+    The rewrite is out-of-place, so it needs room for the copy alongside the
+    original. Running the volume dry mid-write is how an irreplaceable
+    multi-gigabyte recording gets truncated.
+    """
+    try:
+        need = os.path.getsize(path) * MIN_FREE_SPACE_MULTIPLE
+        return shutil.disk_usage(os.path.dirname(path)).free >= need
+    except OSError:
+        return False
+
+
+async def tag_sources_for_mix(
+    mix_id: str, *, reason: str, dry_run: bool = False
+) -> Dict[str, Any]:
+    """Tag this mix's source audio. Best-effort: never raises, never fails a run."""
+    actions: List[Dict[str, Any]] = []
+
+    if not dry_run and not await _tagging_enabled():
+        return {"status": "disabled", "actions": [], "reason": "tag_source_files is off"}
+
+    try:
+        mix = await _load_mix(mix_id)
+        if mix is None:
+            return {"status": "skipped", "actions": [], "reason": f"no mix {mix_id}"}
+
+        status = getattr(mix, "pipeline_status", None)
+        if status != "completed":
+            return {
+                "status": "skipped", "actions": [],
+                "reason": f"pipeline_status is {status!r}, not 'completed' -- "
+                          "only published mixes are tagged",
+            }
+
+        src = getattr(mix, "audio_file_path", None)
+        if not src:
+            return {"status": "skipped", "actions": [], "reason": "no audio_file_path"}
+
+        if not is_within_allowed_roots(src):
+            return {
+                "status": "skipped", "actions": [],
+                "reason": f"{src} is outside the allowed roots",
+            }
+
+        tags = build_tags(mix)
+        actions.append({"path": src, "tags": tags,
+                        "cover_art": getattr(mix, "cover_art_path", None)})
+
+        if dry_run:
+            return {"status": "dry_run", "actions": actions, "reason": "no changes made"}
+
+        if not os.path.isfile(src):
+            return {"status": "skipped", "actions": actions,
+                    "reason": f"{src} does not exist"}
+
+        if not _has_free_space(src):
+            return {"status": "skipped", "actions": actions,
+                    "reason": f"insufficient free space to rewrite {src} safely"}
+
+        temp = write_tagged_copy(
+            src, tags, getattr(mix, "cover_art_path", None),
+            getattr(mix, "duration_seconds", None),
+        )
+        register_and_promote(temp, src, "audio")
+        logger.info("tagged %s (%s)", src, reason)
+        return {"status": "ok", "actions": actions, "reason": reason}
+
+    except Exception as exc:  # never fatal -- see module docstring
+        logger.exception("tagging failed for mix %s", mix_id)
+        return {"status": "failed", "actions": actions, "reason": str(exc)}
