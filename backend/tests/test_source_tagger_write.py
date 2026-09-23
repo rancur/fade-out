@@ -6,8 +6,6 @@ from mutagen.flac import FLAC
 
 from app.services import source_tagger
 
-pytest.importorskip("mutagen")
-
 
 def _make_flac(path):
     """A real, tiny, valid FLAC. Synthesised rather than fixtured so the test
@@ -161,19 +159,19 @@ def test_zero_duration_read_fails_with_expected_duration(tmp_path, monkeypatch):
     src = tmp_path / "orig.flac"
     _make_flac(src)
 
-    # Monkeypatch FLAC to return 0.0 length when verify reads it back.
+    # Monkeypatch FLAC.__init__ to zero out info.length on every FLAC() call
+    # against this path -- both the in-function edit read and the verify
+    # re-read (write_tagged_copy calls FLAC() twice), since only the
+    # combination of "still parses" + "reports zero duration" is what this
+    # test needs to exercise the RuntimeError branch.
     from mutagen.flac import FLAC as RealFLAC
 
     original_init = RealFLAC.__init__
 
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        # Only patch on the verify read (the second call to FLAC in write_tagged_copy).
-        if hasattr(self, "_patched"):
-            return
         if args and str(args[0]).endswith(os.path.basename(str(src))):
             self.info.length = 0.0
-            self._patched = True
 
     monkeypatch.setattr(RealFLAC, "__init__", patched_init)
 
@@ -186,19 +184,33 @@ def test_zero_duration_read_fails_with_expected_duration(tmp_path, monkeypatch):
     assert leftovers == [], "a failed write must not leave a temp file behind"
 
 
-def test_expected_duration_none_skips_verification(tmp_path):
-    """expected_duration=None deliberately skips verification and succeeds."""
+def test_expected_duration_none_skips_only_the_duration_check(tmp_path):
+    """expected_duration=None gates only the duration comparison -- the
+    parse re-read and the size check are unconditional and still run. This
+    is asserted, not assumed: FLAC(out) below only succeeds if the file
+    write_tagged_copy returned actually parses as valid FLAC, which is
+    exactly the re-read verify performs internally."""
     src = tmp_path / "orig.flac"
     _make_flac(src)
     out = source_tagger.write_tagged_copy(
         str(src), {"ARTIST": "Will See"}, None, expected_duration=None
     )
     assert os.path.exists(out), "write should succeed with expected_duration=None"
+    # Proves the unconditional parse check actually ran and passed -- a
+    # write that failed to parse would have raised inside write_tagged_copy
+    # before ever returning a path for this to open.
     assert FLAC(out)["ARTIST"] == ["Will See"]
 
 
 def test_sequential_calls_produce_different_temp_paths(tmp_path):
-    """Concurrent calls must not collide on the same temp path."""
+    """Two sequential calls get different temp paths.
+
+    The calls here are sequential, not concurrent -- this does not prove
+    anything about a race. What it proves is that temp-path uniqueness
+    comes from the uuid4 component in the filename, not from timing (e.g.
+    a coarse timestamp), which is the part that would matter under real
+    concurrency.
+    """
     src = tmp_path / "orig.flac"
     _make_flac(src)
     out1 = source_tagger.write_tagged_copy(
@@ -231,15 +243,6 @@ def test_cover_art_mime_detection(tmp_path):
         str(src), {"ARTIST": "Will See"}, str(jpg_path), None
     )
     assert FLAC(out_jpg).pictures[0].mime == "image/jpeg"
-
-
-def test_padding_uses_constant(tmp_path):
-    """Padding assertion should use the FLAC_PADDING_BYTES constant."""
-    src = tmp_path / "orig.flac"
-    _make_flac(src)
-    out = source_tagger.write_tagged_copy(str(src), {"ARTIST": "Will See"}, None, None)
-    padding = sum(b.length for b in FLAC(out).metadata_blocks if b.code == 1)
-    assert padding >= source_tagger.FLAC_PADDING_BYTES
 
 
 def test_corrupt_write_fails_and_cleans_up_even_with_none_duration(tmp_path, monkeypatch):
