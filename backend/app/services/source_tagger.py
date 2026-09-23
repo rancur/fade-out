@@ -196,7 +196,26 @@ def register_and_promote(
     from app.services import file_watcher
 
     db = seen_db if seen_db is not None else file_watcher.open_seen_files_db()
-    new_hash = file_watcher.compute_file_hash(temp_path)
-    db.mark_done(new_hash, final_path, file_type)
-    os.rename(temp_path, final_path)
-    logger.info("promoted tagged file %s (hash %s registered first)", final_path, new_hash)
+    opened_here = seen_db is None
+    try:
+        new_hash = file_watcher.compute_file_hash(temp_path)
+        db.mark_done(new_hash, final_path, file_type)
+        try:
+            os.rename(temp_path, final_path)
+        except Exception:
+            # The staging dir is hidden from the watcher, so an orphan here is
+            # invisible debris that nothing else will ever reclaim. The
+            # mark_done row above is deliberately NOT rolled back: it is keyed
+            # on a hash no file now has, so it is inert.
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                logger.warning("could not clean up temp file %s", temp_path, exc_info=True)
+            raise
+        logger.info(
+            "promoted tagged file %s (hash %s registered first)", final_path, new_hash
+        )
+    finally:
+        if opened_here:
+            db.close()
