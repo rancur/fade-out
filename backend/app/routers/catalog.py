@@ -847,11 +847,6 @@ async def catalog_retag(
     from app.database import async_session_factory
     from app.models import Mix
 
-    if _retag_task and not _retag_task.done():
-        raise HTTPException(
-            status_code=409, detail="A retag run is already in progress."
-        )
-
     async with async_session_factory() as session:
         candidates = (
             await session.execute(
@@ -860,6 +855,15 @@ async def catalog_retag(
                 .where(Mix.pipeline_status == "completed")
             )
         ).scalar_one()
+
+    # No await between this check and the assignment below: asyncio is
+    # single-threaded, so an uninterrupted block is atomic. A yield here
+    # would let two concurrent POSTs both pass the guard and start two
+    # overlapping passes over the same multi-gigabyte files.
+    if _retag_task and not _retag_task.done():
+        raise HTTPException(
+            status_code=409, detail="A retag run is already in progress."
+        )
 
     _retag_task = _spawn("retag", _run_retag(dry_run, limit))
     return {"started": True, "dry_run": dry_run, "candidates": int(candidates)}
