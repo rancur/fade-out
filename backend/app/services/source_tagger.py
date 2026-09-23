@@ -29,6 +29,7 @@ a full disk, or a corrupt write. In-place tagging gives neither guarantee.
 import logging
 import os
 import shutil
+import uuid
 from typing import Any, Dict, List, Optional
 
 from app.services import source_renamer
@@ -114,12 +115,18 @@ def write_tagged_copy(
 
     The original is never opened for writing. On any failure the temp file is
     removed and the caller is left exactly as it started.
+
+    If ``expected_duration`` is None, verification is skipped; production always
+    passes a real duration to catch corruption. Tests may pass None to accept
+    any duration.
     """
     from mutagen.flac import FLAC, Picture
 
     staging = temp_dir_for(src)
     os.makedirs(staging, exist_ok=True)
-    temp_path = os.path.join(staging, os.path.basename(src))
+    temp_path = os.path.join(
+        staging, f"{os.getpid()}-{uuid.uuid4().hex[:8]}-{os.path.basename(src)}"
+    )
 
     try:
         shutil.copy2(src, temp_path)
@@ -131,7 +138,7 @@ def write_tagged_copy(
         if cover_art_path and os.path.isfile(cover_art_path):
             picture = Picture()
             picture.type = 3  # front cover
-            picture.mime = "image/jpeg"
+            picture.mime = "image/png" if cover_art_path.lower().endswith(".png") else "image/jpeg"
             picture.desc = "Cover"
             with open(cover_art_path, "rb") as fh:
                 picture.data = fh.read()
@@ -142,12 +149,18 @@ def write_tagged_copy(
 
         # Verify by re-reading. A truncated or corrupt write that still parses
         # would otherwise be promoted over a good recording.
-        verify = FLAC(temp_path)
-        if expected_duration and verify.info.length:
-            if abs(verify.info.length - float(expected_duration)) > 1.0:
+        if expected_duration is not None:
+            verify = FLAC(temp_path)
+            actual = verify.info.length
+            if not actual:
                 raise RuntimeError(
-                    f"tagged copy duration {verify.info.length:.1f}s does not match "
-                    f"the expected {float(expected_duration):.1f}s"
+                    "tagged copy reports no audio duration -- the write is empty or "
+                    "unreadable, refusing to treat it as good"
+                )
+            if abs(actual - float(expected_duration)) > 1.0:
+                raise RuntimeError(
+                    f"tagged copy duration {actual:.1f}s does not match the expected "
+                    f"{float(expected_duration):.1f}s"
                 )
         return temp_path
     except Exception:
