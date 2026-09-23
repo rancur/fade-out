@@ -423,6 +423,46 @@ async def set_soundcloud_token(body: TokenUpdate, db: AsyncSession = Depends(get
         return SoundCloudStatus(connected=False, error=str(exc))
 
 
+def soundcloud_redirect_uri(
+    request: Request,
+    settings_json: Optional[Dict[str, Any]] = None,
+    override: Optional[str] = None,
+) -> str:
+    """The redirect URI for the SoundCloud OAuth flow.
+
+    SoundCloud string-matches this against the value registered on the OAuth
+    app, so ``localhost`` and ``127.0.0.1`` are different URIs and only the
+    registered spelling works. A mismatch does not produce an error: the
+    authorize SPA gets ``403 redirect_uri_mismatch`` from
+    ``api-auth.soundcloud.com/allow`` and renders a completely blank page,
+    which reads like a browser or session fault and sends whoever is debugging
+    it somewhere else entirely. That cost hours on 2026-09-18.
+
+    Both the URL-building and code-exchange call sites MUST resolve the same
+    value -- the token exchange fails if its redirect_uri differs by one
+    character from the one that obtained the code -- so both go through here
+    rather than deriving it independently.
+
+    Precedence: explicit override, then configured value (DB settings, then
+    env), then the request Host as a last resort. In that final fallback
+    ``localhost`` is rewritten to ``127.0.0.1``, because the registered URI
+    uses the latter and the two are trivially confused.
+    """
+    if override:
+        return override
+    configured = _get_credential("soundcloud_redirect_uri", settings_json)
+    if configured:
+        return configured
+    host = request.headers.get("host", "127.0.0.1:8500")
+    if host.startswith("localhost"):
+        host = host.replace("localhost", "127.0.0.1", 1)
+        logger.warning(
+            "SoundCloud redirect URI derived from a 'localhost' Host header; "
+            "using 127.0.0.1 instead, as that is what is registered."
+        )
+    return f"http://{host}/api/auth/soundcloud/callback"
+
+
 @router.get("/soundcloud/oauth-url", response_model=OAuthURL)
 async def soundcloud_oauth_url(
     request: Request,
@@ -437,9 +477,7 @@ async def soundcloud_oauth_url(
     if not client_id:
         raise HTTPException(status_code=400, detail="SoundCloud Client ID not configured. Add it in Settings.")
 
-    # Build callback URI dynamically from request host
-    if not redirect_uri:
-        redirect_uri = f"http://{request.headers.get('host', 'localhost:8500')}/api/auth/soundcloud/callback"
+    redirect_uri = soundcloud_redirect_uri(request, sj, override=redirect_uri)
 
     params = {
         "client_id": client_id,
@@ -472,8 +510,9 @@ async def soundcloud_callback(
     if not client_id or not client_secret:
         return RedirectResponse(url="/settings?auth=soundcloud&error=missing_client_credentials")
 
-    # The redirect_uri used here must match what was used to generate the auth URL
-    callback_uri = f"http://{request.headers.get('host', 'localhost:8500')}/api/auth/soundcloud/callback"
+    # Must resolve identically to the URI that obtained this code, or the
+    # exchange fails -- hence the shared helper rather than a second guess.
+    callback_uri = soundcloud_redirect_uri(request, sj)
 
     try:
         async with httpx.AsyncClient(timeout=15) as http_client:
