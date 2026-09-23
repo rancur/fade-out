@@ -9,7 +9,7 @@ its own session; progress lands in the activity log and the sync summary in
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -38,6 +38,10 @@ _playlists_task: Optional[asyncio.Task] = None
 _retag_task: Optional[asyncio.Task] = None
 
 _RETAG_SUMMARY_STATUSES = ("ok", "skipped", "disabled", "failed", "dry_run", "unknown")
+
+# Key under AppSettings.settings_json where the resume cursor is persisted,
+# following the same precedent as catalog_sync's LAST_SYNC_KEY.
+RETAG_PROGRESS_KEY = "retag_progress"
 
 
 def _empty_retag_summary() -> Dict[str, int]:
@@ -834,24 +838,110 @@ def _rename_outcome_status(outcome: Dict[str, Any]) -> str:
     return "skipped"
 
 
-async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
+def _retag_candidates_stmt(offset: int, limit: Optional[int]):
+    """Build the retag candidate-selection query.
+
+    Shared verbatim by the pre-flight count in ``POST /retag`` and the actual
+    selection in ``_run_retag`` so the two can never drift apart -- same
+    WHERE, same ORDER BY, same OFFSET/LIMIT. The ordering is a deterministic
+    total order: ``Mix.created_at`` alone is not guaranteed unique (mixes
+    inserted in the same tick, e.g. via the back-catalog sync, tie), so
+    ``Mix.id`` breaks ties. Without a total order, ``offset``-based paging
+    across two calls (or a resume midway through) is not guaranteed to
+    select disjoint rows.
+    """
+    stmt = (
+        select(Mix.id)
+        .where(Mix.pipeline_status == "completed")
+        .order_by(Mix.created_at, Mix.id)
+        .offset(offset)
+    )
+    if limit:
+        stmt = stmt.limit(limit)
+    return stmt
+
+
+async def _resume_offset(session: AsyncSession) -> int:
+    """Translate the persisted ``retag_progress`` cursor into an offset.
+
+    With no saved cursor -- the very first run, or a prior run whose last
+    mix has since been deleted from the candidate set -- resumption starts
+    from the beginning. This must never raise: ``resume=true`` against a
+    clean slate is exactly as safe as a bare run.
+    """
+    result = await session.execute(select(AppSettings).where(AppSettings.id == 1))
+    row = result.scalar_one_or_none()
+    progress = ((row.settings_json or {}).get(RETAG_PROGRESS_KEY)) if row else None
+    last_mix_id = (progress or {}).get("last_mix_id")
+    if not last_mix_id:
+        return 0
+
+    ordered = await session.execute(
+        select(Mix.id)
+        .where(Mix.pipeline_status == "completed")
+        .order_by(Mix.created_at, Mix.id)
+    )
+    ordered_ids = [row[0] for row in ordered.all()]
+    try:
+        return ordered_ids.index(last_mix_id) + 1
+    except ValueError:
+        return 0
+
+
+async def _persist_retag_progress(
+    mix_id: str, processed: int, total: int, dry_run: bool
+) -> None:
+    """Write the resume cursor after a single mix, committing immediately.
+
+    Called after EVERY mix (not just at the end of the run) so a ``kill -9``
+    mid-run still leaves a usable checkpoint -- persisting only on
+    completion would defeat the entire purpose of a resumable backfill.
+    Best-effort and wrapped like every other persistence call in this
+    module: a failure to save the cursor must not take down a run that is
+    otherwise successfully touching irreplaceable files.
+    """
+    from app.database import async_session_factory
+
+    try:
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(AppSettings).where(AppSettings.id == 1)
+            )
+            row = result.scalar_one_or_none()
+            if not row:
+                row = AppSettings(id=1)
+                session.add(row)
+            merged = dict(row.settings_json or {})
+            merged[RETAG_PROGRESS_KEY] = {
+                "last_mix_id": mix_id,
+                "processed": processed,
+                "total": total,
+                "dry_run": dry_run,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            row.settings_json = merged
+            await session.commit()
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Failed to persist retag progress cursor")
+
+
+async def _run_retag(dry_run: bool, limit: Optional[int], offset: int = 0) -> None:
     """Rename then tag source files for each completed-pipeline mix.
 
     ``source_renamer.rename_sources_for_mix`` / ``source_tagger.tag_sources_for_mix``
     are both best-effort by contract (never raise), so one mix's failure never
     aborts the run. Rename is called before tag for each mix, matching the
     order the pipeline itself uses at completion. Progress is published to the
-    module-level ``_retag_state`` dict polled by ``GET /retag/status``.
+    module-level ``_retag_state`` dict polled by ``GET /retag/status``, and a
+    resume cursor is persisted to ``AppSettings.settings_json`` after each
+    mix (see ``_persist_retag_progress``).
     """
     from app.database import async_session_factory
-    from app.models import Mix
     from app.services import source_renamer, source_tagger
 
     try:
         async with async_session_factory() as session:
-            stmt = select(Mix.id).where(Mix.pipeline_status == "completed")
-            if limit:
-                stmt = stmt.limit(limit)
+            stmt = _retag_candidates_stmt(offset, limit)
             mix_ids = [row[0] for row in (await session.execute(stmt)).all()]
 
         _retag_state["running"] = True
@@ -876,6 +966,9 @@ async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
             for status in (rename_status, tag_status):
                 summary[status if status in summary else "unknown"] += 1
             _retag_state["processed"] += 1
+            await _persist_retag_progress(
+                mix_id, _retag_state["processed"], _retag_state["total"], dry_run
+            )
     finally:
         _retag_state["running"] = False
 
@@ -884,6 +977,8 @@ async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
 async def catalog_retag(
     dry_run: bool = Query(default=True),
     limit: Optional[int] = Query(default=None),
+    offset: int = Query(default=0),
+    resume: bool = Query(default=False),
 ):
     """Rename and tag the source files of already-published (completed) mixes.
 
@@ -894,32 +989,47 @@ async def catalog_retag(
     ``pipeline_status == "completed"`` are candidates; rename runs before tag
     for each one. Single-flight: a run already in progress returns 409
     instead of starting a second concurrent pass.
+
+    ``limit``/``offset`` genuinely paginate now (ordered by ``created_at``,
+    ``id``): a batch-two call with ``offset=limit`` picks up exactly where
+    batch one left off, never re-selecting the same rows. ``resume=true``
+    ignores ``offset`` and instead continues after the mix the last run
+    persisted as its cursor (``AppSettings.settings_json["retag_progress"]``);
+    with no saved cursor it starts from the beginning rather than erroring.
     """
     global _retag_task
     from app.database import async_session_factory
-    from app.models import Mix
 
     async with async_session_factory() as session:
-        # Mirrors the id-selection in ``_run_retag`` exactly (including the
-        # same ``limit``), so this pre-flight number is the actual count of
-        # mixes the run is about to touch -- a plain COUNT(*) with no limit
-        # applied would over-report whenever ``limit`` is passed.
-        candidate_stmt = select(Mix.id).where(Mix.pipeline_status == "completed")
-        if limit:
-            candidate_stmt = candidate_stmt.limit(limit)
+        # Resolve the resume cursor (if any) into a concrete offset in the
+        # same session/await window as the pre-flight count below, well
+        # before the single-flight guard. Mirrors the id-selection in
+        # ``_run_retag`` exactly (same statement builder), so this
+        # pre-flight number is the actual count of mixes the run is about
+        # to touch -- a plain COUNT(*) ignoring limit/offset would
+        # over-report.
+        effective_offset = await _resume_offset(session) if resume else offset
+        candidate_stmt = _retag_candidates_stmt(effective_offset, limit)
         candidates = len((await session.execute(candidate_stmt)).all())
 
     # No await between this check and the assignment below: asyncio is
     # single-threaded, so an uninterrupted block is atomic. A yield here
     # would let two concurrent POSTs both pass the guard and start two
-    # overlapping passes over the same multi-gigabyte files.
+    # overlapping passes over the same multi-gigabyte files. The resume
+    # cursor lookup above happens strictly BEFORE this window, not inside
+    # it, so it cannot reintroduce that race.
     if _retag_task and not _retag_task.done():
         raise HTTPException(
             status_code=409, detail="A retag run is already in progress."
         )
 
-    _retag_task = _spawn("retag", _run_retag(dry_run, limit))
-    return {"started": True, "dry_run": dry_run, "candidates": int(candidates)}
+    _retag_task = _spawn("retag", _run_retag(dry_run, limit, effective_offset))
+    return {
+        "started": True,
+        "dry_run": dry_run,
+        "candidates": int(candidates),
+        "offset": effective_offset,
+    }
 
 
 @router.get("/retag/status")
