@@ -263,10 +263,10 @@ async def tag_sources_for_mix(
     """Tag this mix's source audio. Best-effort: never raises, never fails a run."""
     actions: List[Dict[str, Any]] = []
 
-    if not dry_run and not await _tagging_enabled():
-        return {"status": "disabled", "actions": [], "reason": "tag_source_files is off"}
-
     try:
+        if not dry_run and not await _tagging_enabled():
+            return {"status": "disabled", "actions": [], "reason": "tag_source_files is off"}
+
         mix = await _load_mix(mix_id)
         if mix is None:
             return {"status": "skipped", "actions": [], "reason": f"no mix {mix_id}"}
@@ -290,17 +290,30 @@ async def tag_sources_for_mix(
             }
 
         tags = build_tags(mix)
-        actions.append({"path": src, "tags": tags,
-                        "cover_art": getattr(mix, "cover_art_path", None)})
+        exists = os.path.isfile(src)
+        has_space = _has_free_space(src) if exists else False
+        actions.append({
+            "path": src,
+            "tags": tags,
+            "cover_art": getattr(mix, "cover_art_path", None),
+            "source_exists": exists,
+            "sufficient_space": has_space,
+        })
 
         if dry_run:
+            if not exists:
+                return {"status": "dry_run", "actions": actions,
+                        "reason": f"source missing: {src} -- would be skipped"}
+            if not has_space:
+                return {"status": "dry_run", "actions": actions,
+                        "reason": f"insufficient free space for {src} -- would be skipped"}
             return {"status": "dry_run", "actions": actions, "reason": "no changes made"}
 
-        if not os.path.isfile(src):
+        if not exists:
             return {"status": "skipped", "actions": actions,
                     "reason": f"{src} does not exist"}
 
-        if not _has_free_space(src):
+        if not has_space:
             return {"status": "skipped", "actions": actions,
                     "reason": f"insufficient free space to rewrite {src} safely"}
 
