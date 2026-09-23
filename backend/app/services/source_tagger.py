@@ -29,6 +29,7 @@ a full disk, or a corrupt write. In-place tagging gives neither guarantee.
 import logging
 import os
 import shutil
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -141,6 +142,134 @@ def temp_dir_for(path: str) -> str:
     invisible to the watcher, which scans with a non-recursive ``os.listdir``.
     """
     return os.path.join(os.path.dirname(path), TEMP_DIRNAME)
+
+
+def sweep_staging(
+    root: str, older_than_hours: float = 6.0, dry_run: bool = False
+) -> Dict[str, Any]:
+    """Reclaim orphaned copies left in a ``TEMP_DIRNAME`` staging directory.
+
+    A run that dies between ``write_tagged_copy`` staging a multi-gigabyte
+    copy and ``register_and_promote`` moving it into place leaves that copy
+    behind. Nothing else reclaims it: the directory is invisible to the
+    watcher by design (see the module docstring), so across ~80 files of
+    ~498 GB a few failed runs can quietly consume tens of gigabytes, and the
+    resulting shortage then surfaces only as a routine "skipped" from
+    ``_has_free_space`` -- silent degradation in both directions.
+
+    THIS FUNCTION DELETES FILES, so the guards are the substance of it, not
+    the deletion:
+
+    * ``root`` must be a real, existing ``TEMP_DIRNAME`` directory (checked
+      by basename, not by content) inside one of
+      ``source_renamer.allowed_roots()``. That allowlist already exists
+      because an unguarded path-deletion primitive is dangerous; this reuses
+      it rather than inventing a second one. Neither check is negotiable --
+      a caller passing a normal directory (or one outside the watch roots)
+      gets a refusal back, never a wipe.
+    * Only entries strictly OLDER than ``older_than_hours`` (by mtime) are
+      touched. A fresh temp file may belong to a run currently in flight;
+      deleting one mid-write is the one outcome this must never produce.
+    * The directory is scanned non-recursively (mirroring the watcher's own
+      non-recursive ``os.listdir``, and how ``write_tagged_copy`` always
+      places temp files directly inside ``root``, never in a subdirectory)
+      and symlinks are never followed or removed -- an entry that is a
+      symlink is left alone and reported as skipped, since a plain file
+      written by ``shutil.copy2`` is the only thing this module itself would
+      ever have staged there.
+    * A failure to stat or remove one entry (permission error, file vanished
+      under us, ...) is logged and skipped; it never aborts the sweep.
+
+    Never raises. Returns a dict of:
+
+    * ``refused`` / ``reason``: set when ``root`` fails a guard; when
+      ``refused`` is True nothing was touched, including on a real
+      basename-matching directory that happened to be outside the allowed
+      roots.
+    * ``removed``: list of ``{"path", "bytes"}`` for every entry removed (or,
+      under ``dry_run``, every entry that WOULD have been removed -- the
+      same set, nothing actually deleted).
+    * ``removed_count`` / ``reclaimed_bytes``: totals over ``removed``.
+    * ``skipped``: list of ``{"path", "reason"}`` for every entry left alone
+      (too young, a symlink, or an error acting on it).
+    """
+    result: Dict[str, Any] = {
+        "root": root,
+        "dry_run": dry_run,
+        "refused": False,
+        "reason": None,
+        "removed": [],
+        "removed_count": 0,
+        "reclaimed_bytes": 0,
+        "skipped": [],
+    }
+
+    if os.path.basename(os.path.normpath(root)) != TEMP_DIRNAME:
+        result["refused"] = True
+        result["reason"] = (
+            f"refusing to sweep {root!r}: basename is not {TEMP_DIRNAME!r}"
+        )
+        return result
+
+    if not is_within_allowed_roots(root):
+        result["refused"] = True
+        result["reason"] = f"refusing to sweep {root!r}: outside the allowed roots"
+        return result
+
+    if os.path.islink(root) or not os.path.isdir(root):
+        # Never created, already cleaned up, or -- out of caution -- a
+        # symlink where a real staging directory should be. Either way there
+        # is nothing safe to sweep; this is not a refusal.
+        return result
+
+    cutoff = time.time() - (older_than_hours * 3600.0)
+
+    try:
+        entries = list(os.scandir(root))
+    except OSError as exc:
+        logger.warning("could not list staging directory %s: %s", root, exc)
+        result["skipped"].append({"path": root, "reason": str(exc)})
+        return result
+
+    for entry in entries:
+        path = entry.path
+        try:
+            if entry.is_symlink():
+                result["skipped"].append({"path": path, "reason": "symlink"})
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                result["skipped"].append(
+                    {"path": path, "reason": "not a regular file"}
+                )
+                continue
+            st = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            logger.warning("could not stat staging entry %s: %s", path, exc)
+            result["skipped"].append({"path": path, "reason": str(exc)})
+            continue
+
+        if st.st_mtime > cutoff:
+            result["skipped"].append({"path": path, "reason": "younger than threshold"})
+            continue
+
+        if dry_run:
+            result["removed"].append({"path": path, "bytes": st.st_size})
+            continue
+
+        try:
+            os.remove(path)
+        except OSError as exc:
+            logger.warning(
+                "could not remove orphaned staging file %s: %s", path, exc
+            )
+            result["skipped"].append({"path": path, "reason": str(exc)})
+            continue
+
+        result["removed"].append({"path": path, "bytes": st.st_size})
+
+    result["removed_count"] = len(result["removed"])
+    result["reclaimed_bytes"] = sum(item["bytes"] for item in result["removed"])
+    return result
 
 
 def _audio_payload_offset(path: str) -> int:

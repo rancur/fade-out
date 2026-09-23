@@ -9,6 +9,7 @@ its own session; progress lands in the activity log and the sync summary in
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
@@ -949,6 +950,42 @@ async def _emit_retag_activity(
         logger.debug("retag activity emit failed for %s", event, exc_info=True)
 
 
+async def _sweep_retag_staging() -> Dict[str, Any]:
+    """Reclaim orphaned ``.fadeout-tagging`` staging copies before a run
+    starts touching any real files.
+
+    One staging directory can exist directly under each of
+    ``source_renamer.allowed_roots()`` (``write_tagged_copy`` always stages
+    directly alongside the source file, and the watch folders themselves are
+    flat -- see ``source_tagger``'s module docstring), so this sweeps each
+    root's staging directory in turn. ``source_tagger.sweep_staging`` does
+    real filesystem I/O (scandir/stat/remove over however many orphans have
+    accumulated), so it runs off the event loop via ``asyncio.to_thread``
+    rather than blocking it.
+
+    Best-effort like everything else in this module: a sweep failure must
+    never stop the backfill it is meant to make safer to run unattended.
+    ``sweep_staging`` itself never raises, but this wrapper does not rely on
+    that holding forever -- it catches independently, mirroring
+    ``_emit_retag_activity``.
+    """
+    from app.services import source_renamer, source_tagger
+
+    totals: Dict[str, Any] = {"removed_count": 0, "reclaimed_bytes": 0, "roots": []}
+    try:
+        for watch_root in source_renamer.allowed_roots():
+            staging_root = os.path.join(watch_root, source_tagger.TEMP_DIRNAME)
+            outcome = await asyncio.to_thread(
+                source_tagger.sweep_staging, staging_root
+            )
+            totals["roots"].append(outcome)
+            totals["removed_count"] += outcome.get("removed_count", 0)
+            totals["reclaimed_bytes"] += outcome.get("reclaimed_bytes", 0)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Sweeping retag staging directories failed")
+    return totals
+
+
 async def _run_retag(
     dry_run: bool, limit: Optional[int], offset: int = 0, resume: bool = False
 ) -> None:
@@ -970,11 +1007,26 @@ async def _run_retag(
     either failed, ``info`` otherwise), and one ``retag_run_completed`` event
     with the final summary. Every emit goes through ``_emit_retag_activity``,
     which is best-effort -- an activity-log failure can never abort this run.
+
+    Before any of that, orphaned ``.fadeout-tagging`` staging copies from a
+    previous run that died mid-flight are reclaimed (see
+    ``_sweep_retag_staging`` / ``source_tagger.sweep_staging``) -- otherwise
+    a repeatedly-interrupted backfill just keeps accumulating multi-gigabyte
+    orphans that nothing else will ever reclaim.
     """
     from app.database import async_session_factory
     from app.services import source_renamer, source_tagger
 
     try:
+        sweep = await _sweep_retag_staging()
+        await _emit_retag_activity(
+            "info",
+            "retag_staging_swept",
+            f"Reclaimed {sweep['removed_count']} orphaned staging file(s) "
+            f"({sweep['reclaimed_bytes']} bytes) before starting the retag run.",
+            context=sweep,
+        )
+
         async with async_session_factory() as session:
             stmt = _retag_candidates_stmt(offset, limit)
             mix_ids = [row[0] for row in (await session.execute(stmt)).all()]
