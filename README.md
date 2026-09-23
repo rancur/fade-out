@@ -314,24 +314,32 @@ logged, never fatal to the pipeline run — when free space on the volume is
 under 2x the file's size, since the out-of-place copy needs room to exist
 alongside the original while it is written.
 
-`.fadeout-tagging/` is operator-visible, not a temp directory the OS
-reclaims on its own. Every failure path removes its own staged file, but it
-is not swept on a schedule or on startup — a run that fails between writing
-the copy and any cleanup running (a killed process, an OS-level crash) can
-leave a multi-gigabyte orphan behind. Check it after any run that didn't
-finish cleanly.
+`.fadeout-tagging/` staging copies from a write that never finished (a killed
+process, an OS-level crash between writing the copy and promoting it) are no
+longer left for an operator to find by hand: every retag backfill run sweeps
+each watch root's `.fadeout-tagging/` directory before it starts, removing
+anything older than the sweep's age threshold. See "Orphaned staging
+cleanup" below for the guardrails and the default threshold. Tagging
+triggered by ordinary pipeline completion (a single mix finishing, not the
+backfill) does not run that sweep, so an orphan from a single-mix failure
+outside a backfill run still needs manual cleanup.
 
-**Re-tagging is not idempotent, but it is safe.** There's no "already
-tagged, skip it" check — a mix that already has all its tags written gets
-the exact same full out-of-place rewrite on every run that touches it, and
-that rewrite succeeds: once a file already carries the 64 KB padding block
-this module adds, mutagen writes new metadata *into* that padding, so a
-healthy re-tag's total file size doesn't change at all. The truncation guard
-accounts for this — it compares the audio payload (everything past the last
-metadata block), not total file size, so a byte-identical-size re-tag is not
-mistaken for a truncated write. Running the backfill twice over the same
-mixes redoes the full multi-gigabyte rewrite twice, not zero — that's wasted
-I/O and time on an irreplaceable file, not a failure.
+**Re-tagging skips files that already carry the target tags.** Before
+writing anything, `already_tagged()` reads the FLAC's existing Vorbis
+comments — a header read only, it never opens the file for writing or
+copies it — and compares every target tag's value plus whether the embedded
+cover art's CONTENT (size and a SHA-256 digest, not just whether some
+picture is present) matches the current `cover_art_path` file on disk, so
+regenerated artwork triggers a re-tag rather than leaving stale art in
+place. Only when everything already matches does the mix come back
+`{"status": "skipped", "reason": "already tagged"}` without touching the
+file at all; a retitled mix has a different `TITLE`, so it is still
+re-tagged, same as any other real change. A dry run
+over an already-tagged library reports `"already tagged -- would be
+skipped"` for the same mixes rather than overstating the work a real run
+would do. This is what makes the retag backfill (below) cheap to re-run
+after an interruption instead of redoing a full multi-gigabyte rewrite of
+every file it already touched.
 
 To backfill renames and tags across already-published mixes:
 
@@ -369,17 +377,115 @@ curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false"
 curl "$FADEOUT/api/catalog/retag/status"
 ```
 
-Pass `limit=<n>` to cap how many completed mixes a single run touches — e.g.
-`curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&limit=5"`. This caps
-a *single* run; it does not paginate. `_run_retag`'s selection query has no
-`ORDER BY` and applies no offset, so calling it again with the same `limit`
-is not guaranteed to reach a different batch of mixes rather than
-re-selecting the same ones. Don't rely on repeated limited calls to sweep the
-full backlog in "supervised batches" — use `limit` to bound the size of one
-run (e.g. a smoke test before committing to all ~80 mixes / ~498 GB), and run
-without it (or with a limit covering everything) once you're ready to cover
-the full completed-mix backlog in a single pass.
-The `candidates` count returned by the POST already reflects `limit`.
+**The backfill is resumable and genuinely paginated.** `limit` and `offset`
+select a deterministically ordered slice of completed mixes (`ORDER BY
+created_at, id`, applied identically to the pre-flight `candidates` count
+and to the run itself), so `offset=0&limit=20` followed by
+`offset=20&limit=20` touches two disjoint batches rather than risking the
+same rows twice. After every mix whose outcome — **both** the rename leg
+and the tag leg — is terminal-success, a resume cursor is written to
+`AppSettings.settings_json["retag_progress"]`. Terminal-success for the
+rename leg is anything other than a failed write; for the tag leg it's the
+tag actually being written, or the file already carrying every target tag
+and matching cover art. A failed rename, a failed tag write, or a tag skip
+that could resolve itself (a missing source, a source outside the allowed
+roots, or insufficient free space) does **not** advance the cursor, so the
+mix is retried on the next `resume=true` instead of being skipped forever —
+the run itself still moves on to the next mix immediately either way.
+
+**A tag outcome of `disabled` does *not* advance the cursor on a real run**
+— even though nothing failed and nothing was attempted. `disabled` means
+"genuinely nothing to do" only at the instant it's returned: the moment
+`tag_source_files` is turned on, there IS something to do, and a cursor
+already advanced past that mix would mean a later `resume=true` never
+revisits it. (A dry run's own reporting of `disabled` is unaffected by any
+of this — see below; a dry run's cursor is never terminal-success-gated in
+the first place, since a dry run never writes anything.)
+
+Passing `resume=true` (which ignores any `offset` you also pass) continues
+from that cursor instead of restarting from the beginning, and with no
+saved cursor it just starts at the beginning like a fresh run.
+
+**A dry run's cursor can never resume a real run, and vice versa.** The
+persisted cursor records the `dry_run` it was written under; `resume=true`
+against a cursor from the other mode is treated as no cursor at all rather
+than resolved into an offset — the response's `resume_cursor_ignored` is
+`true` when this happens, and the same flag is recorded on the durable
+`retag_run_started` activity event, so a refused resume is still visible
+after the process that ran it is gone. Without this guard, a bare
+(dry-run) POST over the whole backlog followed by a real
+`dry_run=false&resume=true` run would resolve the dry run's cursor to
+"everything already done" and the real run would touch nothing, report
+`{"started": true}`, and leave every file untagged.
+
+**Do not pair `resume=true` with `limit`.** A permanently-failing mix
+freezes the cursor at its position (by design — see above), and a `limit`
+caps how far each resumed pass can reach past it: with `limit=10` and a
+stuck mix at offset 3, every resumed pass re-processes offsets 3–12 and
+never reaches 13, forever. Without `limit` the same stuck mix is benign —
+the loop still walks every remaining candidate to the end in a single
+pass; only the persisted cursor itself sticks at the stuck mix's position.
+
+**Do not mix `offset` runs with `resume` runs.** They advance two different
+notions of "where we are": a run started at `offset=50` whose very first
+mix succeeds persists THAT mix as the cursor, and a later `resume=true`
+continues from there — silently skipping mixes 0–49, which this `offset=50`
+run never touched at all. Pick one scheme (hand-sized `offset` batches, or
+`resume=true`) for a given pass over the backlog and stick to it.
+
+Combined with the already-tagged skip
+above, an interrupted run can simply be re-issued — as a fresh call
+(previously-touched files are skipped cheaply) or with `resume=true` to
+pick up exactly where the cursor left off — rather than watched through
+hand-sized batches:
+
+```bash
+curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&limit=20"
+curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&resume=true"
+```
+
+The `candidates` count returned by the POST reflects `limit`/`offset` (or
+the resolved resume cursor when `resume=true`) — it's the number of mixes
+this call is actually about to touch, not the size of the whole backlog.
+
+**Orphaned staging cleanup.** After selecting the run's candidates but before
+touching any of them, every retag run sweeps every `.fadeout-tagging/`
+staging directory those candidates could actually be using
+(`source_tagger.sweep_staging`, `older_than_hours=6.0` — this is a fixed
+threshold, not currently exposed as a request parameter) and removes
+anything older than that threshold; a file younger than the threshold is
+left alone because it may belong to a run currently in flight. Sweep
+targets are the union of each watch root's own top-level `.fadeout-tagging/`
+directory (the flat-layout case) and `dirname(<candidate's source>)/
+.fadeout-tagging/` for every candidate this call selected, since a source
+in a subdirectory of a watch root (e.g. `<watch_audio>/2023/foo.flac`)
+stages its own copy alongside itself, not at the watch root. This sweep
+also honours `dry_run` — a bare POST reports what it would remove without
+removing anything, matching every other part of a dry run. The sweep only
+ever acts on a directory whose basename is exactly `.fadeout-tagging` and
+that lives inside an allowed watch root — anything else is refused outright
+rather than swept. What it reclaimed (or, under a dry run, would have
+reclaimed) is logged as a `retag_staging_swept` activity event before this
+run's candidates are actually touched — after they're selected (selection
+is what determines the sweep targets), but before rename/tag runs on a
+single one of them.
+
+**Every backfill run is auditable after the fact**, independent of the
+in-memory `GET /retag/status` state a process restart wipes. Durable events
+go through the activity log: `retag_staging_swept` before the run starts,
+one `retag_run_started` with the run's parameters and candidate count, one
+`retag_mix_processed` per mix carrying both the rename and tag outcome AND
+reason (logged at `error` when either failed, `info` otherwise), and a
+closing `retag_run_completed` with the run's summary (logged at `warn` when
+the summary contains any failures, or any tag skip whose reason wasn't
+"already tagged" — the only thing that tells apart "every file was already
+tagged" from "every file was skipped for want of disk", which otherwise
+both show up identically as `{skipped: N}`; `info` otherwise). If the run
+crashes outright, a `retag_run_failed` event is emitted before the
+exception propagates, so a crashed run is distinguishable in the durable
+log from one that is simply still in progress. Activity-log emits are
+best-effort and layered on top — a logging failure can never abort or slow
+the backfill itself.
 
 `GET /retag/status` includes a `summary` — `{ok, skipped, disabled, failed,
 dry_run, unknown}` counts across every rename *and* tag outcome of the run.
