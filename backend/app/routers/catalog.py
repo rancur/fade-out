@@ -925,7 +925,33 @@ async def _persist_retag_progress(
         logger.exception("Failed to persist retag progress cursor")
 
 
-async def _run_retag(dry_run: bool, limit: Optional[int], offset: int = 0) -> None:
+async def _emit_retag_activity(
+    level: str, event: str, message: str, **kwargs: Any
+) -> None:
+    """Best-effort activity-log emit for the retag backfill.
+
+    Durable per-mix outcomes for a run that rewrites ~498 GB of irreplaceable
+    FLAC masters must not disappear when the process restarts -- that's the
+    entire point of Task 3. But losing this log line is a far better outcome
+    than losing the run itself, so this is wrapped exactly like every other
+    best-effort activity emit in this codebase (see ``handlers._emit_activity``,
+    ``auth._emit_auth``): a broken activity log must never abort the backfill.
+    ``activity_log.log`` already never raises by its own contract, but this
+    wrapper does not rely on that -- it catches independently, so a future
+    change to ``activity_log`` (or a test double that raises) can't take the
+    backfill down with it.
+    """
+    try:
+        from app.services import activity_log
+
+        await activity_log.log(level, event, message, **kwargs)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("retag activity emit failed for %s", event, exc_info=True)
+
+
+async def _run_retag(
+    dry_run: bool, limit: Optional[int], offset: int = 0, resume: bool = False
+) -> None:
     """Rename then tag source files for each completed-pipeline mix.
 
     ``source_renamer.rename_sources_for_mix`` / ``source_tagger.tag_sources_for_mix``
@@ -935,6 +961,15 @@ async def _run_retag(dry_run: bool, limit: Optional[int], offset: int = 0) -> No
     module-level ``_retag_state`` dict polled by ``GET /retag/status``, and a
     resume cursor is persisted to ``AppSettings.settings_json`` after each
     mix (see ``_persist_retag_progress``).
+
+    Durable outcomes also go to the activity log (``app.services.activity_log``),
+    which is what survives a process restart when ``_retag_state`` does not:
+    one ``retag_run_started`` event with the run parameters and candidate
+    total, exactly one ``retag_mix_processed`` event per mix carrying its
+    ``mix_id`` and both the rename and tag status (at ``error`` level when
+    either failed, ``info`` otherwise), and one ``retag_run_completed`` event
+    with the final summary. Every emit goes through ``_emit_retag_activity``,
+    which is best-effort -- an activity-log failure can never abort this run.
     """
     from app.database import async_session_factory
     from app.services import source_renamer, source_tagger
@@ -951,6 +986,20 @@ async def _run_retag(dry_run: bool, limit: Optional[int], offset: int = 0) -> No
         summary = _empty_retag_summary()
         _retag_state["summary"] = summary
 
+        await _emit_retag_activity(
+            "info",
+            "retag_run_started",
+            f"Retag backfill started: {len(mix_ids)} candidate mix(es) "
+            f"(dry_run={dry_run}, limit={limit}, offset={offset}, resume={resume}).",
+            context={
+                "dry_run": dry_run,
+                "limit": limit,
+                "offset": offset,
+                "resume": resume,
+                "candidates": len(mix_ids),
+            },
+        )
+
         for mix_id in mix_ids:
             rename = await source_renamer.rename_sources_for_mix(
                 mix_id, reason="retag_backfill", dry_run=dry_run
@@ -965,10 +1014,33 @@ async def _run_retag(dry_run: bool, limit: Optional[int], offset: int = 0) -> No
             tag_status = tag.get("status")
             for status in (rename_status, tag_status):
                 summary[status if status in summary else "unknown"] += 1
+
+            mix_level = "error" if "failed" in (rename_status, tag_status) else "info"
+            await _emit_retag_activity(
+                mix_level,
+                "retag_mix_processed",
+                f"Retag mix {mix_id}: rename={rename_status}, tag={tag_status}.",
+                mix_id=mix_id,
+                context={"rename_status": rename_status, "tag_status": tag_status},
+            )
+
             _retag_state["processed"] += 1
             await _persist_retag_progress(
                 mix_id, _retag_state["processed"], _retag_state["total"], dry_run
             )
+
+        await _emit_retag_activity(
+            "warn" if summary.get("failed") else "info",
+            "retag_run_completed",
+            f"Retag backfill completed: {_retag_state['processed']}/"
+            f"{_retag_state['total']} mixes processed.",
+            context={
+                "summary": dict(summary),
+                "processed": _retag_state["processed"],
+                "total": _retag_state["total"],
+                "dry_run": dry_run,
+            },
+        )
     finally:
         _retag_state["running"] = False
 
@@ -1023,7 +1095,9 @@ async def catalog_retag(
             status_code=409, detail="A retag run is already in progress."
         )
 
-    _retag_task = _spawn("retag", _run_retag(dry_run, limit, effective_offset))
+    _retag_task = _spawn(
+        "retag", _run_retag(dry_run, limit, effective_offset, resume)
+    )
     return {
         "started": True,
         "dry_run": dry_run,
