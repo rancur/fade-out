@@ -110,7 +110,12 @@ class TestBareRequestIsSafe:
         # run touches nothing, and await the task before returning so it
         # can't leak into the next test.
         async def fake_rename(mix_id, *, reason, dry_run=False):
-            return {"status": "dry_run", "renamed": [], "skipped": []}
+            # Real shape (source_renamer.rename_sources_for_mix): no
+            # top-level "status" key -- see _rename_outcome_status.
+            return {
+                "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                "renamed": [], "skipped": [], "errors": [],
+            }
 
         async def fake_tag(mix_id, *, reason, dry_run=False):
             return {"status": "dry_run", "actions": [], "reason": reason}
@@ -143,7 +148,12 @@ class TestDryRunCallsHelpersWithDryRunTrue:
 
         async def fake_rename(mix_id, *, reason, dry_run=False):
             rename_calls.append({"mix_id": mix_id, "reason": reason, "dry_run": dry_run})
-            return {"status": "dry_run", "renamed": [], "skipped": []}
+            # Real shape (source_renamer.rename_sources_for_mix): no
+            # top-level "status" key -- see _rename_outcome_status.
+            return {
+                "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                "renamed": [], "skipped": [], "errors": [],
+            }
 
         async def fake_tag(mix_id, *, reason, dry_run=False):
             tag_calls.append({"mix_id": mix_id, "reason": reason, "dry_run": dry_run})
@@ -185,7 +195,12 @@ class TestSingleFlight:
         async def slow_rename(mix_id, *, reason, dry_run=False):
             entered.set()
             await release.wait()
-            return {"status": "dry_run", "renamed": [], "skipped": []}
+            # Real shape (source_renamer.rename_sources_for_mix): no
+            # top-level "status" key -- see _rename_outcome_status.
+            return {
+                "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                "renamed": [], "skipped": [], "errors": [],
+            }
 
         monkeypatch.setattr(renamer_mod, "rename_sources_for_mix", slow_rename)
 
@@ -239,7 +254,12 @@ class TestSingleFlight:
         async def fake_rename(mix_id, *, reason, dry_run=False):
             rename_calls.append(mix_id)
             await hold.wait()
-            return {"status": "dry_run", "renamed": [], "skipped": []}
+            # Real shape (source_renamer.rename_sources_for_mix): no
+            # top-level "status" key -- see _rename_outcome_status.
+            return {
+                "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                "renamed": [], "skipped": [], "errors": [],
+            }
 
         async def fake_tag(mix_id, *, reason, dry_run=False):
             return {"status": "dry_run", "actions": [], "reason": reason}
@@ -289,7 +309,12 @@ class TestOnlyCompletedMixesAreCandidates:
 
         async def fake_rename(mix_id, *, reason, dry_run=False):
             seen_mix_ids.append(mix_id)
-            return {"status": "dry_run", "renamed": [], "skipped": []}
+            # Real shape (source_renamer.rename_sources_for_mix): no
+            # top-level "status" key -- see _rename_outcome_status.
+            return {
+                "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                "renamed": [], "skipped": [], "errors": [],
+            }
 
         async def fake_tag(mix_id, *, reason, dry_run=False):
             return {"status": "dry_run", "actions": [], "reason": reason}
@@ -319,7 +344,17 @@ class TestRetagSummary:
         outcome so GET /api/catalog/retag/status cannot show a run that did
         nothing (e.g. every mix coming back "disabled" because the setting
         is off) as if it had succeeded -- processed == total alone can't
-        tell the two apart."""
+        tell the two apart.
+
+        The renamer stubs below use ``rename_sources_for_mix``'s REAL return
+        shape (``{mix_id, reason, dry_run, renamed, skipped, errors}``, per
+        ``source_renamer.py`` -- there is no top-level "status" key at all).
+        Earlier versions of this test used ``{"status": "ok", ...}`` stubs,
+        a shape the real function never returns, which made this test green
+        against fiction: it could never have caught the bug where the
+        summary silently dropped every renamer outcome because
+        ``outcome.get("status")`` was always None.
+        """
         import app.services.source_renamer as renamer_mod
         import app.services.source_tagger as tagger_mod
 
@@ -327,10 +362,29 @@ class TestRetagSummary:
         await _make_mix(id="retag-disabled", pipeline_status="completed")
         await _make_mix(id="retag-failed", pipeline_status="completed")
 
+        def _rename_result(mix_id, **overrides):
+            base = {
+                "mix_id": mix_id, "reason": "retag_backfill", "dry_run": False,
+                "renamed": [], "skipped": [], "errors": [],
+            }
+            base.update(overrides)
+            return base
+
         rename_outcomes = {
-            "retag-ok": {"status": "ok", "renamed": [], "skipped": []},
-            "retag-disabled": {"status": "disabled", "renamed": [], "skipped": []},
-            "retag-failed": {"status": "failed", "renamed": [], "skipped": []},
+            # renamed non-empty -> derived status "ok"
+            "retag-ok": _rename_result(
+                "retag-ok",
+                renamed=[{"kind": "audio", "from": "/a.flac", "to": "/b.flac"}],
+            ),
+            # a skipped entry with reason "disabled" -> derived status "disabled"
+            "retag-disabled": _rename_result(
+                "retag-disabled", skipped=[{"reason": "disabled"}],
+            ),
+            # errors non-empty -> derived status "failed"
+            "retag-failed": _rename_result(
+                "retag-failed",
+                errors=[{"kind": "audio", "reason": "os_error", "path": "/c.flac", "error": "boom"}],
+            ),
         }
         tag_outcomes = {
             "retag-ok": {"status": "ok", "actions": [], "reason": "ok"},
@@ -355,12 +409,56 @@ class TestRetagSummary:
 
         # The summary must be derivable from -- and match -- the per-mix
         # results it was built alongside, not just plausible-looking counts.
-        expected = {"ok": 0, "skipped": 0, "disabled": 0, "failed": 0, "dry_run": 0}
+        # The renamer outcome has no "status" key of its own, so its status
+        # must go through the same derivation _run_retag itself uses.
+        expected = {status: 0 for status in catalog._RETAG_SUMMARY_STATUSES}
         for r in state["results"]:
-            expected[r["rename"]["status"]] += 1
-            expected[r["tag"]["status"]] += 1
+            expected[catalog._rename_outcome_status(r["rename"])] += 1
+            tag_status = r["tag"]["status"]
+            expected[tag_status if tag_status in expected else "unknown"] += 1
 
         assert state["summary"] == expected
         assert state["summary"] == {
             "ok": 2, "skipped": 1, "disabled": 2, "failed": 1, "dry_run": 0,
+            "unknown": 0,
         }
+
+        # The totals must always reconcile: every mix contributes exactly
+        # one rename outcome and one tag outcome, and an unrecognised status
+        # must be bucketed into "unknown" rather than silently dropped, so
+        # this sum can never silently fall short of 2 * processed.
+        assert sum(state["summary"].values()) == 2 * state["processed"]
+
+    async def test_unrecognised_status_is_bucketed_as_unknown(self, prepared_db, monkeypatch):
+        """An outcome shape this summary doesn't recognise must be counted,
+        not dropped -- the exact failure mode this whole item exists to
+        close off. Regression guard: with a naive ``outcome.get("status")``
+        read directly against the renamer's real return shape (no top-level
+        "status" key), this would previously vanish without incrementing
+        anything at all."""
+        import app.services.source_renamer as renamer_mod
+        import app.services.source_tagger as tagger_mod
+
+        await _make_mix(id="retag-weird", pipeline_status="completed")
+
+        async def fake_rename(mix_id, *, reason, dry_run=False):
+            return {
+                "mix_id": mix_id, "reason": reason, "dry_run": dry_run,
+                "renamed": [], "skipped": [], "errors": [],
+            }
+
+        async def fake_tag(mix_id, *, reason, dry_run=False):
+            # A status this summary was never taught about.
+            return {"status": "quarantined", "actions": [], "reason": "??"}
+
+        monkeypatch.setattr(renamer_mod, "rename_sources_for_mix", fake_rename)
+        monkeypatch.setattr(tagger_mod, "tag_sources_for_mix", fake_tag)
+
+        await catalog._run_retag(dry_run=False, limit=None)
+
+        state = catalog._retag_state
+        # rename -> "skipped" (nothing renamed, nothing errored, nothing
+        # disabled); tag -> "unknown" (unrecognised status).
+        assert state["summary"]["skipped"] == 1
+        assert state["summary"]["unknown"] == 1
+        assert sum(state["summary"].values()) == 2 * state["processed"]

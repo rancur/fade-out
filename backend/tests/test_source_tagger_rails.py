@@ -98,6 +98,15 @@ async def test_dry_run_touches_nothing(monkeypatch):
     # the one its name claims (duplicating test_dry_run_touches_nothing's
     # sibling, test_dry_run_reports_a_missing_source_instead_of_a_false_green).
     monkeypatch.setattr(source_tagger.os.path, "isfile", lambda p: True)
+    # `isfile` alone is not enough: with it patched but `_has_free_space`
+    # untouched, `_has_free_space` calls `os.path.getsize` on a path that
+    # still doesn't exist on the test machine, that raises OSError, and the
+    # function's own `except OSError: return False` quietly reports
+    # insufficient space -- landing this test on the insufficient-free-space
+    # branch instead of the "no changes made" branch its name claims to
+    # exercise. Matches the adjacent
+    # test_dry_run_reports_disabled_setting_plainly, which patches both.
+    monkeypatch.setattr(source_tagger, "_has_free_space", lambda p: True)
 
     def boom(*a, **k):
         raise AssertionError("dry run must not write")
@@ -106,6 +115,7 @@ async def test_dry_run_touches_nothing(monkeypatch):
     result = await source_tagger.tag_sources_for_mix("m1", reason="test", dry_run=True)
     assert result["status"] == "dry_run"
     assert result["actions"], "a dry run should still report what it would do"
+    assert result["reason"] == "no changes made"
 
 
 @pytest.mark.asyncio

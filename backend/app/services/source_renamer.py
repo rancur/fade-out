@@ -410,8 +410,14 @@ async def rename_sources_for_mix(
     """Rename this mix's sources to match its title and persist the new paths.
 
     Best-effort by contract: this never raises and never fails a pipeline run.
-    ``dry_run`` reports the plan without touching disk (and ignores the setting,
-    so it works as a preview before the feature is switched on).
+    ``dry_run`` reports the plan without touching disk, and it does not skip
+    on the setting being off -- ``rename_source_files`` is evaluated
+    unconditionally (mirroring how ``source_tagger`` reads its own flag) and
+    surfaced in the result's ``enabled`` key, so a dry run works as a preview
+    before the feature is switched on AND tells the caller whether a real run
+    right now would actually do anything or come back "disabled" for every
+    mix -- the same signal source_tagger's dry run already gives for
+    ``tag_source_files``.
 
     The session discipline matters. SQLite takes its single write lock at the
     first flush and holds it to COMMIT, and an ``os.rename`` against a sleeping
@@ -423,6 +429,7 @@ async def rename_sources_for_mix(
         "mix_id": mix_id,
         "reason": reason,
         "dry_run": dry_run,
+        "enabled": False,
         "renamed": [],
         "skipped": [],
         "errors": [],
@@ -430,7 +437,10 @@ async def rename_sources_for_mix(
     try:
         from app.services import app_config
 
-        if not dry_run and not bool(await app_config.resolve("rename_source_files")):
+        enabled = bool(await app_config.resolve("rename_source_files"))
+        result["enabled"] = enabled
+
+        if not dry_run and not enabled:
             result["skipped"].append({"reason": "disabled"})
             return result
 

@@ -288,12 +288,16 @@ is therefore done out-of-place and promoted in a fixed order:
    directory (same filesystem, and invisible to the watcher's non-recursive
    directory listing),
 2. write the tags and cover art into the copy,
-3. re-read the copy to confirm it still parses as valid FLAC, that its size
-   is larger than the source (a truncated write — e.g. the disk filling
-   mid-copy — still parses and still reports the original's full duration,
-   since that duration comes from a header field a short write leaves
-   untouched; only a size check catches it), and, when a duration is known
-   for the mix, that it still matches,
+3. re-read the copy to confirm it still parses as valid FLAC, that its audio
+   payload (everything past the last metadata block) is at least as large as
+   the source's (a truncated write — e.g. the disk filling mid-copy — still
+   parses and still reports the original's full duration, since that
+   duration comes from a header field a short write leaves untouched; only a
+   size check catches it — and it has to be a payload-size check, not a
+   total-file-size check, because a healthy re-tag of an already-tagged file
+   writes its new metadata into the existing padding block and doesn't grow
+   the file at all), and, when a duration is known for the mix, that it
+   still matches,
 4. register the copy's new hash with the file watcher,
 5. only then move it into place with an atomic rename, followed by an fsync
    of the containing directory so a crash right after promotion can't lose
@@ -317,11 +321,17 @@ the copy and any cleanup running (a killed process, an OS-level crash) can
 leave a multi-gigabyte orphan behind. Check it after any run that didn't
 finish cleanly.
 
-**Re-tagging is not idempotent.** There's no "already tagged, skip it"
-check — a mix that already has all its tags written gets the exact same
-full out-of-place rewrite on every run that touches it. Running the backfill
-twice over the same mixes redoes the full multi-gigabyte rewrite twice, not
-zero.
+**Re-tagging is not idempotent, but it is safe.** There's no "already
+tagged, skip it" check — a mix that already has all its tags written gets
+the exact same full out-of-place rewrite on every run that touches it, and
+that rewrite succeeds: once a file already carries the 64 KB padding block
+this module adds, mutagen writes new metadata *into* that padding, so a
+healthy re-tag's total file size doesn't change at all. The truncation guard
+accounts for this — it compares the audio payload (everything past the last
+metadata block), not total file size, so a byte-identical-size re-tag is not
+mistaken for a truncated write. Running the backfill twice over the same
+mixes redoes the full multi-gigabyte rewrite twice, not zero — that's wasted
+I/O and time on an irreplaceable file, not a failure.
 
 To backfill renames and tags across already-published mixes:
 
@@ -330,18 +340,29 @@ curl -X POST "$FADEOUT/api/catalog/retag"
 ```
 
 **Both `tag_source_files` and `rename_source_files` must be turned on** for a
-real (`dry_run=false`) backfill run to actually do anything — each mix's
-result comes back `"status": "disabled"` for whichever one is off. Since both
-default to OFF, it's easy to run a green dry-run pre-flight and then have the
-real run silently do nothing; check `GET /retag/status`'s `summary` (below)
-before trusting a run.
+real (`dry_run=false`) backfill run to actually do anything. When a flag is
+off, that half comes back as a no-op, but the two report it in different
+shapes: the tagger's result carries `"status": "disabled"` directly; the
+renamer's result has no top-level `status` key at all (its shape is
+`{mix_id, reason, dry_run, enabled, renamed, skipped, errors}`) and instead
+carries `"enabled": false` plus `"skipped": [{"reason": "disabled"}]`.
+`GET /retag/status`'s `summary` (below) normalizes both into the same
+`disabled` bucket so you don't need to know the shape difference yourself —
+check it before trusting a run. Since both settings default to OFF, it's
+easy to run a green dry-run pre-flight and then have the real run silently
+do nothing.
 
 `dry_run` **defaults to true**, so a bare POST is the safe, report-only form —
 per mix, it reports whether the source file exists, whether there is
-sufficient free space, and whether each of the two settings is actually on
-(a dry run with a setting off says so directly instead of claiming it would
-tag), without touching anything. Pass `dry_run=false` to actually rewrite
-files, and poll progress while it runs:
+sufficient free space, and whether each of the two settings is actually on,
+via an `enabled` field in each half's result, without touching anything. The
+two halves differ here too: the tagger's dry run short-circuits with an
+explicit "`tag_source_files is off`" reason when its own flag is disabled;
+the renamer's dry run does **not** short-circuit — it always reports the
+rename plan it would execute (`planned`) regardless of the flag, and relies
+on its `enabled` field to tell you separately whether a real run would
+actually apply that plan. Pass `dry_run=false` to actually rewrite files, and
+poll progress while it runs:
 
 ```bash
 curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false"
@@ -349,14 +370,24 @@ curl "$FADEOUT/api/catalog/retag/status"
 ```
 
 Pass `limit=<n>` to cap how many completed mixes a single run touches — e.g.
-`curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&limit=5"` — to run the
-backfill in supervised batches instead of all ~80 mixes (~498 GB) at once.
+`curl -X POST "$FADEOUT/api/catalog/retag?dry_run=false&limit=5"`. This caps
+a *single* run; it does not paginate. `_run_retag`'s selection query has no
+`ORDER BY` and applies no offset, so calling it again with the same `limit`
+is not guaranteed to reach a different batch of mixes rather than
+re-selecting the same ones. Don't rely on repeated limited calls to sweep the
+full backlog in "supervised batches" — use `limit` to bound the size of one
+run (e.g. a smoke test before committing to all ~80 mixes / ~498 GB), and run
+without it (or with a limit covering everything) once you're ready to cover
+the full completed-mix backlog in a single pass.
 The `candidates` count returned by the POST already reflects `limit`.
 
 `GET /retag/status` includes a `summary` — `{ok, skipped, disabled, failed,
-dry_run}` counts across every rename *and* tag outcome of the run — so a run
-where everything came back `disabled` can't be mistaken for one that
-actually did the work; `processed == total` alone can't tell those apart.
+dry_run, unknown}` counts across every rename *and* tag outcome of the run.
+Any outcome shape the summary doesn't recognise lands in `unknown` rather
+than being silently dropped, so `sum(summary.values())` always equals
+`2 * processed` — a run where everything came back `disabled` can't be
+mistaken for one that actually did the work; `processed == total` alone
+can't tell those apart.
 
 A retag run started while one is already in progress gets `409` rather than
 starting a second concurrent pass over the same files.

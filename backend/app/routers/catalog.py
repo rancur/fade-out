@@ -37,7 +37,7 @@ _regen_thumbs_task: Optional[asyncio.Task] = None
 _playlists_task: Optional[asyncio.Task] = None
 _retag_task: Optional[asyncio.Task] = None
 
-_RETAG_SUMMARY_STATUSES = ("ok", "skipped", "disabled", "failed", "dry_run")
+_RETAG_SUMMARY_STATUSES = ("ok", "skipped", "disabled", "failed", "dry_run", "unknown")
 
 
 def _empty_retag_summary() -> Dict[str, int]:
@@ -46,10 +46,15 @@ def _empty_retag_summary() -> Dict[str, int]:
 
 # Live progress for the retag backfill, polled by GET /retag/status. Reset at
 # the start of each run by ``_run_retag``. ``summary`` tallies every rename
-# AND tag outcome across the run (two entries per mix), so a run in which
-# every mix came back "disabled" (the setting is off) cannot be mistaken for
-# one that actually did the work -- ``processed == total`` alone can't tell
-# the two apart.
+# AND tag outcome across the run (two entries per mix -- one derived from the
+# renamer's outcome via ``_rename_outcome_status``, since it has no top-level
+# ``status`` key of its own; one read straight off the tagger's), so a run in
+# which every mix came back "disabled" (the setting is off) cannot be
+# mistaken for one that actually did the work -- ``processed == total`` alone
+# can't tell the two apart. Any status this summary doesn't recognise lands
+# in "unknown" rather than being dropped, so ``sum(summary.values())`` always
+# equals ``2 * processed`` and a silently-changed outcome shape shows up as a
+# nonzero "unknown" count instead of quietly vanishing.
 _retag_state: Dict[str, Any] = {
     "running": False,
     "processed": 0,
@@ -800,6 +805,35 @@ async def trigger_improve(body: ImproveBody):
 # must be the safe, report-only form, never the destructive one.
 
 
+def _rename_outcome_status(outcome: Dict[str, Any]) -> str:
+    """Derive a tag-style status label from ``rename_sources_for_mix``'s
+    actual return shape.
+
+    Unlike ``tag_sources_for_mix``, the renamer has no top-level ``status``
+    key at all -- its result is ``{mix_id, reason, dry_run, renamed, skipped,
+    errors, ...}`` (see ``source_renamer.rename_sources_for_mix``). Reading
+    ``outcome.get("status")`` on it is always ``None``, which used to make
+    every rename outcome fall out of the summary silently. This derives an
+    equivalent status from the fields the renamer actually populates:
+
+    - any ``errors`` entry        -> "failed"
+    - a ``skipped`` entry whose ``reason`` is ``"disabled"`` -> "disabled"
+    - a non-empty ``renamed`` list -> "ok"
+    - otherwise                   -> "skipped" (covers dry runs, no-title /
+      missing-mix skips, and refusals that aren't the disabled-setting case)
+    """
+    if outcome.get("errors"):
+        return "failed"
+    if any(
+        isinstance(entry, dict) and entry.get("reason") == "disabled"
+        for entry in (outcome.get("skipped") or [])
+    ):
+        return "disabled"
+    if outcome.get("renamed"):
+        return "ok"
+    return "skipped"
+
+
 async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
     """Rename then tag source files for each completed-pipeline mix.
 
@@ -837,10 +871,10 @@ async def _run_retag(dry_run: bool, limit: Optional[int]) -> None:
             _retag_state["results"].append(
                 {"mix_id": mix_id, "rename": rename, "tag": tag}
             )
-            for outcome in (rename, tag):
-                status = outcome.get("status")
-                if status in summary:
-                    summary[status] += 1
+            rename_status = _rename_outcome_status(rename)
+            tag_status = tag.get("status")
+            for status in (rename_status, tag_status):
+                summary[status if status in summary else "unknown"] += 1
             _retag_state["processed"] += 1
     finally:
         _retag_state["running"] = False
