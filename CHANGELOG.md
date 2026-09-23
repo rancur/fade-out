@@ -15,12 +15,24 @@
   live at the start of the file, so tagging changes a file's dedupe hash. The
   write is therefore done out-of-place: the file is copied into a hidden
   `.fadeout-tagging/` staging directory inside the watch folder, tagged
-  there, re-read to confirm it still parses as FLAC (and that its duration
-  matches, when one is known), and only THEN is its new hash registered with
-  the file watcher — before the tagged copy is moved into place with an
+  there, verified, and only THEN is its new hash registered with the file
+  watcher — before the tagged copy is fsynced and moved into place with an
   atomic rename. Registering before promoting is the safety property: the
   file is never visible to the watcher while its hash is unknown, so a
   tagged file can never be re-ingested and re-uploaded. Do not reorder this.
+- Verification compares the AUDIO PAYLOAD size, not the total file size and
+  not the reported duration. A FLAC's duration comes from its `STREAMINFO`
+  header, which a copy carries over verbatim — a file with half its audio
+  deleted still parses cleanly and still reports the full original duration,
+  so a parse-and-duration check would promote a truncated write over an
+  irreplaceable master. The staged copy's payload must be at least as large
+  as the source's. Total file size does not work either: re-tagging a file
+  that already has padding writes into that padding and leaves the size
+  byte-identical, which a naive size check would flag as corruption on a
+  perfectly healthy file.
+- The staged file is fsynced before the rename and its directory fsynced
+  after, so a power loss cannot leave the directory entry pointing at
+  unwritten blocks with the original already gone.
 - These FLACs carry no padding (audio frames measured to begin at byte 86),
   so the first tag write on a file is always a full rewrite; 64 KB of
   padding is added so later edits happen in place.
