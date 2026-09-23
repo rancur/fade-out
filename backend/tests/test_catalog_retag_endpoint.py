@@ -98,10 +98,26 @@ def test_retag_defaults_to_dry_run_signature():
 
 
 class TestBareRequestIsSafe:
-    async def test_bare_post_reports_dry_run_true_over_http(self, client):
+    async def test_bare_post_reports_dry_run_true_over_http(self, client, monkeypatch):
         """POST with no body/params at all must report dry_run: true in the
         actual HTTP response -- the thing the owner reads as the go/no-go
         signal, not just the Python default."""
+        import app.services.source_renamer as renamer_mod
+        import app.services.source_tagger as tagger_mod
+
+        # The route spawns a real background _run_retag against the real DB.
+        # Patch the helpers (as every other test in this file does) so that
+        # run touches nothing, and await the task before returning so it
+        # can't leak into the next test.
+        async def fake_rename(mix_id, *, reason, dry_run=False):
+            return {"status": "dry_run", "renamed": [], "skipped": []}
+
+        async def fake_tag(mix_id, *, reason, dry_run=False):
+            return {"status": "dry_run", "actions": [], "reason": reason}
+
+        monkeypatch.setattr(renamer_mod, "rename_sources_for_mix", fake_rename)
+        monkeypatch.setattr(tagger_mod, "tag_sources_for_mix", fake_tag)
+
         resp = await client.post("/api/catalog/retag")
         assert resp.status_code == 202
         body = resp.json()
@@ -109,8 +125,10 @@ class TestBareRequestIsSafe:
         assert body["started"] is True
         assert "candidates" in body
 
+        await asyncio.wait_for(catalog._retag_task, timeout=5)
 
-class TestDryRunPerformsNoWrites:
+
+class TestDryRunCallsHelpersWithDryRunTrue:
     async def test_dry_run_calls_both_helpers_with_dry_run_true(self, prepared_db, monkeypatch):
         """Drive the actual background coroutine (not just the route) and
         prove BOTH the renamer and tagger are invoked with dry_run=True, so a
