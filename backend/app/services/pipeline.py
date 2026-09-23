@@ -1212,6 +1212,13 @@ class PipelineOrchestrator:
             await source_renamer.rename_sources_for_mix(
                 mix_id, reason="pipeline_complete"
             )
+
+            # After renaming, so the tags land on the final path. Best-effort by
+            # the same contract as renaming: this returns a status dict and
+            # never raises, so it cannot fail a completed run.
+            from app.services import source_tagger
+
+            await source_tagger.tag_sources_for_mix(mix_id, reason="pipeline_complete")
         except Exception:  # pragma: no cover - defensive
             logger.exception("Source rename failed for mix %s", mix_id)
 
