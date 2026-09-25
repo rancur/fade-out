@@ -80,6 +80,13 @@ def _patch_httpx(monkeypatch):
     yield
 
 
+async def _noop_persist(*_args) -> None:
+    """Stand-in ``on_tokens_refreshed`` for tests that need a persister
+    attached (so the no-persister refresh guard doesn't fire) but don't
+    care what happens to the rotated pair."""
+    return None
+
+
 def _uploader(**kwargs) -> SoundCloudUploader:
     return SoundCloudUploader(
         db_settings_json={
@@ -152,11 +159,31 @@ class TestTokenRotationPersistence:
         # Refresh still succeeds; persistence is best-effort.
         assert await up._refresh_access_token() == "new-access"
 
-    async def test_refresh_without_callback_still_works(self):
+    async def test_refresh_without_callback_raises_by_default(self):
+        """2026-09-24 incident: a bare uploader with no persister silently
+        rotated-and-discarded a refresh token when this used to "just work".
+        Refreshing with no callback and no explicit opt-in must now refuse
+        outright instead of destroying the credential.
+
+        (This replaces the old ``test_refresh_without_callback_still_works``,
+        which asserted exactly the behavior that destroyed the credential.)
+        """
         FakeAsyncClient.post_response = FakeResp(
             200, json_data={"access_token": "new-access", "refresh_token": "new-refresh"}
         )
         up = _uploader()
+        with pytest.raises(sc_mod.SoundCloudUnpersistedRefreshError):
+            await up._refresh_access_token()
+        # And the network call this would have made never happened.
+        assert FakeAsyncClient.last_post is None
+
+    async def test_refresh_without_callback_works_with_explicit_opt_in(self):
+        """The escape hatch for a caller who has consciously decided losing
+        the rotated token is acceptable (e.g. a one-off script)."""
+        FakeAsyncClient.post_response = FakeResp(
+            200, json_data={"access_token": "new-access", "refresh_token": "new-refresh"}
+        )
+        up = _uploader(allow_unpersisted_refresh=True)
         assert await up._refresh_access_token() == "new-access"
         assert up._refresh_token == "new-refresh"
 
@@ -357,7 +384,10 @@ class TestAuthFailureSurfacing:
             401, json_data={"error_code": "invalid_grant"}, text="invalid_grant"
         )
 
-        up = _uploader()
+        # A persister is attached (irrelevant to this test's assertions) so
+        # the refresh grant actually gets exercised instead of being refused
+        # by the no-persister guard — see TestUnpersistedRefreshGuard.
+        up = _uploader(on_tokens_refreshed=_noop_persist)
         up._access_token = "stale-access"
 
         with pytest.raises(sc_mod.SoundCloudAuthError) as exc_info:
@@ -371,11 +401,15 @@ class TestAuthFailureSurfacing:
 
     async def test_password_grant_rejection_is_recorded(self):
         FakeAsyncClient.get_response = FakeResp(401)
+        # invalid_client is a genuine, non-retryable grant rejection (unlike
+        # e.g. unsupported_grant_type, which is a protocol/config mismatch —
+        # not proof the operator's credential was revoked, so it is no
+        # longer treated as equivalent to "needs re-authorization").
         FakeAsyncClient.post_response = FakeResp(
-            400, json_data={"error_code": "unsupported_grant_type"}
+            400, json_data={"error_code": "invalid_client"}
         )
 
-        up = _uploader()
+        up = _uploader(on_tokens_refreshed=_noop_persist)
         up._access_token = "stale-access"
         up._email = "dj@example.com"
         up._password = "hunter2"
@@ -383,7 +417,7 @@ class TestAuthFailureSurfacing:
         with pytest.raises(sc_mod.SoundCloudAuthError) as exc_info:
             await up._ensure_access_token()
 
-        assert "unsupported_grant_type" in str(exc_info.value)
+        assert "invalid_client" in str(exc_info.value)
         assert any("password grant rejected" in a for a in exc_info.value.attempts)
 
     async def test_browser_fallback_failure_still_reports_the_auth_cause(
@@ -433,3 +467,114 @@ class TestAuthFailureSurfacing:
             await up.upload(str(f), "Mix", "desc", "House", ["house"], None)
 
         assert str(exc_info.value) == "browser exploded"
+
+
+class TestTransientVsFatalClassification:
+    """2026-09-24 incident: SoundCloud's token endpoint returned a 504 and
+    the old code folded that into the same "rejected" bucket as
+    invalid_grant, so the health probe emailed the owner "soundcloud
+    credentials need re-authorisation" for a perfectly healthy credential.
+
+    A 5xx / gateway timeout / connect-or-read timeout from the token
+    endpoint must raise something that is NOT ``SoundCloudAuthError`` (which
+    ``platform_health`` maps to the paging ``dead`` state) — it must be
+    reported as inconclusive, not as a confirmed rejection.
+    """
+
+    async def test_gateway_timeout_yields_transient_not_auth_error(self):
+        FakeAsyncClient.post_response = FakeResp(504, text="Gateway Time-out")
+        up = _uploader(on_tokens_refreshed=_noop_persist)
+        up._access_token = None  # go straight to the refresh grant
+
+        with pytest.raises(sc_mod.SoundCloudTransientError) as exc_info:
+            await up._ensure_access_token()
+
+        assert not isinstance(exc_info.value, sc_mod.SoundCloudAuthError)
+        assert "504" in str(exc_info.value)
+
+    async def test_server_error_yields_transient_not_auth_error(self):
+        FakeAsyncClient.post_response = FakeResp(503, text="Service Unavailable")
+        up = _uploader(on_tokens_refreshed=_noop_persist)
+        up._access_token = None
+
+        with pytest.raises(sc_mod.SoundCloudTransientError):
+            await up._ensure_access_token()
+
+    async def test_connect_timeout_is_not_an_auth_error(self, monkeypatch):
+        """A raised network exception (no HTTP response at all) must not be
+        wrapped into SoundCloudAuthError either."""
+        import httpx as real_httpx
+
+        async def boom(self, url, **kwargs):
+            raise real_httpx.ConnectTimeout("connect timed out")
+
+        monkeypatch.setattr(FakeAsyncClient, "post", boom)
+
+        up = _uploader(on_tokens_refreshed=_noop_persist)
+        up._access_token = None
+
+        with pytest.raises(Exception) as exc_info:
+            await up._ensure_access_token()
+
+        assert not isinstance(exc_info.value, sc_mod.SoundCloudAuthError)
+
+    async def test_invalid_grant_is_still_a_fatal_auth_error(self):
+        """The transient/fatal split must not soften a genuine rejection."""
+        FakeAsyncClient.post_response = FakeResp(
+            401, json_data={"error_code": "invalid_grant"}, text="invalid_grant"
+        )
+        up = _uploader(on_tokens_refreshed=_noop_persist)
+        up._access_token = None
+
+        with pytest.raises(sc_mod.SoundCloudAuthError):
+            await up._ensure_access_token()
+
+
+class TestUnpersistedRefreshGuard:
+    """2026-09-24 incident: a bare ``SoundCloudUploader()`` constructed with
+    no persister, called only to *check* the credential, silently rotated
+    and discarded the refresh token via ``_ensure_access_token()`` — turning
+    a false DEAD alarm into a real outage. Exercising a rotating refresh
+    with no persister attached must now be structurally unreachable unless
+    explicitly opted into.
+    """
+
+    async def test_ensure_access_token_refuses_unpersisted_rotation(self):
+        FakeAsyncClient.post_response = FakeResp(
+            200, json_data={"access_token": "new-access", "refresh_token": "new-refresh"}
+        )
+        up = _uploader()  # no on_tokens_refreshed, no opt-in
+        up._access_token = None  # force straight into the refresh path
+
+        with pytest.raises(sc_mod.SoundCloudUnpersistedRefreshError):
+            await up._ensure_access_token()
+
+        # The whole point: the refresh_token grant must never be spent.
+        assert FakeAsyncClient.last_post is None
+
+    async def test_opt_in_allows_unpersisted_rotation(self):
+        FakeAsyncClient.post_response = FakeResp(
+            200, json_data={"access_token": "new-access", "refresh_token": "new-refresh"}
+        )
+        up = _uploader(allow_unpersisted_refresh=True)
+        up._access_token = None
+
+        token = await up._ensure_access_token()
+        assert token == "new-access"
+
+    async def test_uploader_with_persister_still_refreshes_and_persists(self):
+        FakeAsyncClient.post_response = FakeResp(
+            200, json_data={"access_token": "new-access", "refresh_token": "new-refresh"}
+        )
+        recorded = {}
+
+        async def persist(access_token, refresh_token):
+            recorded["access"] = access_token
+            recorded["refresh"] = refresh_token
+
+        up = _uploader(on_tokens_refreshed=persist)
+        up._access_token = None
+
+        token = await up._ensure_access_token()
+        assert token == "new-access"
+        assert recorded == {"access": "new-access", "refresh": "new-refresh"}
