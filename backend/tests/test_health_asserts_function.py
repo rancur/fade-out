@@ -126,6 +126,44 @@ class TestProbes:
         assert state.state == DEAD
         assert state.credential == "YOUTUBE_REFRESH_TOKEN"
 
+    async def test_soundcloud_probe_reports_unknown_on_transient_failure(
+        self, prepared_db, monkeypatch
+    ):
+        """2026-09-24 incident: a 504 from the token endpoint must be
+        reported as unknown (does not page), not dead (pages a human)."""
+        from app.services import platform_health as ph
+        import app.services.soundcloud_uploader as sc_mod
+
+        async def transient(self):
+            raise sc_mod.SoundCloudTransientError(
+                ["refresh_token grant rejected (504: Gateway Time-out)"]
+            )
+
+        monkeypatch.setattr(sc_mod.SoundCloudUploader, "_ensure_access_token", transient)
+        svc = ph.PlatformHealth()
+        state = await svc._probe_soundcloud({"soundcloud_access_token": "x"})
+
+        assert state.state == UNKNOWN
+        assert "inconclusive" in state.detail
+
+    async def test_youtube_probe_reports_unknown_on_transient_refresh_error(
+        self, prepared_db, monkeypatch
+    ):
+        from app.config import settings
+        from app.services import platform_health as ph
+        import app.services.youtube_uploader as yt_mod
+
+        monkeypatch.setattr(settings, "YOUTUBE_REFRESH_TOKEN", "rt", raising=False)
+
+        def boom(self):
+            raise yt_mod.YouTubeTransientError("504: Gateway Time-out")
+
+        monkeypatch.setattr(yt_mod.YouTubeUploader, "_get_credentials", boom)
+        svc = ph.PlatformHealth()
+        state = await svc._probe_youtube({})
+        assert state.state == UNKNOWN
+        assert "inconclusive" in state.detail
+
 
 class TestHealthEndpoint:
     async def test_health_503s_when_a_credential_is_dead(self, client, monkeypatch):

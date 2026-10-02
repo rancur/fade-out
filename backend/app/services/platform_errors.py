@@ -58,6 +58,34 @@ class PlatformAuthError(RuntimeError):
         super().__init__(message)
 
 
+class PlatformTransientError(RuntimeError):
+    """A platform's auth endpoint failed for a reason that is NOT proof the
+    credential is dead — a 5xx, a gateway timeout, a connect/read timeout, a
+    DNS or network error.
+
+    This is the other half of the 2026-08-12/2026-09-13-style false alarm:
+    ``PlatformAuthError`` means "the grant was rejected, re-authorization is
+    required" and pages a human. This means "the check was inconclusive" and
+    must never be treated the same way — a transient blip on the token
+    endpoint is not a revoked grant, and reporting it as one is exactly the
+    bug that turned a SoundCloud 504 into a false "credentials need
+    re-authorisation" email.
+    """
+
+    platform: str = "unknown"
+
+    def __init__(
+        self,
+        message: str,
+        platform: Optional[str] = None,
+        attempts: Optional[List[str]] = None,
+    ) -> None:
+        if platform:
+            self.platform = platform
+        self.attempts = attempts or []
+        super().__init__(message)
+
+
 def platform_for_step(step_name: str) -> Optional[str]:
     """The platform a pipeline step belongs to, or None for shared steps."""
     for platform in PLATFORMS:

@@ -10,7 +10,7 @@ import httpx
 from playwright.async_api import Page, async_playwright
 
 from app.config import settings
-from app.services.platform_errors import PlatformAuthError
+from app.services.platform_errors import PlatformAuthError, PlatformTransientError
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,36 @@ UPLOAD_TIMEOUT = 3600  # large uploads on home upstream need well over 10 min
 # streaming anyway, and downloads are disabled.
 API_MAX_UPLOAD_BYTES = 450 * 1024 * 1024
 TRANSCODE_BITRATE = "320k"
+
+# OAuth error codes that mean the GRANT ITSELF was rejected — re-authorization
+# is the only fix. Anything else from the token endpoint (a 5xx, a gateway
+# timeout, an unrecognized 4xx such as a malformed request or a deprecated
+# grant type) is NOT proof the credential is dead; it means the check was
+# inconclusive. Deliberately a narrow allowlist rather than "anything that
+# isn't 2xx": on 2026-08-12 a 504 from this exact endpoint was folded into
+# the same bucket as invalid_grant and emailed the owner as a revoked grant
+# when the credential was perfectly healthy.
+_FATAL_GRANT_MARKERS = ("invalid_grant", "unauthorized_client", "invalid_client")
+
+
+def _classify_grant_status(status_code: int, error_label: Optional[str]) -> str:
+    """Classify a token-endpoint response as ``"auth"`` (grant genuinely
+    rejected) or ``"transient"`` (could not confirm either way).
+
+    Classifies at the point the HTTP status/body is actually known, rather
+    than pattern-matching an accumulated prose message downstream — by the
+    time a rejection reaches ``platform_health`` as
+    ``"refresh_token grant rejected (504: Gateway Time-out)"`` the useful
+    signal (the status code) is buried inside a string, and matching against
+    that string is exactly how a 504 ends up looking like an auth failure.
+    """
+    if status_code in (401, 403):
+        return "auth"
+    if status_code >= 500:
+        return "transient"
+    if error_label and any(marker in error_label for marker in _FATAL_GRANT_MARKERS):
+        return "auth"
+    return "transient"
 
 
 class SoundCloudAuthError(PlatformAuthError):
@@ -63,6 +93,57 @@ class SoundCloudAuthError(PlatformAuthError):
             credential=credential,
             attempts=attempts,
         )
+
+
+class SoundCloudTransientError(PlatformTransientError):
+    """Every credential path that was tried failed for a reason that looks
+    transient — a 5xx, a gateway timeout, or an unrecognized rejection —
+    never a confirmed ``invalid_grant``/``unauthorized_client``/
+    ``invalid_client`` or a 401/403 straight off the credential.
+
+    Raised instead of ``SoundCloudAuthError`` so the health probe reports
+    ``unknown`` (does not page) rather than ``dead`` (pages a human). On
+    2026-09-24 SoundCloud's token endpoint returned a 504 and the old code
+    folded that into the same "rejected" bucket as invalid_grant, so a
+    gateway blip got emailed to the owner as a revoked credential.
+    """
+
+    platform = "soundcloud"
+
+    def __init__(self, attempts: Optional[List[str]] = None):
+        attempts = attempts or []
+        detail = "; ".join(attempts) if attempts else "no response from SoundCloud"
+        super().__init__(
+            f"SoundCloud credential check was inconclusive (transient failure): {detail}",
+            platform="soundcloud",
+            attempts=attempts,
+        )
+
+
+class SoundCloudUnpersistedRefreshError(RuntimeError):
+    """Refused to exercise SoundCloud's refresh_token grant with no persister
+    attached.
+
+    SoundCloud ROTATES the refresh token on every use and invalidates the
+    old one. A caller with no ``on_tokens_refreshed`` callback who refreshes
+    anyway gets a working access token in memory and a DESTROYED credential
+    on disk — the next real refresh (an upload, or the next health probe)
+    gets ``invalid_grant``, because the refresh token it has on file was
+    already spent by this call.
+
+    This happened for real on 2026-09-24: a bare ``SoundCloudUploader()``
+    built to *diagnose* a false ``DEAD`` alarm called
+    ``_ensure_access_token()``, silently rotated the refresh token, and
+    turned the false alarm into a real outage that needed re-authorization.
+    A code comment warning about exactly this was already sitting a few
+    lines above that call and it was not enough — the hazard had to be made
+    impossible, not merely documented.
+
+    Fix: attach a persister (``on_tokens_refreshed=...``) so the rotated
+    pair gets saved, or pass ``allow_unpersisted_refresh=True`` if losing
+    the rotated token is genuinely acceptable (tests; a throwaway credential
+    you do not care about).
+    """
 
 
 def format_bytes(n: float) -> str:
@@ -142,6 +223,8 @@ class SoundCloudUploader:
         on_tokens_refreshed: Optional[Any] = None,
         mix_id: Optional[str] = None,
         emit_activity: bool = True,
+        *,
+        allow_unpersisted_refresh: bool = False,
     ) -> None:
         # on_tokens_refreshed: async callback (access_token, refresh_token) invoked
         # after a successful refresh/grant. SoundCloud ROTATES refresh tokens on
@@ -154,6 +237,12 @@ class SoundCloudUploader:
         # /api/health.
         self._emit_activity = emit_activity
         self._on_tokens_refreshed = on_tokens_refreshed
+        # Explicit, keyword-only opt-out for a caller who has consciously
+        # decided that losing a rotated refresh token is acceptable (tests;
+        # a throwaway credential). Without it, a persister-less uploader
+        # REFUSES to exercise the refresh_token grant rather than silently
+        # rotating and discarding it — see SoundCloudUnpersistedRefreshError.
+        self._allow_unpersisted_refresh = allow_unpersisted_refresh
         self._mix_id = mix_id  # for activity-log attribution (optional)
         self._client_id = sj.get("soundcloud_client_id") or settings.SOUNDCLOUD_CLIENT_ID
         self._client_secret = sj.get("soundcloud_client_secret") or settings.SOUNDCLOUD_CLIENT_SECRET
@@ -166,6 +255,12 @@ class SoundCloudUploader:
         # Per-grant rejection reasons, collected so a failed upload reports why
         # auth was refused rather than only that it was.
         self._auth_failures: List[str] = []
+        # Set while _ensure_access_token evaluates a probe: True once any
+        # attempted grant is classified as a genuine rejection ("auth") or a
+        # transient failure ("transient"). Decides which exception a fully
+        # exhausted _ensure_access_token raises.
+        self._saw_fatal_rejection = False
+        self._saw_transient_failure = False
 
     async def _activity(self, level: str, event: str, message: str, **kwargs) -> None:
         """Best-effort activity-log emit — never breaks an upload."""
@@ -187,19 +282,43 @@ class SoundCloudUploader:
     async def _ensure_access_token(self) -> str:
         """Get a valid access token, refreshing or obtaining one if needed.
 
-        Raises ``SoundCloudAuthError`` carrying every grant's rejection reason
-        when no path yields a token.
+        Raises ``SoundCloudAuthError`` when a grant was genuinely rejected
+        (``invalid_grant`` and friends, or a 401/403 straight off the
+        credential with no other path to fall back to) — re-authorization
+        is the only fix.
+
+        Raises ``SoundCloudTransientError`` when every path tried failed for
+        a reason that does NOT prove the grant is dead (a 5xx, a gateway
+        timeout, an unrecognized rejection) — the check was inconclusive,
+        not confirmed-bad. Callers (``platform_health`` in particular) must
+        not treat the two the same: one pages a human, the other doesn't.
         """
         self._auth_failures = []
+        self._saw_fatal_rejection = False
+        self._saw_transient_failure = False
+
+        has_refresh_path = bool(self._refresh_token)
+        has_password_path = bool(
+            self._email and self._password and self._client_id and self._client_secret
+        )
 
         if self._access_token:
             # Test if token is still valid
-            if await self._test_token(self._access_token):
+            status = await self._test_token(self._access_token)
+            if status == 200:
                 return self._access_token
-            self._auth_failures.append("stored access token rejected by /me")
+            self._auth_failures.append(f"stored access token rejected by /me ({status})")
+            if not has_refresh_path and not has_password_path:
+                # There is no other path — /me's answer about THIS token is
+                # the only signal we will ever get, so it decides the
+                # outcome. When a refresh (or password grant) is available
+                # below, an expired access token is routine (that is what
+                # refreshing is FOR) and proves nothing on its own; only the
+                # refresh/password grant's own result gets to decide.
+                self._mark_grant_result(_classify_grant_status(status, None))
 
         # Try refreshing with refresh_token
-        if self._refresh_token:
+        if has_refresh_path:
             token = await self._refresh_access_token()
             if token:
                 return token
@@ -207,7 +326,7 @@ class SoundCloudUploader:
             self._auth_failures.append("no refresh token configured")
 
         # Try client credentials + user password grant
-        if self._email and self._password and self._client_id and self._client_secret:
+        if has_password_path:
             token = await self._password_grant()
             if token:
                 return token
@@ -219,19 +338,55 @@ class SoundCloudUploader:
             "SoundCloud re-authorization required — every credential path was "
             f"rejected: {'; '.join(self._auth_failures)}",
         )
+        if self._saw_fatal_rejection:
+            raise SoundCloudAuthError(self._auth_failures)
+        if self._saw_transient_failure:
+            raise SoundCloudTransientError(self._auth_failures)
+        # Nothing was misclassified as transient and nothing was confirmed
+        # dead either — every path was simply unconfigured. That is a real
+        # dead end (nothing to publish with), so it is reported the same way
+        # as a confirmed rejection always was.
         raise SoundCloudAuthError(self._auth_failures)
 
-    async def _test_token(self, token: str) -> bool:
-        """Test if an access token is valid."""
+    def _mark_grant_result(self, classification: str) -> None:
+        """Record a grant attempt's classification (see
+        ``_classify_grant_status``). Fatal wins: a genuine rejection on any
+        path proves the grant is dead regardless of a transient hiccup on a
+        different path tried in the same call."""
+        if classification == "auth":
+            self._saw_fatal_rejection = True
+        elif classification == "transient":
+            self._saw_transient_failure = True
+
+    async def _test_token(self, token: str) -> int:
+        """Test if an access token is valid. Returns the /me HTTP status."""
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 f"{SOUNDCLOUD_API_BASE}/me",
                 headers={"Authorization": f"OAuth {token}", "Accept": "application/json"},
             )
-            return resp.status_code == 200
+            return resp.status_code
 
     async def _refresh_access_token(self) -> Optional[str]:
-        """Refresh the access token using the refresh token."""
+        """Refresh the access token using the refresh token.
+
+        SoundCloud ROTATES the refresh token on every use and invalidates the
+        old one. Without a persister attached, actually performing this
+        refresh would silently destroy the stored credential the moment it
+        "succeeds" — see ``SoundCloudUnpersistedRefreshError``. Refuse
+        outright rather than let that happen quietly.
+        """
+        if not self._on_tokens_refreshed and not self._allow_unpersisted_refresh:
+            raise SoundCloudUnpersistedRefreshError(
+                "Refusing to exercise SoundCloud's refresh_token grant: no "
+                "on_tokens_refreshed persister is attached. Refreshing ROTATES "
+                "the refresh token and discards the one currently stored, "
+                "which destroys the credential the moment this call "
+                "'succeeds'. Construct SoundCloudUploader(..., "
+                "on_tokens_refreshed=...) to persist the rotated pair, or "
+                "pass allow_unpersisted_refresh=True if losing it is "
+                "genuinely acceptable."
+            )
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 SOUNDCLOUD_AUTH_URL,
@@ -250,10 +405,11 @@ class SoundCloudUploader:
                 await self._persist_tokens()
                 return self._access_token
             logger.warning("Token refresh failed: %s", resp.text)
+            error_label = self._grant_error(resp)
             self._auth_failures.append(
-                f"refresh_token grant rejected ({resp.status_code}: "
-                f"{self._grant_error(resp)})"
+                f"refresh_token grant rejected ({resp.status_code}: {error_label})"
             )
+            self._mark_grant_result(_classify_grant_status(resp.status_code, error_label))
             await self._activity(
                 "warn", "sc_token_refresh_failed",
                 f"SoundCloud token refresh failed ({resp.status_code})",
@@ -316,10 +472,11 @@ class SoundCloudUploader:
                 await self._persist_tokens()
                 return self._access_token
             logger.warning("Password grant failed: %s", resp.text)
+            error_label = self._grant_error(resp)
             self._auth_failures.append(
-                f"password grant rejected ({resp.status_code}: "
-                f"{self._grant_error(resp)})"
+                f"password grant rejected ({resp.status_code}: {error_label})"
             )
+            self._mark_grant_result(_classify_grant_status(resp.status_code, error_label))
             return None
 
     # ------------------------------------------------------------------
