@@ -39,6 +39,14 @@ logger = logging.getLogger(__name__)
 REFRESH_INTERVAL_SECONDS = 600  # 10 minutes
 STALE_AFTER_SECONDS = 1800  # 3 missed refreshes -> we no longer know
 
+# A single DEAD probe can still be a one-off (a transient mid-request hiccup
+# that slipped past classification, a race with a concurrent token rotation
+# elsewhere). Require this many CONSECUTIVE dead probes before the
+# credential_dead notification fires -- at the 10-minute probe interval that
+# is ~30 minutes of sustained failure. /api/health still flips to "dead"
+# on the very first one; only the page waits for confirmation.
+DEAD_NOTIFY_THRESHOLD = 3
+
 PLATFORMS = ("soundcloud", "youtube", "mixcloud")
 
 # States, in plain language:
@@ -92,6 +100,13 @@ class PlatformHealth:
     def __init__(self) -> None:
         self._states: Dict[str, CredentialState] = {
             p: CredentialState(platform=p) for p in PLATFORMS
+        }
+        # Consecutive DEAD probes per platform, and the last known non-dead
+        # state from just before the current streak began (so the eventual
+        # announce call sees a real transition -- see _track_dead_streak).
+        self._dead_streak: Dict[str, int] = {p: 0 for p in PLATFORMS}
+        self._streak_started_from: Dict[str, Optional[CredentialState]] = {
+            p: None for p in PLATFORMS
         }
         self._lock = asyncio.Lock()
         self._task: Optional[asyncio.Task] = None
@@ -149,8 +164,39 @@ class PlatformHealth:
                     state.checked_at = datetime.now(timezone.utc).isoformat()
                     state.checked_monotonic = time.monotonic()
                     self._states[platform] = state
-                    await self._announce_if_newly_dead(previous, state)
+                    await self._track_dead_streak(platform, previous, state)
         return self.snapshot()
+
+    async def _track_dead_streak(
+        self, platform: str, previous: Optional[CredentialState], current: CredentialState
+    ) -> None:
+        """Gate the DEAD notification behind ``DEAD_NOTIFY_THRESHOLD``
+        consecutive DEAD probes, while leaving ``self._states`` (and so
+        ``/api/health``) reporting the truth immediately -- that update
+        already happened in ``refresh_all`` before this is called.
+
+        Any non-DEAD result resets the streak: a recovery before the
+        threshold means the outage never got confirmed and must not page.
+        """
+        if current.state != DEAD:
+            self._dead_streak[platform] = 0
+            self._streak_started_from[platform] = None
+            return
+
+        if self._dead_streak.get(platform, 0) == 0:
+            # Remember the state from just before this streak started, so
+            # the eventual announce call below sees a genuine transition
+            # (its own dedup keys off previous.state != DEAD).
+            self._streak_started_from[platform] = previous
+
+        self._dead_streak[platform] = self._dead_streak.get(platform, 0) + 1
+        if self._dead_streak[platform] != DEAD_NOTIFY_THRESHOLD:
+            # Not yet confirmed (< threshold), or already announced earlier
+            # in this same unbroken streak (> threshold) -- page once.
+            return
+
+        confirmed_previous = self._streak_started_from.get(platform)
+        await self._announce_if_newly_dead(confirmed_previous, current)
 
     @staticmethod
     async def _announce_if_newly_dead(
@@ -167,6 +213,11 @@ class PlatformHealth:
         Deliberately one-directional: recovery is not announced. An all-clear
         that nobody asked for is noise, and the health endpoint already shows
         the current state for anyone who wants to look.
+
+        Called only once a DEAD streak has been confirmed (see
+        ``_track_dead_streak``) -- ``previous``/``current`` here are the
+        state from before the streak began and the just-confirmed DEAD
+        state, not necessarily two adjacent probes.
         """
         if current.state != DEAD:
             return
@@ -250,7 +301,7 @@ class PlatformHealth:
             return False
 
     async def _probe_soundcloud(self, sj: Dict[str, Any]) -> CredentialState:
-        from app.services.platform_errors import PlatformAuthError
+        from app.services.platform_errors import PlatformAuthError, PlatformTransientError
         from app.services.soundcloud_uploader import SoundCloudUploader
 
         if await self._upload_in_flight("soundcloud"):
@@ -289,9 +340,21 @@ class PlatformHealth:
         try:
             await uploader._ensure_access_token()
         except PlatformAuthError as exc:
+            # Genuinely rejected — invalid_grant/unauthorized_client/
+            # invalid_client, or a 401/403 straight off the credential with
+            # no other path. Re-authorization is the only fix.
             return CredentialState(
                 platform="soundcloud", state=DEAD,
                 detail=str(exc), credential=exc.credential,
+            )
+        except PlatformTransientError as exc:
+            # A 5xx / gateway timeout / unrecognized rejection on the token
+            # endpoint. NOT proof the grant is dead — see
+            # SoundCloudTransientError. Reported the same as any other
+            # inconclusive probe: unknown, not paging.
+            return CredentialState(
+                platform="soundcloud", state=UNKNOWN,
+                detail=f"credential check was inconclusive: {exc}",
             )
         except Exception as exc:
             return CredentialState(
@@ -304,7 +367,7 @@ class PlatformHealth:
         )
 
     async def _probe_youtube(self, sj: Dict[str, Any]) -> CredentialState:
-        from app.services.platform_errors import PlatformAuthError
+        from app.services.platform_errors import PlatformAuthError, PlatformTransientError
         from app.services.youtube_uploader import YouTubeUploader
 
         if not (sj.get("youtube_refresh_token") or settings.YOUTUBE_REFRESH_TOKEN):
@@ -321,6 +384,13 @@ class PlatformHealth:
             return CredentialState(
                 platform="youtube", state=DEAD,
                 detail=str(exc), credential=exc.credential,
+            )
+        except PlatformTransientError as exc:
+            # google-auth marked the token-endpoint failure retryable (5xx /
+            # gateway timeout / 429) — not proof the grant is dead.
+            return CredentialState(
+                platform="youtube", state=UNKNOWN,
+                detail=f"credential check was inconclusive: {exc}",
             )
         except Exception as exc:
             return CredentialState(

@@ -95,3 +95,73 @@ async def test_alerting_failure_never_breaks_the_probe_loop(monkeypatch):
 
     monkeypatch.setattr(ns, "get_notification_service", boom)
     await PlatformHealth._announce_if_newly_dead(_state(state=OK), _state(state=DEAD))
+
+
+class TestConsecutiveDeadThreshold:
+    """Fix 2: a single correctly-classified DEAD probe can still be a
+    one-off. The notification must wait for DEAD_NOTIFY_THRESHOLD (3)
+    consecutive DEAD probes -- /api/health flips to dead immediately
+    regardless (that update happens in refresh_all, before
+    _track_dead_streak is ever called), only the PAGE waits.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_dead_probe_does_not_notify(self, spy):
+        svc = PlatformHealth()
+        await svc._track_dead_streak("soundcloud", _state(state=OK), _state(state=DEAD))
+
+        assert spy.calls == []
+
+    @pytest.mark.asyncio
+    async def test_three_consecutive_dead_probes_notify_exactly_once(self, spy):
+        svc = PlatformHealth()
+        previous = _state(state=OK)
+        for _ in range(3):
+            current = _state(state=DEAD)
+            await svc._track_dead_streak("soundcloud", previous, current)
+            previous = current
+
+        assert len(spy.calls) == 1, "the 3rd consecutive DEAD probe must notify"
+
+        # Further consecutive DEAD probes (~8 more hours) must not re-page.
+        for _ in range(50):
+            current = _state(state=DEAD)
+            await svc._track_dead_streak("soundcloud", previous, current)
+            previous = current
+        assert len(spy.calls) == 1, "must still page on transition-confirmed only"
+
+    @pytest.mark.asyncio
+    async def test_recovery_before_threshold_resets_the_counter(self, spy):
+        svc = PlatformHealth()
+        # Two DEAD probes -- one short of the threshold.
+        await svc._track_dead_streak("soundcloud", _state(state=OK), _state(state=DEAD))
+        await svc._track_dead_streak("soundcloud", _state(state=DEAD), _state(state=DEAD))
+        assert spy.calls == [], "must not notify before the streak is confirmed"
+
+        # A recovery resets the streak.
+        await svc._track_dead_streak("soundcloud", _state(state=DEAD), _state(state=OK))
+
+        # A fresh streak of only 2 more DEAD probes must still stay silent --
+        # the counter was reset, not merely paused.
+        await svc._track_dead_streak("soundcloud", _state(state=OK), _state(state=DEAD))
+        await svc._track_dead_streak("soundcloud", _state(state=DEAD), _state(state=DEAD))
+        assert spy.calls == [], "recovery must reset the counter, not pause it"
+
+        # The 3rd consecutive DEAD probe of the NEW streak finally notifies.
+        await svc._track_dead_streak("soundcloud", _state(state=DEAD), _state(state=DEAD))
+        assert len(spy.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_unknown_never_accumulates_toward_a_page(self, spy):
+        """Fix 1 + Fix 2 together: a run of transient (UNKNOWN) probes must
+        never notify, no matter how long it runs."""
+        svc = PlatformHealth()
+        previous = _state(state=OK)
+        for _ in range(5):
+            current = _state(
+                state=UNKNOWN, detail="credential check was inconclusive: 504"
+            )
+            await svc._track_dead_streak("soundcloud", previous, current)
+            previous = current
+
+        assert spy.calls == []

@@ -12,7 +12,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 from app.config import settings
-from app.services.platform_errors import PlatformAuthError
+from app.services.platform_errors import PlatformAuthError, PlatformTransientError
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,22 @@ class YouTubeAuthError(PlatformAuthError):
             f"YouTube authorization failed and needs re-authorization: {reason}",
             platform="youtube",
             credential=credential,
+            attempts=[reason],
+        )
+
+
+class YouTubeTransientError(PlatformTransientError):
+    """The OAuth refresh failed for a reason that is NOT proof the grant is
+    dead — google-auth marked the underlying token-endpoint response
+    ``retryable`` (a 5xx, a gateway timeout, a 429). Not a revoked grant.
+    """
+
+    platform = "youtube"
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"YouTube credential check was inconclusive (transient failure): {reason}",
+            platform="youtube",
             attempts=[reason],
         )
 
@@ -112,10 +128,18 @@ class YouTubeUploader:
         try:
             self._credentials.refresh(Request())
         except RefreshError as exc:
+            self._credentials = None
+            # google-auth already did this classification for us: a 5xx,
+            # gateway timeout, or 429 from the token endpoint sets
+            # exc.retryable — that is a transient condition, not proof the
+            # grant was revoked. Trust the structural signal rather than
+            # pattern-matching the message; see the module docstring on
+            # SoundCloudTransientError for why that split matters.
+            if getattr(exc, "retryable", False):
+                raise YouTubeTransientError(str(exc)) from exc
             # A revoked/expired grant is an operator action, not a transient
             # fault: surface it as an auth failure naming the credential so
             # the alert does not read as a generic upload error.
-            self._credentials = None
             raise YouTubeAuthError(f"refresh grant rejected: {exc}") from exc
         return self._credentials
 
