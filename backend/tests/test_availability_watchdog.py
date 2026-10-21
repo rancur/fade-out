@@ -2,8 +2,6 @@
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from app.database import async_session_factory
 from app.models import Mix
 from app.services.availability_watchdog import AvailabilityWatchdog
