@@ -75,7 +75,7 @@ function TagChips({ tags, tone }: { tags: string[]; tone: 'old' | 'new' }) {
         <span
           key={`${t}-${idx}`}
           className={clsx(
-            'text-[10px] px-1.5 py-0.5 rounded font-mono',
+            'text-[10px] px-1.5 py-0.5 rounded-sm font-mono',
             tone === 'new' ? 'bg-cyber-lime/10 text-cyber-lime' : 'bg-white/5 text-gray-500',
           )}
         >
@@ -102,12 +102,12 @@ export default function DiffView({ field, current, proposed }: DiffViewProps) {
   if (field === 'description') {
     const lines = diffLines(current ?? '', proposed ?? '')
     return (
-      <pre className="text-[11px] font-mono bg-dark rounded-lg p-3 overflow-x-auto whitespace-pre-wrap break-words max-h-72 overflow-y-auto">
+      <pre className="text-[11px] font-mono bg-dark rounded-lg p-3 overflow-x-auto whitespace-pre-wrap wrap-break-word max-h-72 overflow-y-auto">
         {lines.map((l, idx) => (
           <div
             key={idx}
             className={clsx(
-              'px-1 -mx-1 rounded-sm',
+              'px-1 -mx-1 rounded-xs',
               l.type === 'add' && 'bg-cyber-lime/10 text-cyber-lime',
               l.type === 'del' && 'bg-cyber-red/10 text-cyber-red/80 line-through decoration-cyber-red/40',
               l.type === 'same' && 'text-gray-400',

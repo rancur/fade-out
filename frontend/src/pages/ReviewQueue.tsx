@@ -31,7 +31,7 @@ function CreatedByChip({ createdBy }: { createdBy: 'ai' | 'user' }) {
   return (
     <span
       className={clsx(
-        'text-[10px] font-mono px-1.5 py-0.5 rounded uppercase tracking-wider',
+        'text-[10px] font-mono px-1.5 py-0.5 rounded-sm uppercase tracking-wider',
         createdBy === 'ai' ? 'bg-cyber-magenta/10 text-cyber-magenta' : 'bg-primary/10 text-primary',
       )}
     >
@@ -107,7 +107,7 @@ function ProposalRow({
   const busy = action.isPending || createProposal.isPending
 
   return (
-    <div className="border-b border-white/5 last:border-0 px-4 py-3 space-y-2 hover:bg-white/[0.02]">
+    <div className="border-b border-white/5 last:border-0 px-4 py-3 space-y-2 hover:bg-white/2">
       <div className="flex flex-wrap items-center gap-2">
         {selectable && (
           <input
@@ -115,11 +115,11 @@ function ProposalRow({
             checked={selected}
             onChange={() => onToggleSelect(proposal.id)}
             aria-label={`Select ${proposal.field} proposal`}
-            className="accent-[#7CB342] cursor-pointer"
+            className="accent-primary cursor-pointer"
           />
         )}
         <ProposalStatusChip status={proposal.status} />
-        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-dark text-gray-500">
+        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-sm bg-dark text-gray-500">
           {proposal.platform}
         </span>
         <span className="text-xs text-gray-300 font-mono">{proposal.field}</span>
@@ -180,7 +180,7 @@ function ProposalRow({
             onChange={(e) => setEditValue(e.target.value)}
             rows={proposal.field === 'description' ? 10 : 2}
             aria-label="Edit proposed value"
-            className="w-full px-3 py-2 bg-surface border border-accent/30 rounded-lg text-xs text-gray-200 font-mono leading-relaxed focus:border-accent/60 focus:outline-none resize-y"
+            className="w-full px-3 py-2 bg-surface border border-accent/30 rounded-lg text-xs text-gray-200 font-mono leading-relaxed focus:border-accent/60 focus:outline-hidden resize-y"
           />
           <div className="flex items-center gap-2">
             <button
@@ -231,7 +231,7 @@ function ProposalGroup({
 }) {
   return (
     <div className="bg-surface-light border border-primary/10 rounded-xl overflow-hidden">
-      <div className="flex items-center gap-2 px-4 py-2.5 bg-white/[0.02] border-b border-white/5">
+      <div className="flex items-center gap-2 px-4 py-2.5 bg-white/2 border-b border-white/5">
         <Music2 className="w-3.5 h-3.5 text-primary shrink-0" />
         <Link
           to={`/catalog/${mixId}`}
@@ -397,7 +397,7 @@ export default function ReviewQueue() {
               value={mixId}
               onChange={(e) => setParam('mix_id', e.target.value.trim() || null)}
               placeholder="filter by mix id…"
-              className="w-full bg-surface border border-white/10 rounded-lg pl-8 pr-7 py-1.5 text-xs font-mono text-gray-300 placeholder:text-gray-600 focus:outline-none focus:border-primary/40"
+              className="w-full bg-surface border border-white/10 rounded-lg pl-8 pr-7 py-1.5 text-xs font-mono text-gray-300 placeholder:text-gray-600 focus:outline-hidden focus:border-primary/40"
             />
             {mixId && (
               <button

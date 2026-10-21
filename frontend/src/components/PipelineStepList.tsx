@@ -98,7 +98,7 @@ function StepRow({ step, mixId }: { step: PipelineStep; mixId: string }) {
           <StatusBadge status={step.status} />
           <span className="text-sm text-gray-300 font-mono">{step.step_name}</span>
           {step.retry_count > 0 && (
-            <span className="text-[10px] text-gold font-mono px-1.5 py-0.5 rounded bg-gold/10 border border-gold/20">
+            <span className="text-[10px] text-gold font-mono px-1.5 py-0.5 rounded-sm bg-gold/10 border border-gold/20">
               attempt {step.retry_count + 1}
             </span>
           )}
@@ -116,7 +116,7 @@ function StepRow({ step, mixId }: { step: PipelineStep; mixId: string }) {
               onClick={handleRetryStep}
               disabled={retryStep.isPending}
               title="Retry this step"
-              className="flex items-center gap-1 px-2 py-1 text-[11px] font-mono text-cyber-cyan bg-cyber-cyan/5 border border-cyber-cyan/20 rounded hover:bg-cyber-cyan/15 disabled:opacity-50 transition-all"
+              className="flex items-center gap-1 px-2 py-1 text-[11px] font-mono text-cyber-cyan bg-cyber-cyan/5 border border-cyber-cyan/20 rounded-sm hover:bg-cyber-cyan/15 disabled:opacity-50 transition-all"
             >
               <RotateCcw className="w-3 h-3" /> Retry
             </button>
@@ -126,7 +126,7 @@ function StepRow({ step, mixId }: { step: PipelineStep; mixId: string }) {
               onClick={handleReread}
               disabled={reread.isPending}
               title="Re-read tracklist"
-              className="flex items-center gap-1 px-2 py-1 text-[11px] font-mono text-cyber-magenta bg-cyber-magenta/5 border border-cyber-magenta/20 rounded hover:bg-cyber-magenta/15 disabled:opacity-50 transition-all"
+              className="flex items-center gap-1 px-2 py-1 text-[11px] font-mono text-cyber-magenta bg-cyber-magenta/5 border border-cyber-magenta/20 rounded-sm hover:bg-cyber-magenta/15 disabled:opacity-50 transition-all"
             >
               <ListRestart className="w-3 h-3" /> Re-read tracklist
             </button>
@@ -134,7 +134,7 @@ function StepRow({ step, mixId }: { step: PipelineStep; mixId: string }) {
           <Link
             to={`/activity?mix_id=${mixId}`}
             title="View activity for this mix"
-            className="flex items-center gap-1 px-2 py-1 text-[11px] font-mono text-gray-500 bg-white/[0.02] border border-white/10 rounded hover:text-gray-300 hover:border-white/20 transition-all"
+            className="flex items-center gap-1 px-2 py-1 text-[11px] font-mono text-gray-500 bg-white/2 border border-white/10 rounded-sm hover:text-gray-300 hover:border-white/20 transition-all"
           >
             <Activity className="w-3 h-3" /> Activity
           </Link>
@@ -147,7 +147,7 @@ function StepRow({ step, mixId }: { step: PipelineStep; mixId: string }) {
           <div className="h-1.5 bg-dark rounded-full overflow-hidden">
             <div
               className={clsx(
-                'h-full rounded-full bg-gradient-to-r from-cyber-cyan to-primary transition-all duration-500',
+                'h-full rounded-full bg-linear-to-r from-cyber-cyan to-primary transition-all duration-500',
                 step.progress == null && 'w-full animate-pulse opacity-40',
               )}
               style={

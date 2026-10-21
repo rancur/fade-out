@@ -19,7 +19,7 @@ function Row({ item }: { item: ActivityItem }) {
   const style = levelStyle[item.level] ?? levelStyle.info
   const Icon = style.icon
   return (
-    <div className="flex gap-2 px-5 py-2.5 border-b border-white/5 hover:bg-white/[0.02]">
+    <div className="flex gap-2 px-5 py-2.5 border-b border-white/5 hover:bg-white/2">
       <Icon className={clsx('w-3.5 h-3.5 mt-0.5 shrink-0', style.text)} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
@@ -28,7 +28,7 @@ function Row({ item }: { item: ActivityItem }) {
             <span className={clsx('text-[10px] font-mono truncate', style.text)}>{item.event}</span>
           )}
         </div>
-        <p className="text-xs text-gray-300 break-words leading-snug mt-0.5">{item.message}</p>
+        <p className="text-xs text-gray-300 wrap-break-word leading-snug mt-0.5">{item.message}</p>
       </div>
     </div>
   )

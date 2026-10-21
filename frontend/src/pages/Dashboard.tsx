@@ -130,10 +130,10 @@ export default function Dashboard() {
               className={clsx(
                 'h-full rounded-full transition-all duration-700',
                 budget.percentage_used > 90
-                  ? 'bg-gradient-to-r from-cyber-red to-cyber-orange'
+                  ? 'bg-linear-to-r from-cyber-red to-cyber-orange'
                   : budget.percentage_used > 70
-                    ? 'bg-gradient-to-r from-gold to-cyber-orange'
-                    : 'bg-gradient-to-r from-primary to-cyber-cyan',
+                    ? 'bg-linear-to-r from-gold to-cyber-orange'
+                    : 'bg-linear-to-r from-primary to-cyber-cyan',
               )}
               style={{ width: `${Math.min(100, budget.percentage_used)}%` }}
             />
@@ -162,10 +162,10 @@ export default function Dashboard() {
                 <Link
                   key={mix.id}
                   to={`/mixes/${mix.id}`}
-                  className="flex items-center justify-between px-5 py-3 hover:bg-white/[0.02] transition-colors"
+                  className="flex items-center justify-between px-5 py-3 hover:bg-white/2 transition-colors"
                 >
                   <div className="flex items-center gap-3 min-w-0">
-                    <div className="w-8 h-8 rounded bg-primary/10 flex items-center justify-center shrink-0">
+                    <div className="w-8 h-8 rounded-sm bg-primary/10 flex items-center justify-center shrink-0">
                       <Music2 className="w-4 h-4 text-primary/50" />
                     </div>
                     <div className="min-w-0">
@@ -209,7 +209,7 @@ export default function Dashboard() {
                 </div>
               </div>
             ) : (
-              <div className="flex items-center gap-3 p-3 bg-white/[0.02] rounded-lg">
+              <div className="flex items-center gap-3 p-3 bg-white/2 rounded-lg">
                 <CheckCircle2 className="w-4 h-4 text-primary/50" />
                 <p className="text-sm text-gray-500">Pipeline idle</p>
               </div>
@@ -218,11 +218,11 @@ export default function Dashboard() {
             {/* Summary stats */}
             {pipeline && (
               <div className="grid grid-cols-2 gap-3">
-                <div className="text-center p-2 bg-white/[0.02] rounded-lg">
+                <div className="text-center p-2 bg-white/2 rounded-lg">
                   <p className="text-lg font-bold text-cyber-lime">{pipeline.completed}</p>
                   <p className="text-[10px] text-gray-600 font-mono uppercase">Completed</p>
                 </div>
-                <div className="text-center p-2 bg-white/[0.02] rounded-lg">
+                <div className="text-center p-2 bg-white/2 rounded-lg">
                   <p className="text-lg font-bold text-cyber-red">{pipeline.failed}</p>
                   <p className="text-[10px] text-gray-600 font-mono uppercase">Failed</p>
                 </div>

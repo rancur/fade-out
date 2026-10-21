@@ -174,14 +174,14 @@ function ShortCard({ short }: { short: ShortItem }) {
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             maxLength={100}
-            className="w-full px-3 py-2 bg-dark border border-primary/20 rounded-lg text-sm text-gray-200 focus:border-primary/50 focus:outline-none font-mono"
+            className="w-full px-3 py-2 bg-dark border border-primary/20 rounded-lg text-sm text-gray-200 focus:border-primary/50 focus:outline-hidden font-mono"
           />
           <textarea
             aria-label="Short description"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             rows={5}
-            className="w-full px-3 py-2 bg-dark border border-primary/20 rounded-lg text-xs text-gray-300 focus:border-primary/50 focus:outline-none font-mono"
+            className="w-full px-3 py-2 bg-dark border border-primary/20 rounded-lg text-xs text-gray-300 focus:border-primary/50 focus:outline-hidden font-mono"
           />
           <div className="flex gap-2">
             <button
@@ -213,7 +213,7 @@ function ShortCard({ short }: { short: ShortItem }) {
       )}
 
       {short.error && (
-        <p className="text-[11px] text-cyber-red/80 font-mono break-words">{short.error}</p>
+        <p className="text-[11px] text-cyber-red/80 font-mono wrap-break-word">{short.error}</p>
       )}
 
       {/* Actions */}

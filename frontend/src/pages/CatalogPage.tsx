@@ -106,7 +106,7 @@ function LockToggle({ mix }: { mix: CatalogMix }) {
       disabled={lockTitle.isPending}
       title={mix.title_locked ? 'Title locked — AI will never propose changes. Click to unlock.' : 'Title unlocked — click to lock as a keeper.'}
       className={clsx(
-        'p-1 rounded shrink-0 transition-colors',
+        'p-1 rounded-sm shrink-0 transition-colors',
         mix.title_locked ? 'text-gold hover:text-gold/70' : 'text-gray-600 hover:text-gray-400',
       )}
     >
@@ -141,11 +141,11 @@ function CatalogMixCard({ mix }: { mix: CatalogMix }) {
             className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
           />
         ) : (
-          <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-primary/10 to-cyber-cyan/5">
+          <div className="w-full h-full flex items-center justify-center bg-linear-to-br from-primary/10 to-cyber-cyan/5">
             <Music className="w-12 h-12 text-primary/30" />
           </div>
         )}
-        <div className="absolute inset-0 bg-gradient-to-t from-surface-light via-transparent to-transparent" />
+        <div className="absolute inset-0 bg-linear-to-t from-surface-light via-transparent to-transparent" />
         {/* Source chip */}
         <div className="absolute top-3 left-3">
           <span
@@ -517,7 +517,7 @@ export default function CatalogPage() {
             placeholder="Search catalog..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            className="w-full pl-10 pr-4 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:border-primary/40 focus:outline-none transition-colors font-mono"
+            className="w-full pl-10 pr-4 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:border-primary/40 focus:outline-hidden transition-colors font-mono"
           />
         </div>
         <select
@@ -526,7 +526,7 @@ export default function CatalogPage() {
             setSource(e.target.value as typeof source)
             setPage(1)
           }}
-          className="px-3 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-none font-mono"
+          className="px-3 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-hidden font-mono"
         >
           {SOURCE_FILTERS.map((s) => (
             <option key={s} value={s}>
@@ -543,7 +543,7 @@ export default function CatalogPage() {
               setSort(e.target.value as CatalogSort)
               setPage(1)
             }}
-            className="pl-10 pr-8 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-none font-mono"
+            className="pl-10 pr-8 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-hidden font-mono"
           >
             {SORT_OPTIONS.map((o) => (
               <option key={o.value} value={o.value}>

@@ -47,7 +47,7 @@ export default function Upgrade() {
   if (isLoading) {
     return (
       <div className="space-y-6">
-        <div className="h-8 w-48 bg-surface-light rounded animate-pulse" />
+        <div className="h-8 w-48 bg-surface-light rounded-sm animate-pulse" />
         <div className="h-48 bg-surface-light rounded-xl animate-pulse" />
       </div>
     )

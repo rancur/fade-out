@@ -37,12 +37,12 @@ export default function MixCard({ mix }: { mix: Mix }) {
             className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
           />
         ) : (
-          <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-primary/10 to-cyber-cyan/5">
+          <div className="w-full h-full flex items-center justify-center bg-linear-to-br from-primary/10 to-cyber-cyan/5">
             <Music className="w-12 h-12 text-primary/30" />
           </div>
         )}
         {/* Gradient overlay */}
-        <div className="absolute inset-0 bg-gradient-to-t from-surface-light via-transparent to-transparent" />
+        <div className="absolute inset-0 bg-linear-to-t from-surface-light via-transparent to-transparent" />
         {/* Status */}
         <div className="absolute top-3 right-3">
           <StatusBadge status={mix.pipeline_status} />
@@ -69,13 +69,13 @@ export default function MixCard({ mix }: { mix: Mix }) {
             {genres.slice(0, 3).map((g) => (
               <span
                 key={g}
-                className="text-[10px] px-2 py-0.5 rounded bg-primary/10 text-primary/80 font-mono"
+                className="text-[10px] px-2 py-0.5 rounded-sm bg-primary/10 text-primary/80 font-mono"
               >
                 {g}
               </span>
             ))}
             {genres.length > 3 && (
-              <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-gray-500 font-mono">
+              <span className="text-[10px] px-2 py-0.5 rounded-sm bg-white/5 text-gray-500 font-mono">
                 +{genres.length - 3}
               </span>
             )}

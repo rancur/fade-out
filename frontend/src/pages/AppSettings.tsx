@@ -68,7 +68,7 @@ function SourceBadge({ source }: { source: SettingItem['source'] }) {
   return (
     <span
       className={clsx(
-        'px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider',
+        'px-1.5 py-0.5 rounded-sm text-[10px] font-mono uppercase tracking-wider',
         source === 'db' && 'bg-primary/10 text-primary',
         source === 'env' && 'bg-gold/10 text-gold',
         source === 'default' && 'bg-gray-800 text-gray-500',
@@ -101,7 +101,7 @@ function Toggle({
     >
       <span
         className={clsx(
-          'absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform shadow',
+          'absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform shadow-sm',
           checked ? 'translate-x-[22px]' : 'translate-x-0.5',
         )}
       />
@@ -110,7 +110,7 @@ function Toggle({
 }
 
 const inputClass =
-  'w-full px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono disabled:opacity-50'
+  'w-full px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-hidden font-mono disabled:opacity-50'
 
 function SettingField({
   item,
@@ -224,7 +224,7 @@ function SettingField({
     <div
       className={clsx(
         'grid grid-cols-1 sm:grid-cols-[1fr_260px] gap-2 sm:gap-6 items-start py-4',
-        isDirty && 'bg-primary/[0.03] -mx-3 px-3 rounded-lg',
+        isDirty && 'bg-primary/3 -mx-3 px-3 rounded-lg',
       )}
     >
       <div className="min-w-0">
@@ -235,7 +235,7 @@ function SettingField({
           )}
           <SourceBadge source={item.source} />
           {!item.editable && (
-            <span className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider bg-gray-800 text-gray-500">
+            <span className="px-1.5 py-0.5 rounded-sm text-[10px] font-mono uppercase tracking-wider bg-gray-800 text-gray-500">
               configured at deploy
             </span>
           )}
@@ -408,7 +408,7 @@ export default function AppSettings() {
 
       {/* Save bar */}
       {dirtyCount > 0 && (
-        <div className="fixed bottom-0 left-0 right-0 z-40 bg-surface-light/95 backdrop-blur border-t border-primary/20">
+        <div className="fixed bottom-0 left-0 right-0 z-40 bg-surface-light/95 backdrop-blur-sm border-t border-primary/20">
           <div className="max-w-4xl mx-auto px-6 py-3 flex items-center justify-between gap-4">
             <p className="text-sm text-gray-400 font-mono">
               {dirtyCount} unsaved change{dirtyCount === 1 ? '' : 's'}

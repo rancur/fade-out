@@ -73,8 +73,8 @@ type StatusColor = 'green' | 'yellow' | 'red'
 
 function StatusDot({ color }: { color: StatusColor }) {
   const colorClasses: Record<StatusColor, string> = {
-    green: 'bg-primary shadow-[0_0_6px_theme(colors.primary)]',
-    yellow: 'bg-gold shadow-[0_0_6px_theme(colors.gold)]',
+    green: 'bg-primary shadow-[0_0_6px_var(--color-primary)]',
+    yellow: 'bg-gold shadow-[0_0_6px_var(--color-gold)]',
     red: 'bg-gray-600',
   }
   return <span className={clsx('inline-block w-2.5 h-2.5 rounded-full', colorClasses[color])} />
@@ -160,7 +160,7 @@ function CredentialField({
           value={value}
           onChange={(e) => onChange(name, e.target.value)}
           placeholder={placeholder || `Enter ${label}`}
-          className="w-full bg-dark border border-gray-700 rounded-lg px-3 py-2 pr-10 text-sm font-mono text-gray-200 placeholder-gray-600 focus:border-primary/50 focus:outline-none"
+          className="w-full bg-dark border border-gray-700 rounded-lg px-3 py-2 pr-10 text-sm font-mono text-gray-200 placeholder-gray-600 focus:border-primary/50 focus:outline-hidden"
         />
         <button
           type="button"
@@ -463,7 +463,7 @@ function SoundCloudSection({ status }: { status: SoundCloudStatus | undefined })
               value={token}
               onChange={(e) => setToken(e.target.value)}
               placeholder="Paste SoundCloud OAuth access token"
-              className="flex-1 bg-dark border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-200 placeholder-gray-600 focus:border-primary/50 focus:outline-none"
+              className="flex-1 bg-dark border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-200 placeholder-gray-600 focus:border-primary/50 focus:outline-hidden"
             />
             <button
               onClick={() => token && saveToken.mutate(token)}
@@ -736,7 +736,7 @@ function YouTubeSection({ status }: { status: YouTubeStatus | undefined }) {
                       value={refreshToken}
                       onChange={(e) => setRefreshToken(e.target.value)}
                       placeholder="Paste YouTube OAuth refresh token"
-                      className="flex-1 bg-dark border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-200 placeholder-gray-600 focus:border-primary/50 focus:outline-none"
+                      className="flex-1 bg-dark border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-gray-200 placeholder-gray-600 focus:border-primary/50 focus:outline-hidden"
                     />
                     <button
                       onClick={() => refreshToken && saveRefreshToken.mutate(refreshToken)}

@@ -1,6 +1,154 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --color-primary: #7cb342;
+  --color-secondary: #ff8a65;
+  --color-accent: #4fc3f7;
+  --color-gold: #ffd54f;
+  --color-dark: #1b2631;
+  --color-surface: #0d1117;
+  --color-surface-light: #161b22;
+
+  --color-cyber-cyan: #00e5ff;
+  --color-cyber-magenta: #e040fb;
+  --color-cyber-lime: #76ff03;
+  --color-cyber-orange: #ffab40;
+  --color-cyber-red: #ff1744;
+
+  /*
+    v3 font sizes carried an absolute line-height, so a child with only an
+    arbitrary size (text-[10px]) inherited e.g. 16px from text-xs. v4 uses a
+    unitless ratio, which re-scales in the child and shrinks chip rows. Pin
+    the v3 values so the upgrade is visually neutral.
+  */
+  --text-xs--line-height: 1rem;
+  --text-sm--line-height: 1.25rem;
+  --text-base--line-height: 1.5rem;
+  --text-lg--line-height: 1.75rem;
+  --text-xl--line-height: 1.75rem;
+  --text-2xl--line-height: 2rem;
+  --text-3xl--line-height: 2.25rem;
+  --text-4xl--line-height: 2.5rem;
+
+  --font-pixel: 'Press Start 2P', monospace;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --shadow-neon:
+    0 0 5px var(--color-primary), 0 0 20px --theme(--color-primary / 30%);
+  --shadow-neon-cyan:
+    0 0 5px var(--color-cyber-cyan), 0 0 20px --theme(--color-cyber-cyan / 30%);
+  --shadow-neon-magenta:
+    0 0 5px var(--color-cyber-magenta),
+    0 0 20px --theme(--color-cyber-magenta / 30%);
+  --shadow-neon-red:
+    0 0 5px var(--color-cyber-red), 0 0 20px --theme(--color-cyber-red / 30%);
+
+  --animate-pulse-slow: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  --animate-glow: glow 2s ease-in-out infinite alternate;
+  --animate-slide-in: slideIn 0.3s ease-out;
+
+  @keyframes glow {
+    0% {
+      box-shadow:
+        0 0 5px currentColor,
+        0 0 10px currentColor;
+    }
+    100% {
+      box-shadow:
+        0 0 10px currentColor,
+        0 0 30px currentColor,
+        0 0 50px currentColor;
+    }
+  }
+  @keyframes slideIn {
+    0% {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+@utility pixel-border {
+  border: 2px solid;
+  box-shadow:
+    inset -2px -2px 0 0 rgba(0, 0, 0, 0.3),
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.1),
+    4px 4px 0 0 rgba(0, 0, 0, 0.4);
+}
+
+@utility glow-text {
+  text-shadow:
+    0 0 10px currentColor,
+    0 0 20px currentColor,
+    0 0 40px currentColor;
+}
+
+@utility neon-line {
+  @apply h-px w-full;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    #7cb342,
+    #00e5ff,
+    #7cb342,
+    transparent
+  );
+}
+
+@utility card-hover {
+  @apply transition-all duration-300;
+
+  &:hover {
+    @apply -translate-y-1;
+    box-shadow:
+      0 0 15px rgba(124, 179, 66, 0.2),
+      0 8px 25px rgba(0, 0, 0, 0.4);
+  }
+}
+
+@utility cyber-grid {
+  background-image:
+    linear-gradient(rgba(124, 179, 66, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(124, 179, 66, 0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+@utility gradient-mask-b {
+  mask-image: linear-gradient(to bottom, black 60%, transparent);
+  -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent);
+}
+
+@utility animate-fade-in {
+  animation: fadeIn 0.4s ease-out;
+}
+
+@utility animate-scan {
+  animation: scan 4s linear infinite;
+}
 
 @layer base {
   body {
@@ -31,58 +179,7 @@
   }
 }
 
-@layer components {
-  .pixel-border {
-    border: 2px solid;
-    box-shadow:
-      inset -2px -2px 0 0 rgba(0, 0, 0, 0.3),
-      inset 2px 2px 0 0 rgba(255, 255, 255, 0.1),
-      4px 4px 0 0 rgba(0, 0, 0, 0.4);
-  }
-
-  .glow-text {
-    text-shadow: 0 0 10px currentColor, 0 0 20px currentColor, 0 0 40px currentColor;
-  }
-
-  .neon-line {
-    @apply h-px w-full;
-    background: linear-gradient(
-      90deg,
-      transparent,
-      #7CB342,
-      #00E5FF,
-      #7CB342,
-      transparent
-    );
-  }
-
-  .card-hover {
-    @apply transition-all duration-300;
-  }
-
-  .card-hover:hover {
-    @apply -translate-y-1;
-    box-shadow: 0 0 15px rgba(124, 179, 66, 0.2), 0 8px 25px rgba(0, 0, 0, 0.4);
-  }
-
-  .cyber-grid {
-    background-image:
-      linear-gradient(rgba(124, 179, 66, 0.03) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(124, 179, 66, 0.03) 1px, transparent 1px);
-    background-size: 40px 40px;
-  }
-
-  .gradient-mask-b {
-    mask-image: linear-gradient(to bottom, black 60%, transparent);
-    -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent);
-  }
-}
-
 @layer utilities {
-  .animate-fade-in {
-    animation: fadeIn 0.4s ease-out;
-  }
-
   @keyframes fadeIn {
     from {
       opacity: 0;
@@ -92,10 +189,6 @@
       opacity: 1;
       transform: translateY(0);
     }
-  }
-
-  .animate-scan {
-    animation: scan 4s linear infinite;
   }
 
   @keyframes scan {

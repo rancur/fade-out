@@ -16,7 +16,7 @@ export default function AIUsage() {
   if (isLoading) {
     return (
       <div className="space-y-6">
-        <div className="h-8 w-48 bg-surface-light rounded animate-pulse" />
+        <div className="h-8 w-48 bg-surface-light rounded-sm animate-pulse" />
         <div className="grid grid-cols-3 gap-4">
           {[1, 2, 3].map((i) => (
             <div key={i} className="h-28 bg-surface-light rounded-xl animate-pulse" />
@@ -90,10 +90,10 @@ export default function AIUsage() {
             className={clsx(
               'h-full rounded-full transition-all duration-1000 relative',
               pct > 90
-                ? 'bg-gradient-to-r from-cyber-orange to-cyber-red'
+                ? 'bg-linear-to-r from-cyber-orange to-cyber-red'
                 : pct > 70
-                  ? 'bg-gradient-to-r from-gold to-cyber-orange'
-                  : 'bg-gradient-to-r from-primary to-cyber-cyan',
+                  ? 'bg-linear-to-r from-gold to-cyber-orange'
+                  : 'bg-linear-to-r from-primary to-cyber-cyan',
             )}
             style={{ width: `${Math.min(100, pct)}%` }}
           >
