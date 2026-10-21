@@ -241,3 +241,99 @@ class TestUploadShort:
         up = YouTubeUploader()
         with pytest.raises(FileNotFoundError):
             await up.upload_short("/nope/missing.mp4", "t", "d", [])
+
+
+# A real mix's video: public, processed, and blocked in
+# the US by a Content ID claim — exactly as videos.list returned it.
+BLOCKED_RESTRICTION = {"blocked": ["CA", "US"]}
+
+
+class TestRegionBlockReason:
+    def test_blocked_in_home_region(self):
+        from app.services.youtube_uploader import region_block_reason
+
+        reason = region_block_reason(BLOCKED_RESTRICTION, "US")
+        assert reason and "blocked in US" in reason
+
+    def test_blocked_elsewhere_only_is_fine(self):
+        from app.services.youtube_uploader import region_block_reason
+
+        assert region_block_reason({"blocked": ["BY", "RU"]}, "US") is None
+
+    def test_allow_list_excluding_home_region(self):
+        from app.services.youtube_uploader import region_block_reason
+
+        reason = region_block_reason({"allowed": ["GB", "DE"]}, "US")
+        assert reason and "not allowed in US" in reason
+
+    def test_allow_list_including_home_region(self):
+        from app.services.youtube_uploader import region_block_reason
+
+        assert region_block_reason({"allowed": ["US"]}, "us") is None
+
+    def test_no_restriction(self):
+        from app.services.youtube_uploader import region_block_reason
+
+        assert region_block_reason(None, "US") is None
+        assert region_block_reason({}, "US") is None
+
+
+class TestVerifyUploadRegion:
+    def _uploader(self, monkeypatch, item):
+        up = YouTubeUploader()
+        fake_service = MagicMock()
+        fake_service.videos.return_value.list.return_value.execute.return_value = {
+            "items": [item]
+        }
+        monkeypatch.setattr(up, "_get_service", lambda: fake_service)
+        return up, fake_service
+
+    async def test_reports_home_region_block(self, monkeypatch):
+        up, svc = self._uploader(monkeypatch, {
+            "id": "blockedvid1",
+            "status": {"uploadStatus": "processed", "privacyStatus": "public"},
+            "processingDetails": {"processingStatus": "succeeded"},
+            "contentDetails": {"regionRestriction": BLOCKED_RESTRICTION},
+            "snippet": {"title": "Example Mix | House Mix"},
+        })
+        result = await up.verify_upload("blockedvid1")
+
+        assert "contentDetails" in svc.videos.return_value.list.call_args.kwargs["part"]
+        assert result["privacy"] == "public"
+        assert result["region_restriction"] == BLOCKED_RESTRICTION
+        assert "blocked in US" in result["home_region_block"]
+
+    async def test_unrestricted_video_has_no_block(self, monkeypatch):
+        up, _ = self._uploader(monkeypatch, {
+            "id": "J2SVLsf790s",
+            "status": {"uploadStatus": "processed", "privacyStatus": "public"},
+            "contentDetails": {},
+            "snippet": {"title": "Dune Mirage Groove | House Mix"},
+        })
+        result = await up.verify_upload("J2SVLsf790s")
+        assert result["home_region_block"] is None
+
+
+class TestGetVideos:
+    async def test_batches_by_fifty_and_omits_missing(self, monkeypatch):
+        up = YouTubeUploader()
+        fake_service = MagicMock()
+        calls = []
+
+        def list_(part, id):
+            ids = id.split(",")
+            calls.append(len(ids))
+            req = MagicMock()
+            req.execute.return_value = {
+                "items": [{"id": v} for v in ids if v != "gone"]
+            }
+            return req
+
+        fake_service.videos.return_value.list.side_effect = list_
+        monkeypatch.setattr(up, "_get_service", lambda: fake_service)
+
+        ids = [f"v{i}" for i in range(60)] + ["gone", "v0"]
+        found = await up.get_videos(ids)
+
+        assert calls == [50, 11]  # duplicates collapsed, 61 unique ids
+        assert "gone" not in found and len(found) == 60
