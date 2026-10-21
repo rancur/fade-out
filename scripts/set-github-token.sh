@@ -24,11 +24,12 @@
 #   scripts/set-github-token.sh --ssh nas --env-file /srv/fade-out/.env
 #   scripts/set-github-token.sh --check               # is it wired? (no read)
 #
-# The credential is read from 1Password. Defaults, overridable by flag or env:
+# The credential is read from 1Password. Vault and item have no default; pass
+# them by flag or env. Field defaults to `credential`:
 #
-#   vault  FADEOUT_TOKEN_VAULT   (no default)
-#   item   FADEOUT_TOKEN_ITEM    (no default)
-#   field  FADEOUT_TOKEN_FIELD   credential
+#   vault  --vault  FADEOUT_TOKEN_VAULT   (required)
+#   item   --item   FADEOUT_TOKEN_ITEM    (required)
+#   field  --field  FADEOUT_TOKEN_FIELD   credential
 #
 # WHAT THE CREDENTIAL SHOULD BE
 #
@@ -70,7 +71,7 @@ while [ $# -gt 0 ]; do
     --item)     ITEM="$2"; shift 2 ;;
     --field)    FIELD="$2"; shift 2 ;;
     --check)    MODE="check"; shift ;;
-    -h|--help)  sed -n '2,48p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,49p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -91,6 +92,12 @@ if [ "$MODE" = "check" ]; then
   echo "$VAR_NAME is NOT set in $ENV_FILE${SSH_HOST:+ on $SSH_HOST}" >&2
   echo "the freshness check will report 'cannot determine' until it is" >&2
   exit 1
+fi
+
+if [ -z "$VAULT" ] || [ -z "$ITEM" ]; then
+  echo "fatal: name the 1Password vault and item that hold the token:" >&2
+  echo "  --vault NAME --item NAME   (or FADEOUT_TOKEN_VAULT / FADEOUT_TOKEN_ITEM)" >&2
+  exit 2
 fi
 
 command -v op >/dev/null 2>&1 || {
