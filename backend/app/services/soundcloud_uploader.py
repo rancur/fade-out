@@ -1139,11 +1139,17 @@ class SoundCloudUploader:
             except Exception as exc:
                 logger.debug("API verification failed, trying HTTP: %s", exc)
 
-        # Fallback: HTTP HEAD/GET check
+        # Fallback: public oEmbed. NOT a plain GET of the track URL —
+        # soundcloud.com answers 200 for any path, including tracks that do
+        # not exist, so that check could never fail. oEmbed 404s on a
+        # missing or private track.
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(track_url)
+            resp = await client.get(
+                "https://soundcloud.com/oembed",
+                params={"format": "json", "url": track_url},
+            )
             if resp.status_code == 200:
-                logger.info("SoundCloud upload verified via HTTP: %s", track_url)
+                logger.info("SoundCloud upload verified via oEmbed: %s", track_url)
                 return True
 
         logger.warning("SoundCloud verification failed for %s", track_url)
