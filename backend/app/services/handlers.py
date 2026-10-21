@@ -921,11 +921,24 @@ async def handle_verify_youtube(
     if status.get("status") == "error":
         raise RuntimeError(f"YouTube verification error: {status.get('error')}")
 
+    block = status.get("home_region_block")
+    if block:
+        # Not a step failure: the upload itself worked and retrying cannot
+        # lift a claim. Recorded loudly here; the availability watchdog owns
+        # alerting, because a claim usually lands AFTER this step has run.
+        await _emit_activity(
+            "warn", "youtube_region_blocked",
+            f"YouTube video {video_id} is {block}",
+            mix_id=mix_id, platform="youtube",
+            context={"region_restriction": status.get("region_restriction")},
+        )
+
     return {
         "verified": True,
         "upload_status": status.get("status"),
         "processing": status.get("processing"),
         "video_id": video_id,
+        "home_region_block": block,
     }
 
 

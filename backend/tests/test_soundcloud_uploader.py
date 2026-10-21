@@ -578,3 +578,24 @@ class TestUnpersistedRefreshGuard:
         token = await up._ensure_access_token()
         assert token == "new-access"
         assert recorded == {"access": "new-access", "refresh": "new-refresh"}
+
+
+class TestVerifyUploadFallback:
+    """Without an API token, verification must still be able to FAIL."""
+
+    async def test_fallback_uses_oembed_not_a_bare_get(self):
+        up = SoundCloudUploader()
+        up._access_token = None
+        FakeAsyncClient.get_response = FakeResp(200)
+
+        assert await up.verify_upload("https://soundcloud.com/thewillsee/real-mix") is True
+        assert FakeAsyncClient.last_get["url"] == "https://soundcloud.com/oembed"
+        assert FakeAsyncClient.last_get["params"]["url"].endswith("/real-mix")
+
+    async def test_missing_track_fails_verification(self):
+        # soundcloud.com/<anything> is a 200; oEmbed for a missing track is a 404.
+        up = SoundCloudUploader()
+        up._access_token = None
+        FakeAsyncClient.get_response = FakeResp(404)
+
+        assert await up.verify_upload("https://soundcloud.com/thewillsee/no-such-mix") is False

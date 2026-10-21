@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     # Each write (videos.update / thumbnails.set / playlistItems.*) costs ~50
     # units; the true daily cap is 10k, so 8k leaves headroom for uploads.
     YOUTUBE_DAILY_QUOTA_BUDGET: int = 8000
+    # ISO 3166-1 alpha-2 region the channel's audience is in. A video that is
+    # public but region-blocked HERE (typically by a Content ID claim) is not
+    # published as far as the owner is concerned, and is reported as such.
+    YOUTUBE_HOME_REGION: str = "US"
 
     # --- YouTube Shorts (vertical clip auto-uploader) ---
     # Watches SHORTS_WATCH_PATH (read-only mount of the OBS Backtrack folder)

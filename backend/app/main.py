@@ -44,6 +44,7 @@ from app.services.pipeline import (
 from app.services.platform_health import get_platform_health
 from app.services.shorts_pipeline import get_shorts_service
 from app.services.stuck_mix_watchdog import get_stuck_mix_watchdog
+from app.services.availability_watchdog import get_availability_watchdog
 from app.services.upgrade_service import deployment_status, deployment_watch_loop
 from app.version import __version__ as APP_VERSION_STR, build_info
 
@@ -158,12 +159,19 @@ async def lifespan(app: FastAPI):
     stuck_watchdog = get_stuck_mix_watchdog()
     await stuck_watchdog.start()
 
+    # Availability watchdog: a mix that published and was then claimed or
+    # removed is still a mix the audience cannot hear. Re-checks on a timer
+    # because Content ID lands after verify_youtube has already run.
+    availability_watchdog = get_availability_watchdog()
+    await availability_watchdog.start()
+
     await activity_log.info("service_started", "fade-out started; watching for drops.")
 
     logger.info("Fade-Out is running.")
     yield
     logger.info("Fade-Out shutting down.")
     await stuck_watchdog.stop()
+    await availability_watchdog.stop()
     await platform_health.stop()
     deployment_task.cancel()
     try:

@@ -36,6 +36,9 @@ NOTIFICATION_TYPES = {
     "platform_failed",
     "publish_incomplete",
     "stuck_mix",
+    # Published, but not watchable for the home audience (Content ID region
+    # block, or the video was removed). Found by the availability watchdog.
+    "mix_unavailable",
     "deployment_stale",
     # A platform credential stopped working. This fires on the TRANSITION into
     # dead, not on every probe: the health loop re-checks every few minutes and
@@ -57,6 +60,7 @@ DEFAULT_EVENT_TOGGLES: Dict[str, bool] = {
     "platform_failed": True,
     "publish_incomplete": True,
     "stuck_mix": True,
+    "mix_unavailable": True,
     "deployment_stale": True,
     "credential_dead": True,
 }
@@ -67,6 +71,7 @@ TYPE_LEVELS: Dict[str, str] = {
     "platform_failed": "error",
     "publish_incomplete": "error",
     "stuck_mix": "warn",
+    "mix_unavailable": "error",
     "deployment_stale": "warn",
     # Nothing publishes to that platform until a human re-authorises, so this
     # is an error, not a warning.
@@ -90,6 +95,7 @@ DISCORD_COLORS: Dict[str, int] = {
     "platform_failed": 0xE74C3C,    # red
     "publish_incomplete": 0xE67E22, # dark orange
     "stuck_mix": 0xE67E22,          # dark orange
+    "mix_unavailable": 0xE74C3C,    # red
     "deployment_stale": 0xE67E22,   # dark orange
 }
 
@@ -576,6 +582,7 @@ class NotificationService:
             "platform_failed": "#E74C3C",
             "publish_incomplete": "#E67E22",
             "stuck_mix": "#E67E22",
+            "mix_unavailable": "#E74C3C",
             "deployment_stale": "#E67E22",
             "upload_complete": "#9B59B6",
             "draft_ready": "#F39C12",
