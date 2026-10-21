@@ -17,6 +17,29 @@ from app.services.platform_errors import PlatformAuthError, PlatformTransientErr
 logger = logging.getLogger(__name__)
 
 
+def region_block_reason(
+    region_restriction: Optional[Dict[str, Any]], region: str
+) -> Optional[str]:
+    """Why a video cannot be watched in ``region``, or None if it can.
+
+    ``contentDetails.regionRestriction`` carries either a ``blocked`` list or
+    an ``allowed`` list. A Content ID claim with a block policy shows up here
+    minutes after an upload that the API otherwise reports as public and
+    processed — the only place the block is visible through the Data API.
+    """
+    if not region_restriction or not region:
+        return None
+    region = region.upper()
+    blocked = region_restriction.get("blocked") or []
+    if region in blocked:
+        return f"blocked in {region} (regionRestriction.blocked={blocked})"
+    if "allowed" in region_restriction and region not in (
+        region_restriction.get("allowed") or []
+    ):
+        return f"not allowed in {region} (regionRestriction.allowed={region_restriction['allowed']})"
+    return None
+
+
 class YouTubeAuthError(PlatformAuthError):
     """The YouTube OAuth grant was refused — re-authorization required."""
 
@@ -599,7 +622,7 @@ class YouTubeUploader:
         try:
             response = await asyncio.to_thread(
                 youtube.videos().list(
-                    part="status,snippet,processingDetails",
+                    part="status,snippet,processingDetails,contentDetails",
                     id=video_id,
                 ).execute
             )
@@ -613,12 +636,17 @@ class YouTubeUploader:
             privacy = video.get("status", {}).get("privacyStatus", "unknown")
             processing = video.get("processingDetails", {}).get("processingStatus", "unknown")
 
+            region_restriction = video.get("contentDetails", {}).get("regionRestriction")
             result = {
                 "status": upload_status,
                 "privacy": privacy,
                 "processing": processing,
                 "video_id": video_id,
                 "title": video.get("snippet", {}).get("title", ""),
+                "region_restriction": region_restriction,
+                "home_region_block": region_block_reason(
+                    region_restriction, settings.YOUTUBE_HOME_REGION
+                ),
             }
             logger.info("YouTube verification for %s: %s", video_id, result)
             return result
@@ -626,6 +654,27 @@ class YouTubeUploader:
         except Exception as exc:
             logger.error("YouTube verification failed for %s: %s", video_id, exc)
             return {"status": "error", "error": str(exc), "video_id": video_id}
+
+    async def get_videos(self, video_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Raw ``status,contentDetails`` resources keyed by id (1 unit / 50 ids).
+
+        An id missing from the result was not returned by the API — deleted,
+        removed, or never existed. Errors propagate: a caller that cannot reach
+        the API must report "unknown", not "all present".
+        """
+        import asyncio
+        youtube = self._get_service()
+        found: Dict[str, Dict[str, Any]] = {}
+        ids = list(dict.fromkeys(v for v in video_ids if v))
+        for i in range(0, len(ids), 50):
+            response = await asyncio.to_thread(
+                youtube.videos().list(
+                    part="status,contentDetails", id=",".join(ids[i:i + 50]),
+                ).execute
+            )
+            for item in response.get("items", []):
+                found[item["id"]] = item
+        return found
 
     # ==================================================================
     # Catalog listing / editing APIs (Stage C — back-catalog management)
