@@ -20,6 +20,7 @@ from app.services import app_config
 from app.services import ingest as ingest_module
 from app.services.platform_health import get_platform_health
 from app.services.stuck_mix_watchdog import get_stuck_mix_watchdog
+from app.services.availability_watchdog import get_availability_watchdog
 from app.services.upgrade_service import deployment_status
 from app.version import __version__, build_info
 
@@ -63,6 +64,7 @@ async def system_health() -> Dict[str, Any]:
     platforms = get_platform_health().snapshot()
     deployment = deployment_status.as_dict()
     stuck = get_stuck_mix_watchdog().last_result
+    unavailable = get_availability_watchdog().last_result
 
     platforms_ok = all(p["healthy"] for p in platforms.values())
     ok = db_ok and disk_ok and platforms_ok and deployment["healthy"]
@@ -77,6 +79,15 @@ async def system_health() -> Dict[str, Any]:
             "state": stuck.get("state", "unknown"),
             "count": stuck.get("stuck_count"),
             "checked_at": stuck.get("checked_at"),
+        },
+        "unavailable_mixes": {
+            "state": unavailable.get("state", "unknown"),
+            "count": unavailable.get("unavailable_count"),
+            "checked_at": unavailable.get("checked_at"),
+            "items": [
+                {k: e.get(k) for k in ("id", "title", "youtube_url", "reason")}
+                for e in unavailable.get("unavailable", [])
+            ],
         },
         "db_ok": db_ok,
         "watcher_running": coordinator is not None,
@@ -103,6 +114,20 @@ async def unpublished_mixes(refresh: bool = False) -> Dict[str, Any]:
     has never run reports ``unknown``, never an empty "all clear".
     """
     watchdog = get_stuck_mix_watchdog()
+    if refresh:
+        return await watchdog.check(alert=False)
+    return watchdog.last_result
+
+
+@router.get("/unavailable")
+async def unavailable_mixes(refresh: bool = False) -> Dict[str, Any]:
+    """Published mixes YouTube no longer serves to the home region.
+
+    ``refresh=true`` re-checks now (1 quota unit per 50 videos) instead of
+    returning the watchdog's last result. A check that could not reach
+    YouTube reports ``unknown``, never an empty all-clear.
+    """
+    watchdog = get_availability_watchdog()
     if refresh:
         return await watchdog.check(alert=False)
     return watchdog.last_result
