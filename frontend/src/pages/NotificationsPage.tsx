@@ -62,7 +62,7 @@ function toForm(s: NotificationSettings): FormState {
 }
 
 const inputCls =
-  'w-full bg-surface border border-white/10 rounded-lg px-3 py-2 text-sm font-mono text-gray-300 placeholder:text-gray-600 focus:outline-none focus:border-primary/40'
+  'w-full bg-surface border border-white/10 rounded-lg px-3 py-2 text-sm font-mono text-gray-300 placeholder:text-gray-600 focus:outline-hidden focus:border-primary/40'
 
 function Field({
   label,
@@ -251,7 +251,7 @@ function SettingsTab() {
                 type="checkbox"
                 checked={form.email_smtp_secure}
                 onChange={(e) => set('email_smtp_secure', e.target.checked)}
-                className="accent-[#7CB342]"
+                className="accent-primary"
               />
               <span className="text-xs text-gray-400 font-mono">Use SSL/TLS</span>
             </label>
@@ -271,13 +271,13 @@ function SettingsTab() {
             {eventKeys.map((key) => (
               <label
                 key={key}
-                className="flex items-center gap-3 px-3 py-2.5 bg-white/[0.02] rounded-lg cursor-pointer select-none hover:bg-white/[0.04] transition-colors"
+                className="flex items-center gap-3 px-3 py-2.5 bg-white/2 rounded-lg cursor-pointer select-none hover:bg-white/4 transition-colors"
               >
                 <input
                   type="checkbox"
                   checked={form.events[key] ?? false}
                   onChange={(e) => set('events', { ...form.events, [key]: e.target.checked })}
-                  className="accent-[#7CB342]"
+                  className="accent-primary"
                 />
                 <div>
                   <p className="text-xs text-gray-300">{EVENT_LABELS[key] ?? key}</p>
@@ -290,7 +290,7 @@ function SettingsTab() {
             <select
               value={form.min_level}
               onChange={(e) => set('min_level', e.target.value as FormState['min_level'])}
-              className="bg-surface border border-white/10 rounded-lg px-3 py-2 text-sm font-mono text-gray-300 focus:outline-none focus:border-primary/40"
+              className="bg-surface border border-white/10 rounded-lg px-3 py-2 text-sm font-mono text-gray-300 focus:outline-hidden focus:border-primary/40"
             >
               {MIN_LEVELS.map((l) => (
                 <option key={l} value={l}>

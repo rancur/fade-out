@@ -116,7 +116,7 @@ export default function BrandSettings() {
           type="text"
           value={form.brand_name}
           onChange={(e) => setForm({ ...form, brand_name: e.target.value })}
-          className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-gray-200 focus:border-primary/40 focus:outline-none font-mono"
+          className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-gray-200 focus:border-primary/40 focus:outline-hidden font-mono"
           placeholder="Your DJ name"
         />
       </div>
@@ -152,7 +152,7 @@ export default function BrandSettings() {
             type="text"
             value={newColor}
             onChange={(e) => setNewColor(e.target.value)}
-            className="w-28 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 font-mono focus:border-primary/40 focus:outline-none"
+            className="w-28 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 font-mono focus:border-primary/40 focus:outline-hidden"
           />
           <button
             onClick={addColor}
@@ -193,7 +193,7 @@ export default function BrandSettings() {
           value={form.visual_style}
           onChange={(e) => setForm({ ...form, visual_style: e.target.value })}
           rows={4}
-          className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none resize-none font-mono"
+          className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-hidden resize-none font-mono"
           placeholder="e.g. Neon-soaked cyberpunk cityscapes with vibrant gradients and abstract geometric overlays..."
         />
       </div>
@@ -208,7 +208,7 @@ export default function BrandSettings() {
           type="text"
           value={form.title_format}
           onChange={(e) => setForm({ ...form, title_format: e.target.value })}
-          className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
+          className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-hidden font-mono"
           placeholder="{brand} - {genre} Mix #{number}"
         />
       </div>
@@ -223,7 +223,7 @@ export default function BrandSettings() {
           value={form.description_template}
           onChange={(e) => setForm({ ...form, description_template: e.target.value })}
           rows={8}
-          className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none resize-none font-mono"
+          className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-hidden resize-none font-mono"
           placeholder={`{title}\n\nGenre: {genres}\nDuration: {duration}\n\n{tracklist}\n\nFollow me on SoundCloud for more mixes.`}
         />
       </div>
@@ -251,7 +251,7 @@ export default function BrandSettings() {
             onChange={(e) => setNewMotif(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && addMotif()}
             placeholder="Add a motif..."
-            className="flex-1 px-4 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
+            className="flex-1 px-4 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-hidden font-mono"
           />
           <button
             onClick={addMotif}
@@ -290,7 +290,7 @@ export default function BrandSettings() {
             value={newModGenre}
             onChange={(e) => setNewModGenre(e.target.value)}
             placeholder="Genre"
-            className="w-32 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
+            className="w-32 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-hidden font-mono"
           />
           <input
             type="text"
@@ -298,7 +298,7 @@ export default function BrandSettings() {
             onChange={(e) => setNewModStyle(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && addModifier()}
             placeholder="Visual style modifier..."
-            className="flex-1 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none font-mono"
+            className="flex-1 px-3 py-2 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-hidden font-mono"
           />
           <button
             onClick={addModifier}
@@ -321,7 +321,7 @@ export default function BrandSettings() {
               value={form.soundcloud_links}
               onChange={(e) => setForm({ ...form, soundcloud_links: e.target.value })}
               rows={3}
-              className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none resize-none font-mono"
+              className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-hidden resize-none font-mono"
               placeholder="https://soundcloud.com/your-profile"
             />
           </div>
@@ -331,7 +331,7 @@ export default function BrandSettings() {
               value={form.youtube_links}
               onChange={(e) => setForm({ ...form, youtube_links: e.target.value })}
               rows={3}
-              className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-none resize-none font-mono"
+              className="w-full px-4 py-3 bg-dark border border-primary/10 rounded-lg text-sm text-gray-300 focus:border-primary/40 focus:outline-hidden resize-none font-mono"
               placeholder="https://youtube.com/@your-channel"
             />
           </div>

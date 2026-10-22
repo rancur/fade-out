@@ -51,7 +51,7 @@ export default function MixList() {
               setSearch(e.target.value)
               setPage(1)
             }}
-            className="w-full pl-10 pr-4 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:border-primary/40 focus:outline-none transition-colors font-mono"
+            className="w-full pl-10 pr-4 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:border-primary/40 focus:outline-hidden transition-colors font-mono"
           />
         </div>
 
@@ -65,7 +65,7 @@ export default function MixList() {
               setSort(e.target.value as typeof sort)
               setPage(1)
             }}
-            className="pl-10 pr-8 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-none font-mono"
+            className="pl-10 pr-8 py-2.5 bg-surface-light border border-primary/10 rounded-lg text-sm text-gray-300 appearance-none cursor-pointer focus:border-primary/40 focus:outline-hidden font-mono"
           >
             <option value="newest">Newest</option>
             <option value="oldest">Oldest</option>

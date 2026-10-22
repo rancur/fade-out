@@ -69,7 +69,7 @@ function TagsInput({
       {tags.map((t) => (
         <span
           key={t}
-          className="flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-primary/10 text-primary/90 font-mono"
+          className="flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-sm bg-primary/10 text-primary/90 font-mono"
         >
           {t}
           <button
@@ -95,7 +95,7 @@ function TagsInput({
         }}
         onBlur={commit}
         placeholder={tags.length === 0 ? 'add tags…' : ''}
-        className="flex-1 min-w-[80px] bg-transparent text-xs font-mono text-gray-300 placeholder:text-gray-600 focus:outline-none py-0.5"
+        className="flex-1 min-w-[80px] bg-transparent text-xs font-mono text-gray-300 placeholder:text-gray-600 focus:outline-hidden py-0.5"
       />
     </div>
   )
@@ -170,7 +170,7 @@ function PlatformPanel({
           value={fields.title}
           disabled={titleLocked}
           onChange={(e) => onChange({ ...fields, title: e.target.value })}
-          className="w-full px-3 py-2 bg-surface border border-white/10 rounded-lg text-sm text-gray-200 focus:border-primary/40 focus:outline-none transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-mono"
+          className="w-full px-3 py-2 bg-surface border border-white/10 rounded-lg text-sm text-gray-200 focus:border-primary/40 focus:outline-hidden transition-colors disabled:opacity-50 disabled:cursor-not-allowed font-mono"
         />
         {titleLocked && (
           <p className="flex items-center gap-1.5 text-[11px] text-gold font-mono">
@@ -192,7 +192,7 @@ function PlatformPanel({
           value={fields.description}
           onChange={(e) => onChange({ ...fields, description: e.target.value })}
           rows={12}
-          className="w-full px-3 py-2 bg-surface border border-white/10 rounded-lg text-xs text-gray-300 font-mono leading-relaxed focus:border-primary/40 focus:outline-none transition-colors resize-y"
+          className="w-full px-3 py-2 bg-surface border border-white/10 rounded-lg text-xs text-gray-300 font-mono leading-relaxed focus:border-primary/40 focus:outline-hidden transition-colors resize-y"
         />
       </div>
 
@@ -454,13 +454,13 @@ export default function CatalogMixEditor() {
                 className="flex flex-wrap items-center gap-2 text-xs border-b border-white/5 pb-2 last:border-0 last:pb-0"
               >
                 <ProposalStatusChip status={p.status} />
-                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-dark text-gray-500">
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-sm bg-dark text-gray-500">
                   {p.platform}
                 </span>
                 <span className="text-gray-300 font-mono">{p.field}</span>
                 <span
                   className={clsx(
-                    'text-[10px] font-mono px-1.5 py-0.5 rounded',
+                    'text-[10px] font-mono px-1.5 py-0.5 rounded-sm',
                     p.created_by === 'ai'
                       ? 'bg-cyber-magenta/10 text-cyber-magenta'
                       : 'bg-primary/10 text-primary',

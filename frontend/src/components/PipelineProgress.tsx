@@ -28,7 +28,7 @@ const lineColors: Record<string, string> = {
   complete: 'bg-primary',
   completed: 'bg-primary',
   failed: 'bg-cyber-red',
-  running: 'bg-gradient-to-r from-cyber-cyan to-transparent animate-pulse',
+  running: 'bg-linear-to-r from-cyber-cyan to-transparent animate-pulse',
   skipped: 'bg-gray-700',
   waiting: 'bg-gold/40',
   interrupted: 'bg-gold/40',
@@ -95,7 +95,7 @@ export default function PipelineProgress({ steps, vertical = false }: PipelinePr
               <div className="w-20 space-y-0.5">
                 <div className="h-1 bg-dark rounded-full overflow-hidden">
                   <div
-                    className="h-full bg-gradient-to-r from-cyber-cyan to-primary rounded-full transition-all duration-500"
+                    className="h-full bg-linear-to-r from-cyber-cyan to-primary rounded-full transition-all duration-500"
                     style={{ width: `${Math.min(100, Math.max(0, step.progress))}%` }}
                   />
                 </div>

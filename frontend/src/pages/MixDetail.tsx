@@ -57,7 +57,7 @@ export default function MixDetail() {
   if (isLoading) {
     return (
       <div className="space-y-6">
-        <div className="h-8 w-48 bg-surface-light rounded animate-pulse" />
+        <div className="h-8 w-48 bg-surface-light rounded-sm animate-pulse" />
         <div className="h-64 bg-surface-light rounded-xl animate-pulse" />
       </div>
     )
@@ -118,7 +118,7 @@ export default function MixDetail() {
           {mix.cover_art_path ? (
             <img src={`/api/mixes/${mix.id}/cover-art`} alt={mix.title} className="w-full h-full object-cover" />
           ) : (
-            <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-primary/10 to-cyber-cyan/5">
+            <div className="w-full h-full flex items-center justify-center bg-linear-to-br from-primary/10 to-cyber-cyan/5">
               <Music className="w-16 h-16 text-primary/20" />
             </div>
           )}
@@ -266,7 +266,7 @@ export default function MixDetail() {
                 <h3 className="text-sm font-mono text-gray-400 mb-2">Tags</h3>
                 <div className="flex flex-wrap gap-2">
                   {mix.tags.map((t) => (
-                    <span key={t} className="text-xs px-2 py-1 rounded bg-white/5 text-gray-400 font-mono">
+                    <span key={t} className="text-xs px-2 py-1 rounded-sm bg-white/5 text-gray-400 font-mono">
                       {t}
                     </span>
                   ))}
@@ -281,7 +281,7 @@ export default function MixDetail() {
             {/* SoundCloud */}
             <div className="border border-secondary/20 rounded-xl overflow-hidden">
               <div className="flex items-center gap-2 px-5 py-3 bg-secondary/5 border-b border-secondary/20">
-                <div className="w-2.5 h-2.5 rounded-full bg-secondary shadow-[0_0_6px_theme(colors.secondary)]" />
+                <div className="w-2.5 h-2.5 rounded-full bg-secondary shadow-[0_0_6px_var(--color-secondary)]" />
                 <span className="text-sm font-mono text-secondary">SoundCloud</span>
                 <span className="text-[11px] text-gray-500 ml-auto font-mono">{mix.title}</span>
               </div>
@@ -295,7 +295,7 @@ export default function MixDetail() {
                       className="w-full md:w-64 md:h-64 object-cover"
                     />
                   ) : (
-                    <div className="w-full h-48 md:h-64 bg-gradient-to-br from-secondary/10 to-cyber-magenta/5 flex items-center justify-center">
+                    <div className="w-full h-48 md:h-64 bg-linear-to-br from-secondary/10 to-cyber-magenta/5 flex items-center justify-center">
                       <Music className="w-16 h-16 text-secondary/20" />
                     </div>
                   )}
@@ -316,7 +316,7 @@ export default function MixDetail() {
             {/* YouTube */}
             <div className="border border-cyber-red/20 rounded-xl overflow-hidden">
               <div className="flex items-center gap-2 px-5 py-3 bg-cyber-red/5 border-b border-cyber-red/20">
-                <div className="w-2.5 h-2.5 rounded-full bg-cyber-red shadow-[0_0_6px_theme(colors.cyber.red)]" />
+                <div className="w-2.5 h-2.5 rounded-full bg-cyber-red shadow-[0_0_6px_var(--color-cyber-red)]" />
                 <span className="text-sm font-mono text-cyber-red">YouTube</span>
                 {mix.title_youtube && (
                   <span className="text-[11px] text-gray-500 ml-auto font-mono">{mix.title_youtube}</span>
@@ -332,7 +332,7 @@ export default function MixDetail() {
                       className="w-full md:w-80 md:h-[180px] object-cover"
                     />
                   ) : (
-                    <div className="w-full h-48 md:h-[180px] bg-gradient-to-br from-cyber-red/10 to-cyber-orange/5 flex items-center justify-center">
+                    <div className="w-full h-48 md:h-[180px] bg-linear-to-br from-cyber-red/10 to-cyber-orange/5 flex items-center justify-center">
                       <Music className="w-16 h-16 text-cyber-red/20" />
                     </div>
                   )}
@@ -359,7 +359,7 @@ export default function MixDetail() {
                 {mix.tracklist.map((track, i) => (
                   <li
                     key={i}
-                    className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-white/[0.02] transition-colors"
+                    className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-white/2 transition-colors"
                   >
                     <span className="text-xs text-gray-600 font-mono w-6 text-right">{i + 1}</span>
                     <span className="text-xs text-gray-500 font-mono w-16">

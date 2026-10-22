@@ -39,7 +39,7 @@ function Row({ item }: { item: ActivityItem }) {
   const validTs = !isNaN(ts.getTime())
 
   return (
-    <div className="border-b border-white/5 hover:bg-white/[0.02] animate-slide-in">
+    <div className="border-b border-white/5 hover:bg-white/2 animate-slide-in">
       <div className="flex gap-3 px-5 py-3">
         <Icon className={clsx('w-4 h-4 mt-0.5 shrink-0', style.text)} />
         <div className="min-w-0 flex-1">
@@ -53,7 +53,7 @@ function Row({ item }: { item: ActivityItem }) {
             {item.event && (
               <span
                 className={clsx(
-                  'text-[10px] font-mono px-1.5 py-0.5 rounded border border-current/20 bg-current/5',
+                  'text-[10px] font-mono px-1.5 py-0.5 rounded-sm border border-current/20 bg-current/5',
                   style.text,
                 )}
               >
@@ -61,7 +61,7 @@ function Row({ item }: { item: ActivityItem }) {
               </span>
             )}
             {item.platform && (
-              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-dark text-gray-500">
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-sm bg-dark text-gray-500">
                 {item.platform}
               </span>
             )}
@@ -69,7 +69,7 @@ function Row({ item }: { item: ActivityItem }) {
               <span className="text-[10px] font-mono text-gray-600">{item.stage}</span>
             )}
           </div>
-          <p className="text-sm text-gray-300 break-words leading-snug mt-1">{item.message}</p>
+          <p className="text-sm text-gray-300 wrap-break-word leading-snug mt-1">{item.message}</p>
           <div className="flex items-center gap-3 mt-1">
             {item.mix_id && (
               <Link
@@ -276,7 +276,7 @@ export default function ActivityPage() {
           <select
             value={platform}
             onChange={(e) => setPlatform(e.target.value)}
-            className="bg-surface border border-white/10 rounded-lg px-2 py-1.5 text-[11px] font-mono text-gray-300 focus:outline-none focus:border-primary/40"
+            className="bg-surface border border-white/10 rounded-lg px-2 py-1.5 text-[11px] font-mono text-gray-300 focus:outline-hidden focus:border-primary/40"
           >
             <option value="all">all platforms</option>
             {platformOptions.map((p) => (
@@ -290,7 +290,7 @@ export default function ActivityPage() {
           <select
             value={eventType}
             onChange={(e) => setEventType(e.target.value)}
-            className="bg-surface border border-white/10 rounded-lg px-2 py-1.5 text-[11px] font-mono text-gray-300 focus:outline-none focus:border-primary/40"
+            className="bg-surface border border-white/10 rounded-lg px-2 py-1.5 text-[11px] font-mono text-gray-300 focus:outline-hidden focus:border-primary/40"
           >
             <option value="all">all events</option>
             {eventOptions.map((ev) => (
@@ -309,7 +309,7 @@ export default function ActivityPage() {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="search messages…"
-              className="w-full bg-surface border border-white/10 rounded-lg pl-8 pr-2 py-1.5 text-xs font-mono text-gray-300 placeholder:text-gray-600 focus:outline-none focus:border-primary/40"
+              className="w-full bg-surface border border-white/10 rounded-lg pl-8 pr-2 py-1.5 text-xs font-mono text-gray-300 placeholder:text-gray-600 focus:outline-hidden focus:border-primary/40"
             />
           </div>
 
@@ -320,7 +320,7 @@ export default function ActivityPage() {
               value={mixId}
               onChange={(e) => setMixId(e.target.value)}
               placeholder="filter by mix id…"
-              className="w-full bg-surface border border-white/10 rounded-lg pl-8 pr-7 py-1.5 text-xs font-mono text-gray-300 placeholder:text-gray-600 focus:outline-none focus:border-primary/40"
+              className="w-full bg-surface border border-white/10 rounded-lg pl-8 pr-7 py-1.5 text-xs font-mono text-gray-300 placeholder:text-gray-600 focus:outline-hidden focus:border-primary/40"
             />
             {mixId && (
               <button
@@ -339,7 +339,7 @@ export default function ActivityPage() {
             value={since}
             onChange={(e) => setSince(e.target.value)}
             title="From"
-            className="bg-surface border border-white/10 rounded-lg px-2 py-1.5 text-[11px] font-mono text-gray-400 focus:outline-none focus:border-primary/40 [color-scheme:dark]"
+            className="bg-surface border border-white/10 rounded-lg px-2 py-1.5 text-[11px] font-mono text-gray-400 focus:outline-hidden focus:border-primary/40 scheme-dark"
           />
           <span className="text-[10px] text-gray-600 font-mono">to</span>
           <input
@@ -347,7 +347,7 @@ export default function ActivityPage() {
             value={until}
             onChange={(e) => setUntil(e.target.value)}
             title="Until"
-            className="bg-surface border border-white/10 rounded-lg px-2 py-1.5 text-[11px] font-mono text-gray-400 focus:outline-none focus:border-primary/40 [color-scheme:dark]"
+            className="bg-surface border border-white/10 rounded-lg px-2 py-1.5 text-[11px] font-mono text-gray-400 focus:outline-hidden focus:border-primary/40 scheme-dark"
           />
         </div>
       </div>

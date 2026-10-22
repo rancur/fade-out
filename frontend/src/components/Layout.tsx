@@ -42,8 +42,8 @@ function LiveDot({ collapsed }: { collapsed: boolean }) {
         className={clsx(
           'w-2 h-2 rounded-full shrink-0',
           connected
-            ? 'bg-cyber-lime shadow-[0_0_6px_theme(colors.cyber.lime)]'
-            : 'bg-gold shadow-[0_0_6px_theme(colors.gold)] animate-pulse',
+            ? 'bg-cyber-lime shadow-[0_0_6px_var(--color-cyber-lime)]'
+            : 'bg-gold shadow-[0_0_6px_var(--color-gold)] animate-pulse',
         )}
       />
       {!collapsed && (
@@ -94,7 +94,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 clsx(
                   'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-all duration-200 group',
                   isActive
-                    ? 'bg-primary/10 text-primary shadow-neon/20'
+                    ? 'bg-primary/10 text-primary'
                     : 'text-gray-400 hover:text-gray-200 hover:bg-white/5',
                 )
               }

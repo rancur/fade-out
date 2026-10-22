@@ -104,7 +104,7 @@ export default function NotificationHistoryList() {
               return (
                 <div
                   key={notif.id}
-                  className="flex items-start gap-4 px-6 py-4 transition-colors hover:bg-white/[0.02]"
+                  className="flex items-start gap-4 px-6 py-4 transition-colors hover:bg-white/2"
                 >
                   {/* Icon */}
                   <div className={clsx('mt-0.5 shrink-0', color)}>
@@ -117,10 +117,10 @@ export default function NotificationHistoryList() {
                       <div>
                         <p className="text-sm text-gray-200 font-medium">{notif.message}</p>
                         <div className="flex items-center gap-2 mt-1">
-                          <span className="text-[10px] text-gray-600 font-mono px-1.5 py-0.5 bg-dark rounded">
+                          <span className="text-[10px] text-gray-600 font-mono px-1.5 py-0.5 bg-dark rounded-sm">
                             {notif.channel}
                           </span>
-                          <span className="text-[10px] text-gray-600 font-mono px-1.5 py-0.5 bg-dark rounded">
+                          <span className="text-[10px] text-gray-600 font-mono px-1.5 py-0.5 bg-dark rounded-sm">
                             {notif.type}
                           </span>
                           {notif.sent ? (
