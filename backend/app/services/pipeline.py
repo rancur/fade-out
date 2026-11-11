@@ -17,7 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database import async_session_factory
 from app.models import Mix, PipelineStep
-from app.services import app_config
+from app.services import app_config, duplicate_guard
+from app.services.duplicate_guard import STATUS_DUPLICATE
 from app.services.platform_errors import FailureCause, classify_failure
 
 logger = logging.getLogger(__name__)
@@ -448,6 +449,11 @@ class PipelineOrchestrator:
                 mix.pipeline_started_at = datetime.now(timezone.utc)
                 await session.commit()
 
+            # A copy of a recording that is already out (or already queued)
+            # is parked before hours of analysis are spent on it.
+            if await self._skip_if_duplicate(mix_id, stage="ingest"):
+                return
+
             # Phase 1 — shared prep. A prep failure genuinely blocks every
             # platform, so it still stops the run.
             for step_name in PREP_STEPS:
@@ -521,6 +527,11 @@ class PipelineOrchestrator:
         """
         targets = platforms or list(PLATFORM_LEGS)
         outcomes: Dict[str, dict] = {}
+
+        # The last gate before anything uploads: every route into publishing
+        # (first run, draft approval, platform retry) passes through here.
+        if await self._skip_if_duplicate(mix_id, stage="pre-publish"):
+            return {p: {"status": STATUS_DUPLICATE} for p in targets}
 
         for platform in targets:
             steps = PLATFORM_LEGS.get(platform)
@@ -635,6 +646,10 @@ class PipelineOrchestrator:
         A platform step continues its own leg and re-finalizes; it no longer
         drags the other platforms' steps along behind it.
         """
+        if leg_for_step(step_name) and step_name.startswith("upload_"):
+            if await self._skip_if_duplicate(mix_id, stage="pre-publish"):
+                return False
+
         result = await self._execute_step(mix_id, step_name, force=True)
         if not result.ok:
             await self._finalize(mix_id)
@@ -891,6 +906,32 @@ class PipelineOrchestrator:
                     i + 1, max_checks, mix_id,
                 )
         return False, last_reason
+
+    async def _skip_if_duplicate(self, mix_id: str, *, stage: str) -> bool:
+        """Park the mix as a duplicate if it is one. True when parked.
+
+        Fails open: a bug in the guard must not stop every upload. The failure
+        is logged as a warning so it is visible rather than silent.
+        """
+        try:
+            match = await duplicate_guard.find_duplicate(mix_id)
+            if match is None:
+                return False
+            await duplicate_guard.mark_duplicate(mix_id, match, stage=stage)
+            return True
+        except Exception as exc:
+            logger.exception("Duplicate check failed for mix %s", mix_id)
+            try:
+                from app.services import activity_log
+
+                await activity_log.warn(
+                    "duplicate_check_failed",
+                    f"Duplicate check failed, continuing: {exc}",
+                    mix_id=mix_id, stage=stage,
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
+            return False
 
     # ------------------------------------------------------------------
     # Persistence helpers
