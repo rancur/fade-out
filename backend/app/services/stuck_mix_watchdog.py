@@ -26,6 +26,7 @@ from sqlalchemy import or_, select
 from app.database import async_session_factory
 from app.models import Mix
 from app.services import app_config
+from app.services.duplicate_guard import STATUS_DUPLICATE
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,10 @@ class StuckMixWatchdog:
                     "soundcloud_url": m.soundcloud_url,
                     "youtube_url": m.youtube_url,
                     "mixcloud_url": m.mixcloud_url,
+                    "duplicate_of": (
+                        (m.metadata_json or {}).get("duplicate_of")
+                        if isinstance(m.metadata_json, dict) else None
+                    ),
                 }
                 for m in rows
             ]
@@ -169,6 +174,12 @@ class StuckMixWatchdog:
             if status == "completed" and published_anywhere:
                 continue
 
+            # A duplicate is parked on purpose: the recording is already out
+            # under another mix. Reporting it would only re-ask a settled
+            # question.
+            if status == STATUS_DUPLICATE or mix["duplicate_of"]:
+                continue
+
             is_draft = status == "draft_review"
             window = draft_hours if is_draft else unpublished_hours
 
@@ -185,7 +196,10 @@ class StuckMixWatchdog:
                 )
             )
             stuck.append({
-                **{k: v for k, v in mix.items() if k not in ("created_at", "completed_at")},
+                **{
+                    k: v for k, v in mix.items()
+                    if k not in ("created_at", "completed_at", "duplicate_of")
+                },
                 "age_hours": round(age_hours, 1) if age_hours is not None else None,
                 "window_hours": window,
                 "reason": reason,

@@ -19,6 +19,8 @@ const statusConfig: Record<string, { label: string; color: string; glow: string 
   skipped: { label: 'Skipped', color: 'text-gray-500 border-gray-600', glow: '' },
   waiting: { label: 'Waiting', color: 'text-gold border-gold', glow: '' },
   interrupted: { label: 'Interrupted', color: 'text-gold border-gold border-dashed', glow: '' },
+  // Same recording as a mix that is already out; parked by the duplicate guard.
+  duplicate: { label: 'Duplicate', color: 'text-gray-500 border-gray-600 border-dashed', glow: '' },
 }
 
 const animatedStatuses = new Set(['running', 'analyzing', 'generating', 'uploading_soundcloud', 'uploading_youtube'])

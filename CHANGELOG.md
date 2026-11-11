@@ -1,5 +1,30 @@
 # Changelog
 
+## v2.6.2 — 2026-11-11
+
+### Duplicate guard: the same recording is never published twice
+
+On 2026-11-04 the original video files of two mixes that were already live
+reappeared in the watch directory. Ingest paired each with the existing FLAC,
+created a new mix, and the pipeline published both again under new titles on
+YouTube and SoundCloud. Nothing compared a new mix with what was already out.
+
+- Before any upload, and again before analysis starts, the pipeline compares
+  the mix with every mix that is published or queued: same source file path,
+  identical video bytes (MD5 of the first 10 MB plus size), identical decoded
+  audio (MD5 of a 30 s PCM window, so tag rewrites and renames do not hide a
+  copy) and, for catalog rows with no files, the same title stem and duration.
+  Every rule also needs the durations to agree within 5 s; duration alone is
+  never a match.
+- A match parks the mix as `duplicate` with `metadata_json.duplicate_of`. It is
+  quiet: an info activity entry, no alert, no upload. Its steps are recorded
+  `skipped`. Set `metadata_json.allow_duplicate` to re-upload on purpose.
+- The stuck-mix watchdog no longer reports duplicates.
+- Each checked mix stores its fingerprint, so a later copy is caught even
+  after the original's files are renamed or moved.
+- A catalog row for the mix's own upload is not counted as a duplicate, and a
+  guard error fails open with a warning instead of blocking every upload.
+
 ## v2.6.1 — 2026-09-23
 
 ### Retag backfill: safe to run unattended
