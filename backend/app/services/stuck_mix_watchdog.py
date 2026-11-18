@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +27,7 @@ from sqlalchemy import or_, select
 from app.database import async_session_factory
 from app.models import Mix
 from app.services import app_config
+from app.services import soundcloud_reconcile as sc_reconcile
 from app.services.duplicate_guard import STATUS_DUPLICATE
 
 logger = logging.getLogger(__name__)
@@ -56,7 +58,12 @@ def _aware(dt: Optional[datetime]) -> Optional[datetime]:
 
 
 class StuckMixWatchdog:
-    def __init__(self) -> None:
+    def __init__(
+        self, sc_track_lister: Optional[sc_reconcile.TrackLister] = None
+    ) -> None:
+        # Lists the SoundCloud account's tracks right now. Injectable so tests
+        # never talk to SoundCloud.
+        self._sc_track_lister = sc_track_lister or sc_reconcile.default_track_lister
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._last_result: Dict[str, Any] = {
@@ -120,8 +127,18 @@ class StuckMixWatchdog:
             pass
         return unpublished, draft
 
-    async def check(self, alert: bool = False) -> Dict[str, Any]:
-        """Find mixes ingested but not published inside their window."""
+    async def check(
+        self, alert: bool = False, verify: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        """Find mixes ingested but not published inside their window.
+
+        ``verify`` (default: same as ``alert``) checks each stuck mix against
+        SoundCloud as it is right now before anything is reported, so a
+        report never repeats a stale "live on SoundCloud" and never asks for a
+        re-upload of a recording the owner already published himself.
+        """
+        if verify is None:
+            verify = alert
         unpublished_hours, draft_hours = await self._window_hours()
         now = datetime.now(timezone.utc)
 
@@ -149,6 +166,11 @@ class StuckMixWatchdog:
                     "soundcloud_url": m.soundcloud_url,
                     "youtube_url": m.youtube_url,
                     "mixcloud_url": m.mixcloud_url,
+                    "soundcloud_track_id": m.soundcloud_track_id,
+                    "duration_seconds": m.duration_seconds,
+                    "title_youtube": m.title_youtube,
+                    "audio_file_path": m.audio_file_path,
+                    "video_file_path": m.video_file_path,
                     "duplicate_of": (
                         (m.metadata_json or {}).get("duplicate_of")
                         if isinstance(m.metadata_json, dict) else None
@@ -156,6 +178,21 @@ class StuckMixWatchdog:
                 }
                 for m in rows
             ]
+            pipeline_sc_keys: set = set()
+            if verify:
+                # Every SoundCloud upload any pipeline mix ever recorded. Any
+                # other track on the account was uploaded by the owner.
+                for tid, url in (
+                    await session.execute(
+                        select(Mix.soundcloud_track_id, Mix.soundcloud_url).where(
+                            Mix.source == "pipeline"
+                        )
+                    )
+                ).all():
+                    if tid:
+                        pipeline_sc_keys.add(str(tid))
+                    if url:
+                        pipeline_sc_keys.add(sc_reconcile._permalink(url))
 
         stuck: List[Dict[str, Any]] = []
         for mix in mixes:
@@ -206,8 +243,15 @@ class StuckMixWatchdog:
                 "kind": "draft_unreviewed" if is_draft else "unpublished",
             })
 
+        superseded: List[Dict[str, Any]] = []
+        if verify and stuck:
+            stuck, superseded = await self._verify_soundcloud(
+                stuck, pipeline_sc_keys, persist=alert,
+            )
+
         self._last_result = {
             "state": "ok",
+            "superseded": superseded,
             "checked_at": now.isoformat(),
             "stuck_count": len(stuck),
             "stuck": stuck,
@@ -222,6 +266,75 @@ class StuckMixWatchdog:
                 await self._alert(entry)
 
         return self._last_result
+
+    async def _verify_soundcloud(
+        self,
+        stuck: List[Dict[str, Any]],
+        pipeline_keys: set,
+        *,
+        persist: bool,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Re-check each stuck mix's SoundCloud state against the live API.
+
+        Returns (still stuck, superseded by an owner upload). A superseded mix
+        is parked as a duplicate when ``persist`` is set, so it does not come
+        back on the next sweep.
+        """
+        tracks: Optional[List[Dict[str, Any]]] = None
+        error: Optional[str] = None
+        try:
+            tracks = await self._sc_track_lister()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"[:200]
+            logger.warning("Stuck-mix SoundCloud check failed: %s", error)
+
+        still: List[Dict[str, Any]] = []
+        superseded: List[Dict[str, Any]] = []
+        for entry in stuck:
+            verdict = sc_reconcile.verdict_for(entry, tracks, pipeline_keys, error)
+            entry["soundcloud_check"] = verdict.to_dict()
+            if (
+                verdict.recorded == sc_reconcile.SC_GONE
+                and not (entry.get("youtube_url") or entry.get("mixcloud_url"))
+            ):
+                entry["reason"] = (
+                    "not live on any target (its SoundCloud upload has since "
+                    "been deleted)"
+                )
+            if entry.get("kind") != "draft_unreviewed" and verdict.canonical:
+                superseded.append(entry)
+                if persist:
+                    await self._park_as_owner_copy(entry, verdict)
+                continue
+            still.append(entry)
+        return still, superseded
+
+    async def _park_as_owner_copy(
+        self, entry: Dict[str, Any], verdict: sc_reconcile.SoundCloudVerdict
+    ) -> None:
+        from app.services.duplicate_guard import DuplicateMatch, mark_duplicate
+
+        canon = verdict.to_dict()["canonical"]
+        reasons = list(canon["match"]) + ["owner's own SoundCloud upload"]
+        if verdict.recorded == sc_reconcile.SC_GONE:
+            reasons.append(f"pipeline upload {verdict.recorded_ref} no longer exists")
+        match = DuplicateMatch(
+            duplicate_of=f"soundcloud:{canon['track_id']}",
+            title=canon["title"] or canon["url"],
+            reasons=reasons,
+            published=True,
+        )
+        try:
+            await mark_duplicate(entry["id"], match, stage="stuck_mix_watchdog")
+            async with async_session_factory() as session:
+                mix = await session.get(Mix, entry["id"])
+                if mix is not None:
+                    meta = dict(mix.metadata_json or {})
+                    meta["canonical_upload"] = {"platform": "soundcloud", **canon}
+                    mix.metadata_json = meta
+                    await session.commit()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Could not park %s as an owner copy", entry["id"])
 
     async def _alert(self, entry: Dict[str, Any]) -> None:
         from app.services import activity_log
@@ -246,13 +359,33 @@ class StuckMixWatchdog:
             pass
 
         age = f"{entry['age_hours']}h" if entry["age_hours"] is not None else "unknown age"
+        check = entry.get("soundcloud_check")
+        error = entry["error"]
+        if (
+            error and check is not None
+            and check["recorded"] != sc_reconcile.SC_LIVE
+            and re.search(r"live on [^;]*soundcloud", error, re.I)
+        ):
+            # The stored note says SoundCloud is live; SoundCloud now says
+            # otherwise (or could not be asked). Don't repeat the stale claim.
+            error = re.sub(
+                r"live on [^;]*soundcloud[^;]*;?\s*", "", error, flags=re.I
+            ).strip(" ;—-") or None
         message = (
             f"Mix \"{entry['title']}\" has been in the system {age} "
             f"(window {entry['window_hours']}h) and is {entry['reason']}. "
             f"Pipeline status: {entry['status']}"
             + (f" at {entry['step']}" if entry["step"] else "")
-            + (f" — {entry['error']}" if entry["error"] else "")
+            + (f" — {error}" if error else "")
         )
+        if check is not None:
+            # pipeline_error was written when the publish step ran; this is
+            # what SoundCloud says now, and it wins.
+            message += " " + sc_reconcile.SoundCloudVerdict(
+                recorded=check["recorded"],
+                recorded_ref=check["recorded_ref"],
+                error=check["error"],
+            ).summary()
 
         await activity_log.warn(
             EVENT, message, mix_id=entry["id"], context=entry,

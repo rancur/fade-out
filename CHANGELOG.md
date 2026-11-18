@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.6.3 — 2026-11-18
+
+### Stuck-mix watchdog checks SoundCloud as it is now before reporting
+
+"Mirage Groove Reverie" was reported every two days as "live on SoundCloud but
+not published to YouTube", which invited a re-render and re-upload. The
+pipeline's SoundCloud track had been deleted (it 404s), and the set was
+already out as the owner's own upload with identical audio. The watchdog was
+repeating the `pipeline_error` text written when the publish step ran.
+
+- Before an alert, the watchdog lists the SoundCloud account's tracks via the
+  API. A mix's recorded upload is reported as verified live, gone, or
+  UNVERIFIED when the lookup fails. A stale "live on soundcloud" from the
+  stored error is never repeated unless SoundCloud confirms it.
+- An upload on the account that no pipeline mix recorded, with the same
+  duration (within 1 s, mix-length tracks only) or the same title (durations
+  within 5 s), is treated as the canonical copy. The mix is parked as
+  `duplicate` (`duplicate_of = "soundcloud:<id>"`, plus
+  `metadata_json.canonical_upload`) and nobody is alerted.
+- The status endpoint (`check(alert=False)`) does not call SoundCloud.
+
 ## v2.6.2 — 2026-11-11
 
 ### Duplicate guard: the same recording is never published twice
